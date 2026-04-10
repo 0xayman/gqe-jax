@@ -1,21 +1,21 @@
 # config.yml — GQE Quantum Compilation Configuration
 
 target:
-  num_qubits: 2
-  type: "file" # Load a saved target unitary from disk
-  path: "targets/haar_random_q2.npy"
+  num_qubits: 3
+  type: "haar_random" # Load a saved target unitary from disk
+  path: "targets/haar_random_q3.npy"
 
 model:
   size: "small" # tiny | small | medium | large
-  max_gates_count: 100 # Sequence length N
+  max_gates_count: 125 # Sequence length N
 
 training:
   max_epochs: 100
   num_samples: 100 # Circuits generated per epoch (rollout size)
-  batch_size: 16 # Gradient-step batch size (drawn from replay buffer)
+  batch_size: 32 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
   grad_norm_clip: 1.0
-  seed: 3047
+  seed: 42
   grpo_clip_ratio: 0.2
   early_stop: true # Stop training once fidelity reaches 1.0
 

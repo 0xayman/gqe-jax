@@ -38,6 +38,10 @@ class Pipeline:
         self._advantages = None
 
         self.pool_names = [name for name, _ in pool]
+        self.two_qubit_token_mask = np.asarray(
+            [name.startswith("CNOT") for name in self.pool_names],
+            dtype=bool,
+        )
         self.pool_matrices = np.stack([matrix for _, matrix in pool], axis=0)
         self.pool_matrices_jax = jnp.asarray(self.pool_matrices, dtype=jnp.complex128)
         self.u_target_jax = (
@@ -262,49 +266,31 @@ class Pipeline:
 
     def computeCost(self, idx_output, pool, **kwargs):
         idx_output = np.asarray(idx_output, dtype=np.int32)
-        token_names_batch = [[pool[j][0] for j in row.tolist()] for row in idx_output]
 
         if self.continuous_optimizer is None:
             return self._compute_discrete_costs(idx_output)
 
-        verbose = self.cfg.logging.verbose
         if self.continuous_optimizer.top_k > 0:
             discrete_costs = self._compute_discrete_costs(idx_output)
             top_indices = sorted(range(len(discrete_costs)), key=lambda i: discrete_costs[i])[
                 : self.continuous_optimizer.top_k
             ]
             results = discrete_costs.astype(np.float64).tolist()
-            best_f = 0.0
-            width = len(str(max(1, self.continuous_optimizer.top_k)))
-            for rank, sample_idx in enumerate(top_indices):
-                fidelity, self.rng_key = self.continuous_optimizer.optimize_circuit(
-                    token_names_batch[sample_idx],
-                    self.rng_key,
-                )
+            selected_idx = idx_output[top_indices]
+            fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
+                selected_idx,
+                self.rng_key,
+                simplify=False,
+            )
+            for sample_idx, fidelity in zip(top_indices, fidelities.tolist()):
                 results[sample_idx] = 1.0 - fidelity
-                best_f = max(best_f, fidelity)
-                if verbose:
-                    print(
-                        f"    angle opt [{rank + 1:{width}d}/{self.continuous_optimizer.top_k}]"
-                        f"  f={fidelity:.6f}  best_f={best_f:.6f}"
-                    )
         else:
-            results = []
-            best_f = 0.0
-            total = len(token_names_batch)
-            width = len(str(max(1, total)))
-            for sample_idx, names in enumerate(token_names_batch):
-                fidelity, self.rng_key = self.continuous_optimizer.optimize_circuit(
-                    names,
-                    self.rng_key,
-                )
-                results.append(1.0 - fidelity)
-                best_f = max(best_f, fidelity)
-                if verbose:
-                    print(
-                        f"    angle opt [{sample_idx + 1:{width}d}/{total}]"
-                        f"  f={fidelity:.6f}  best_f={best_f:.6f}"
-                    )
+            fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
+                idx_output,
+                self.rng_key,
+                simplify=False,
+            )
+            results = (1.0 - fidelities).tolist()
 
         return np.asarray(results, dtype=np.float32)
 

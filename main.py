@@ -44,7 +44,6 @@ def _compile_target_with_qiskit(u_target: np.ndarray, num_qubits: int):
     print(compiled.draw("text", fold=-1))
     return compiled
 
-
 def _circuit_stats(qc) -> tuple[int, int, int]:
     """Return (depth, total_gates, two_qubit_gates) for a QuantumCircuit."""
     depth = qc.depth()
@@ -148,6 +147,8 @@ def main():
     print(f"  Max gates/circuit:    {cfg.model.max_gates_count}")
     print(f"  Training epochs:      {cfg.training.max_epochs}")
     print(f"  W&B logging:          {cfg.logging.wandb}")
+    print(f"  JAX backend:          {jax.default_backend()}")
+    print(f"  JAX devices:          {jax.devices()}")
 
     # ── Initialize W&B logger immediately (before any training work) ────────
     logger = _build_logger(cfg)

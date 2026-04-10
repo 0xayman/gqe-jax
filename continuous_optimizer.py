@@ -231,6 +231,8 @@ class ContinuousOptimizer:
         top_k,
         max_gates: int,
         num_restarts: int = 1,
+        pool_token_names: list[str] | None = None,
+        fast_runtime: bool = False,
     ):
         self.num_qubits = num_qubits
         self.steps = steps
@@ -239,9 +241,18 @@ class ContinuousOptimizer:
         self.top_k = top_k
         self.max_gates = max_gates
         self.num_restarts = num_restarts
-        self.u_target_jax = jnp.asarray(u_target, dtype=jnp.complex128)
+        self.fast_runtime = fast_runtime
+        self._real_dtype = jnp.float32 if fast_runtime else jnp.float64
+        self._complex_dtype = jnp.complex64 if fast_runtime else jnp.complex128
+        self._np_real_dtype = np.float32 if fast_runtime else np.float64
+        self._np_complex_dtype = np.complex64 if fast_runtime else np.complex128
+        self._imag_unit = jnp.asarray(1.0j, dtype=self._complex_dtype)
+        self.u_target_jax = jnp.asarray(u_target, dtype=self._complex_dtype)
 
-        self._identity = jnp.eye(2**num_qubits, dtype=jnp.complex128)
+        self._identity = jnp.eye(2**num_qubits, dtype=self._complex_dtype)
+        self._pauli_x = jnp.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=self._complex_dtype)
+        self._pauli_y = jnp.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=self._complex_dtype)
+        self._pauli_z = jnp.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=self._complex_dtype)
         self._cnot_pairs = [
             (ctrl, tgt)
             for ctrl in range(num_qubits)
@@ -253,12 +264,32 @@ class ContinuousOptimizer:
             self._cnot_matrices = jnp.stack(
                 [_embed_cnot(ctrl, tgt, num_qubits) for ctrl, tgt in self._cnot_pairs],
                 axis=0,
-            )
+            ).astype(self._complex_dtype)
         else:
             self._cnot_matrices = self._identity[None, ...]
-        self._single_embed_cases = tuple(
-            self._make_single_embed_case(qubit) for qubit in range(num_qubits)
-        )
+        self._sx_matrices = jnp.stack(
+            [_embed_single(_SX, qubit, num_qubits) for qubit in range(num_qubits)],
+            axis=0,
+        ).astype(self._complex_dtype)
+        self._pauli_x_matrices = jnp.stack(
+            [_embed_single(self._pauli_x, qubit, num_qubits) for qubit in range(num_qubits)],
+            axis=0,
+        ).astype(self._complex_dtype)
+        self._pauli_y_matrices = jnp.stack(
+            [_embed_single(self._pauli_y, qubit, num_qubits) for qubit in range(num_qubits)],
+            axis=0,
+        ).astype(self._complex_dtype)
+        self._pauli_z_matrices = jnp.stack(
+            [_embed_single(self._pauli_z, qubit, num_qubits) for qubit in range(num_qubits)],
+            axis=0,
+        ).astype(self._complex_dtype)
+        self._pool_gate_specs: tuple[GateSpec, ...] | None = None
+        self._pool_gate_type_ids: jax.Array | None = None
+        self._pool_qubit0: jax.Array | None = None
+        self._pool_cnot_pair: jax.Array | None = None
+        self._pool_initial_angles: jax.Array | None = None
+        if pool_token_names is not None:
+            self._initialize_pool_encoding(pool_token_names)
         self._lbfgs = optax.lbfgs(learning_rate=lr)
         self._adam = optax.adam(learning_rate=lr)
 
@@ -321,12 +352,35 @@ class ContinuousOptimizer:
 
         self._optimize_adam = jax.jit(optimize_adam)
         self._optimize_lbfgs = jax.jit(optimize_lbfgs)
+        self._optimize_adam_batch = jax.jit(jax.vmap(optimize_adam, in_axes=(0, 0, 0, 0)))
+        self._optimize_lbfgs_batch = jax.jit(jax.vmap(optimize_lbfgs, in_axes=(0, 0, 0, 0)))
+        self._fidelity_batch_fn = jax.jit(
+            jax.vmap(
+                lambda angles, gate_type_ids, qubit0, cnot_pair: 1.0
+                - loss_fn(angles, gate_type_ids, qubit0, cnot_pair),
+                in_axes=(0, 0, 0, 0),
+            )
+        )
 
-    def _make_single_embed_case(self, qubit: int):
-        return lambda gate_2x2: _embed_single(gate_2x2, qubit, self.num_qubits)
+    def _initialize_pool_encoding(self, pool_token_names: list[str]) -> None:
+        gate_specs = tuple(parse_gate_spec(name) for name in pool_token_names)
+        gate_type_ids = np.zeros((len(gate_specs),), dtype=np.int32)
+        qubit0 = np.zeros((len(gate_specs),), dtype=np.int32)
+        cnot_pair = np.zeros((len(gate_specs),), dtype=np.int32)
+        initial_angles = np.zeros((len(gate_specs),), dtype=self._np_real_dtype)
 
-    def _embed_single_dynamic(self, gate_2x2: jax.Array, qubit: jax.Array) -> jax.Array:
-        return jax.lax.switch(qubit, self._single_embed_cases, gate_2x2)
+        for idx, spec in enumerate(gate_specs):
+            gate_type_ids[idx] = _GATE_TYPE_TO_ID[spec.gate_type]
+            qubit0[idx] = spec.qubits[0]
+            initial_angles[idx] = spec.initial_angle if spec.is_parametric else 0.0
+            if spec.gate_type == "CNOT":
+                cnot_pair[idx] = self._cnot_pair_to_idx[spec.qubits]
+
+        self._pool_gate_specs = gate_specs
+        self._pool_gate_type_ids = jnp.asarray(gate_type_ids, dtype=jnp.int32)
+        self._pool_qubit0 = jnp.asarray(qubit0, dtype=jnp.int32)
+        self._pool_cnot_pair = jnp.asarray(cnot_pair, dtype=jnp.int32)
+        self._pool_initial_angles = jnp.asarray(initial_angles, dtype=self._real_dtype)
 
     def _build_gate_matrix(
         self,
@@ -337,19 +391,43 @@ class ContinuousOptimizer:
     ) -> jax.Array:
         def rx_branch(operand):
             theta, qubit0, _ = operand
-            return self._embed_single_dynamic(_rx(theta), qubit0)
+            half = jnp.asarray(theta, dtype=self._real_dtype) / jnp.asarray(
+                2.0, dtype=self._real_dtype
+            )
+            cos_half = jnp.asarray(jnp.cos(half), dtype=self._complex_dtype)
+            sin_half = jnp.asarray(jnp.sin(half), dtype=self._complex_dtype)
+            return (
+                cos_half * self._identity
+                - self._imag_unit * sin_half * self._pauli_x_matrices[qubit0]
+            )
 
         def ry_branch(operand):
             theta, qubit0, _ = operand
-            return self._embed_single_dynamic(_ry(theta), qubit0)
+            half = jnp.asarray(theta, dtype=self._real_dtype) / jnp.asarray(
+                2.0, dtype=self._real_dtype
+            )
+            cos_half = jnp.asarray(jnp.cos(half), dtype=self._complex_dtype)
+            sin_half = jnp.asarray(jnp.sin(half), dtype=self._complex_dtype)
+            return (
+                cos_half * self._identity
+                - self._imag_unit * sin_half * self._pauli_y_matrices[qubit0]
+            )
 
         def rz_branch(operand):
             theta, qubit0, _ = operand
-            return self._embed_single_dynamic(_rz(theta), qubit0)
+            half = jnp.asarray(theta, dtype=self._real_dtype) / jnp.asarray(
+                2.0, dtype=self._real_dtype
+            )
+            cos_half = jnp.asarray(jnp.cos(half), dtype=self._complex_dtype)
+            sin_half = jnp.asarray(jnp.sin(half), dtype=self._complex_dtype)
+            return (
+                cos_half * self._identity
+                - self._imag_unit * sin_half * self._pauli_z_matrices[qubit0]
+            )
 
         def sx_branch(operand):
             _, qubit0, _ = operand
-            return self._embed_single_dynamic(_SX, qubit0)
+            return self._sx_matrices[qubit0]
 
         def cnot_branch(operand):
             _, _, cnot_pair = operand
@@ -410,14 +488,42 @@ class ContinuousOptimizer:
             jnp.asarray(cnot_pair, dtype=jnp.int32),
         )
 
+    def _encode_gate_specs_batch(
+        self,
+        gate_specs_batch: list[list],
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        batch_size = len(gate_specs_batch)
+        gate_type_ids = np.full(
+            (batch_size, self.max_gates),
+            _GATE_TYPE_TO_ID["NOOP"],
+            dtype=np.int32,
+        )
+        qubit0 = np.zeros((batch_size, self.max_gates), dtype=np.int32)
+        cnot_pair = np.zeros((batch_size, self.max_gates), dtype=np.int32)
+        for batch_idx, gate_specs in enumerate(gate_specs_batch):
+            for gate_idx, spec in enumerate(gate_specs):
+                gate_type_ids[batch_idx, gate_idx] = _GATE_TYPE_TO_ID[spec.gate_type]
+                qubit0[batch_idx, gate_idx] = spec.qubits[0]
+                if spec.gate_type == "CNOT":
+                    cnot_pair[batch_idx, gate_idx] = self._cnot_pair_to_idx[spec.qubits]
+        return (
+            jnp.asarray(gate_type_ids, dtype=jnp.int32),
+            jnp.asarray(qubit0, dtype=jnp.int32),
+            jnp.asarray(cnot_pair, dtype=jnp.int32),
+        )
+
     def _build_full_angle_vector(
         self,
         gate_specs: list,
         compact_params: jax.Array | None = None,
     ) -> jax.Array:
-        angles = np.zeros((self.max_gates,), dtype=np.float64)
+        angles = np.zeros((self.max_gates,), dtype=self._np_real_dtype)
         param_idx = 0
-        compact = None if compact_params is None else np.asarray(compact_params, dtype=np.float64)
+        compact = (
+            None
+            if compact_params is None
+            else np.asarray(compact_params, dtype=self._np_real_dtype)
+        )
         for gate_idx, spec in enumerate(gate_specs):
             if spec.is_parametric:
                 if compact is None:
@@ -425,14 +531,48 @@ class ContinuousOptimizer:
                 else:
                     angles[gate_idx] = compact[param_idx]
                     param_idx += 1
-        return jnp.asarray(angles, dtype=jnp.float64)
+        return jnp.asarray(angles, dtype=self._real_dtype)
+
+    def _build_full_angle_vector_batch(self, gate_specs_batch: list[list]) -> jax.Array:
+        angles = np.zeros((len(gate_specs_batch), self.max_gates), dtype=self._np_real_dtype)
+        for batch_idx, gate_specs in enumerate(gate_specs_batch):
+            for gate_idx, spec in enumerate(gate_specs):
+                if spec.is_parametric:
+                    angles[batch_idx, gate_idx] = spec.initial_angle
+        return jnp.asarray(angles, dtype=self._real_dtype)
 
     def _compact_param_angles(self, gate_specs: list, full_angles: jax.Array) -> jax.Array:
-        full_angles_np = np.asarray(full_angles, dtype=np.float64)
+        full_angles_np = np.asarray(full_angles, dtype=self._np_real_dtype)
         params = [full_angles_np[idx] for idx, spec in enumerate(gate_specs) if spec.is_parametric]
         if not params:
-            return jnp.zeros((0,), dtype=jnp.float64)
-        return jnp.asarray(params, dtype=jnp.float64)
+            return jnp.zeros((0,), dtype=self._real_dtype)
+        return jnp.asarray(params, dtype=self._real_dtype)
+
+    def _take_subkeys(
+        self,
+        rng_key: jax.Array,
+        count: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        if count <= 0:
+            return jnp.zeros((0, *rng_key.shape), dtype=rng_key.dtype), rng_key
+        keys = jax.random.split(rng_key, count + 1)
+        return keys[1:], keys[0]
+
+    def _sample_restart_angles_batch(
+        self,
+        subkeys: jax.Array,
+        parametric_mask: jax.Array,
+    ) -> jax.Array:
+        sampled = jax.vmap(
+            lambda key: jax.random.uniform(
+                key,
+                shape=(self.max_gates,),
+                minval=-jnp.pi,
+                maxval=jnp.pi,
+                dtype=self._real_dtype,
+            )
+        )(subkeys)
+        return jnp.where(parametric_mask, sampled, 0.0)
 
     def _optimize_angles(
         self,
@@ -443,44 +583,251 @@ class ContinuousOptimizer:
         num_restarts: int,
     ) -> tuple[float, jax.Array, jax.Array]:
         gate_type_ids, qubit0, cnot_pair = self._encode_gate_specs(gate_specs)
+        fidelities, params_batch, key = self._optimize_angles_batch(
+            initial_angles[None, :],
+            gate_type_ids[None, :],
+            qubit0[None, :],
+            cnot_pair[None, :],
+            rng_key,
+            num_restarts=num_restarts,
+        )
+        return float(np.asarray(fidelities[0], dtype=np.float64)), params_batch[0], key
+
+    def _optimize_angles_batch(
+        self,
+        initial_angles: jax.Array,
+        gate_type_ids: jax.Array,
+        qubit0: jax.Array,
+        cnot_pair: jax.Array,
+        rng_key: jax.Array,
+        *,
+        num_restarts: int,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if self.optimizer_type == "lbfgs":
-            optimize_impl = self._optimize_lbfgs
+            optimize_impl = self._optimize_lbfgs_batch
         elif self.optimizer_type == "adam":
-            optimize_impl = self._optimize_adam
+            optimize_impl = self._optimize_adam_batch
         else:
             raise ValueError(f"Unknown optimizer type: {self.optimizer_type!r}")
 
-        best_fidelity = -1.0
-        best_params = initial_angles
+        batch_size = initial_angles.shape[0]
         key = rng_key
         parametric_mask = gate_type_ids < _GATE_TYPE_TO_ID["SX"]
-        for restart in range(max(1, num_restarts)):
-            if restart == 0:
-                start = initial_angles
-            else:
-                key, subkey = jax.random.split(key)
-                sampled = jax.random.uniform(
-                    subkey,
-                    shape=initial_angles.shape,
-                    minval=-jnp.pi,
-                    maxval=jnp.pi,
-                    dtype=jnp.float64,
-                )
-                start = jnp.where(parametric_mask, sampled, 0.0)
+        total_restarts = max(1, num_restarts)
 
-            params = optimize_impl(start, gate_type_ids, qubit0, cnot_pair)
-            fidelity = float(
-                self._fidelity_fn(params, gate_type_ids, qubit0, cnot_pair).astype(jnp.float64)
+        starts = initial_angles[None, :, :]
+        if total_restarts > 1:
+            subkeys, key = self._take_subkeys(key, batch_size * (total_restarts - 1))
+            repeated_mask = jnp.broadcast_to(
+                parametric_mask[None, :, :],
+                (total_restarts - 1, batch_size, self.max_gates),
+            ).reshape((batch_size * (total_restarts - 1), self.max_gates))
+            random_starts = self._sample_restart_angles_batch(subkeys, repeated_mask).reshape(
+                (total_restarts - 1, batch_size, self.max_gates)
             )
-            if fidelity > best_fidelity:
-                best_fidelity = fidelity
-                best_params = params
+            starts = jnp.concatenate((starts, random_starts), axis=0)
+
+        gate_type_ids_runs = jnp.broadcast_to(
+            gate_type_ids[None, :, :],
+            (total_restarts, batch_size, self.max_gates),
+        )
+        qubit0_runs = jnp.broadcast_to(
+            qubit0[None, :, :],
+            (total_restarts, batch_size, self.max_gates),
+        )
+        cnot_pair_runs = jnp.broadcast_to(
+            cnot_pair[None, :, :],
+            (total_restarts, batch_size, self.max_gates),
+        )
+
+        flat_starts = starts.reshape((total_restarts * batch_size, self.max_gates))
+        flat_gate_type_ids = gate_type_ids_runs.reshape((total_restarts * batch_size, self.max_gates))
+        flat_qubit0 = qubit0_runs.reshape((total_restarts * batch_size, self.max_gates))
+        flat_cnot_pair = cnot_pair_runs.reshape((total_restarts * batch_size, self.max_gates))
+
+        flat_params = optimize_impl(flat_starts, flat_gate_type_ids, flat_qubit0, flat_cnot_pair)
+        flat_fidelities = self._fidelity_batch_fn(
+            flat_params,
+            flat_gate_type_ids,
+            flat_qubit0,
+            flat_cnot_pair,
+        ).astype(jnp.float64)
+
+        fidelity_runs = flat_fidelities.reshape((total_restarts, batch_size))
+        param_runs = flat_params.reshape((total_restarts, batch_size, self.max_gates))
+        best_restart_idx = jnp.argmax(fidelity_runs, axis=0)
+        best_fidelity = jnp.max(fidelity_runs, axis=0)
+        best_params = jnp.take_along_axis(
+            param_runs,
+            best_restart_idx[None, :, None],
+            axis=0,
+        ).squeeze(0)
 
         return best_fidelity, best_params, key
+
+    def _optimize_encoded_batch(
+        self,
+        gate_specs_batch: list[list[GateSpec]] | None,
+        initial_angles_batch: jax.Array,
+        gate_type_ids_batch: jax.Array,
+        qubit0_batch: jax.Array,
+        cnot_pair_batch: jax.Array,
+        rng_key: jax.Array,
+        *,
+        simplify: bool,
+    ) -> tuple[np.ndarray, jax.Array]:
+        has_params = np.asarray(
+            np.any(np.asarray(gate_type_ids_batch) < _GATE_TYPE_TO_ID["SX"], axis=1),
+            dtype=bool,
+        )
+        fidelities = np.zeros((initial_angles_batch.shape[0],), dtype=np.float64)
+
+        no_param_indices = np.flatnonzero(~has_params)
+        if no_param_indices.size > 0:
+            fidelities[no_param_indices] = np.asarray(
+                self._fidelity_batch_fn(
+                    jnp.take(initial_angles_batch, no_param_indices, axis=0),
+                    jnp.take(gate_type_ids_batch, no_param_indices, axis=0),
+                    jnp.take(qubit0_batch, no_param_indices, axis=0),
+                    jnp.take(cnot_pair_batch, no_param_indices, axis=0),
+                ),
+                dtype=np.float64,
+            )
+
+        param_indices = np.flatnonzero(has_params)
+        if param_indices.size == 0:
+            return fidelities, rng_key
+
+        opt_fidelities, full_params_batch, rng_key = self._optimize_angles_batch(
+            jnp.take(initial_angles_batch, param_indices, axis=0),
+            jnp.take(gate_type_ids_batch, param_indices, axis=0),
+            jnp.take(qubit0_batch, param_indices, axis=0),
+            jnp.take(cnot_pair_batch, param_indices, axis=0),
+            rng_key,
+            num_restarts=self.num_restarts,
+        )
+        fidelities[param_indices] = np.asarray(opt_fidelities, dtype=np.float64)
+
+        if not simplify:
+            return fidelities, rng_key
+        if gate_specs_batch is None:
+            raise ValueError("gate_specs_batch is required when simplify=True")
+
+        full_params_np = np.asarray(full_params_batch, dtype=np.float64)
+        simplified_specs_batch: list[list[GateSpec]] = []
+        simplified_full_init_batch: list[np.ndarray] = []
+        simplified_global_indices: list[int] = []
+        for local_idx, global_idx in enumerate(param_indices.tolist()):
+            gate_specs = gate_specs_batch[global_idx]
+            compact_params = self._compact_param_angles(gate_specs, full_params_np[local_idx])
+            simp_specs, simp_params = simplify_gate_sequence(gate_specs, compact_params)
+            if len(simp_specs) == len(gate_specs):
+                continue
+
+            simp_full_init = self._build_full_angle_vector(simp_specs, simp_params)
+            if int(simp_params.size) > 0:
+                simplified_specs_batch.append(simp_specs)
+                simplified_full_init_batch.append(np.asarray(simp_full_init, dtype=np.float64))
+                simplified_global_indices.append(batch_idx)
+                continue
+
+            gate_type_ids, qubit0, cnot_pair = self._encode_gate_specs(simp_specs)
+            simp_fidelity = float(
+                self._fidelity_fn(simp_full_init, gate_type_ids, qubit0, cnot_pair).astype(
+                    jnp.float64
+                )
+            )
+            if simp_fidelity >= fidelities[global_idx] - 1e-6:
+                fidelities[global_idx] = simp_fidelity
+
+        if simplified_specs_batch:
+            simp_initial_angles = jnp.asarray(
+                np.stack(simplified_full_init_batch, axis=0),
+                dtype=jnp.float64,
+            )
+            simp_gate_type_ids, simp_qubit0, simp_cnot_pair = self._encode_gate_specs_batch(
+                simplified_specs_batch
+            )
+            simp_fidelities, _, rng_key = self._optimize_angles_batch(
+                simp_initial_angles,
+                simp_gate_type_ids,
+                simp_qubit0,
+                simp_cnot_pair,
+                rng_key,
+                num_restarts=1,
+            )
+            simp_fidelities_np = np.asarray(simp_fidelities, dtype=np.float64)
+            for local_idx, global_idx in enumerate(simplified_global_indices):
+                simp_fidelity = float(simp_fidelities_np[local_idx])
+                if simp_fidelity >= fidelities[global_idx] - 1e-6:
+                    fidelities[global_idx] = simp_fidelity
+
+        return fidelities, rng_key
 
     def optimize_circuit(self, token_names: list[str], rng_key: jax.Array) -> tuple[float, jax.Array]:
         fidelity, _, _, rng_key = self.optimize_circuit_with_params(token_names, rng_key)
         return fidelity, rng_key
+
+    def optimize_batch(
+        self,
+        token_names_batch: list[list[str]],
+        rng_key: jax.Array,
+        *,
+        simplify: bool = True,
+    ) -> tuple[np.ndarray, jax.Array]:
+        if not token_names_batch:
+            return np.zeros((0,), dtype=np.float64), rng_key
+
+        gate_specs_batch = [
+            [parse_gate_spec(name) for name in token_names] for token_names in token_names_batch
+        ]
+        initial_angles_batch = self._build_full_angle_vector_batch(gate_specs_batch)
+        gate_type_ids_batch, qubit0_batch, cnot_pair_batch = self._encode_gate_specs_batch(
+            gate_specs_batch
+        )
+        return self._optimize_encoded_batch(
+            gate_specs_batch,
+            initial_angles_batch,
+            gate_type_ids_batch,
+            qubit0_batch,
+            cnot_pair_batch,
+            rng_key,
+            simplify=simplify,
+        )
+
+    def optimize_token_index_batch(
+        self,
+        token_ids_batch: np.ndarray | jax.Array,
+        rng_key: jax.Array,
+        *,
+        simplify: bool = True,
+    ) -> tuple[np.ndarray, jax.Array]:
+        if self._pool_gate_specs is None:
+            raise ValueError("optimize_token_index_batch requires pool_token_names at construction")
+
+        token_ids_batch = np.asarray(token_ids_batch, dtype=np.int32)
+        if token_ids_batch.size == 0:
+            return np.zeros((0,), dtype=np.float64), rng_key
+
+        token_ids_batch_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)
+        initial_angles_batch = jnp.take(self._pool_initial_angles, token_ids_batch_jax, axis=0)
+        gate_type_ids_batch = jnp.take(self._pool_gate_type_ids, token_ids_batch_jax, axis=0)
+        qubit0_batch = jnp.take(self._pool_qubit0, token_ids_batch_jax, axis=0)
+        cnot_pair_batch = jnp.take(self._pool_cnot_pair, token_ids_batch_jax, axis=0)
+        gate_specs_batch = None
+        if simplify:
+            gate_specs_batch = [
+                [self._pool_gate_specs[idx] for idx in row.tolist()] for row in token_ids_batch
+            ]
+        return self._optimize_encoded_batch(
+            gate_specs_batch,
+            initial_angles_batch,
+            gate_type_ids_batch,
+            qubit0_batch,
+            cnot_pair_batch,
+            rng_key,
+            simplify=simplify,
+        )
 
     def optimize_circuit_with_params(
         self,
