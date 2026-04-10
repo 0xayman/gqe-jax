@@ -1,0 +1,12 @@
+jax
+jaxlib
+flax
+optax
+qiskit
+qiskit[visualization]
+matplotlib
+seaborn
+wandb
+python-dotenv
+pyyaml
+pytest

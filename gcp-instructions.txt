@@ -1,0 +1,46 @@
+This file contains how to setup a GPU on GCP and run this codebase in it
+------------------------------------------------------
+
+
+gcloud compute instances create gpu-l4-vm \
+  --project=aymantarig-project \
+  --zone=us-central1-a \
+  --machine-type=g2-standard-8 \
+  --accelerator=type=nvidia-l4,count=1 \
+  --image-family=common-cu128-ubuntu-2404-nvidia-570 \
+  --image-project=deeplearning-platform-release \
+  --boot-disk-size=100GB \
+  --boot-disk-type=pd-ssd \
+  --network=aymantarig-vpc \
+  --maintenance-policy=TERMINATE \
+  --restart-on-failure \
+  --metadata="install-nvidia-driver=True"
+
+gcloud compute ssh gpu-l4-vm --zone=us-central1-a --project=aymantarig-project
+
+
+
+python main.py
+
+=======================================
+
+
+gcloud compute instances create gpu-a100-vm \
+  --project=aymantarig-project \
+  --zone=us-central1-b \
+  --machine-type=a2-highgpu-1g \
+  --accelerator=type=nvidia-tesla-a100,count=1 \
+  --image-family=common-cu128-ubuntu-2404-nvidia-570 \
+  --image-project=deeplearning-platform-release \
+  --boot-disk-size=100GB \
+  --boot-disk-type=pd-ssd \
+  --network=aymantarig-vpc \
+  --maintenance-policy=TERMINATE \
+  --restart-on-failure \
+  --metadata="install-nvidia-driver=True"
+
+
+gcloud compute ssh gpu-a100-vm --zone=us-central1-b --project=aymantarig-project
+
+
+git clone https://0xayman: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@github.com/0xayman/GQE-Compiler.git
