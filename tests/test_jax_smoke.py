@@ -10,7 +10,6 @@ from config import (
     BufferConfig,
     ContinuousOptConfig,
     GQEConfig,
-    GrammarConfig,
     LoggingConfig,
     ModelConfig,
     TargetConfig,
@@ -19,9 +18,9 @@ from config import (
 )
 from continuous_optimizer import ContinuousOptimizer
 from cost import build_cost_fn
-from data import ReplayBuffer
-from gqe import _update_best_from_latest_rollout, gqe
+from gqe import gqe
 from operator_pool import build_operator_pool
+from pipeline import _sequence_structure_metrics
 from target import build_target
 
 
@@ -56,7 +55,6 @@ def _tiny_cfg(*, continuous_opt_enabled: bool, batch_size: int = 2) -> GQEConfig
             top_k=1,
             num_restarts=2,
         ),
-        grammar=GrammarConfig(enabled=True),
     )
 
 
@@ -191,27 +189,14 @@ def test_continuous_optimizer_index_batch_matches_name_batch():
     )
 
 
-def test_best_rollout_tiebreak_prefers_fewer_two_qubit_gates():
-    class _StubPipeline:
-        def __init__(self):
-            self.buffer = ReplayBuffer(size=4)
-            self.num_samples = 2
-            self.two_qubit_token_mask = np.asarray(
-                [False, False, True, True],
-                dtype=bool,
-            )
-
-    pipeline = _StubPipeline()
-    pipeline.buffer.push(np.asarray([0, 2, 3], dtype=np.int32), np.float32(0.1))
-    pipeline.buffer.push(np.asarray([0, 1, 1], dtype=np.int32), np.float32(0.1))
-
-    best_cost, best_indices, best_two_qubit_count = _update_best_from_latest_rollout(
-        pipeline,
-        float("inf"),
-        None,
-        None,
+def test_sequence_structure_metrics_reports_depth_and_gate_counts():
+    depth, total_gates, cnot_count = _sequence_structure_metrics(
+        np.asarray([0, 1, 2, 3], dtype=np.int32),
+        num_qubits=2,
+        token_qubit0=np.asarray([0, 1, 0, 1], dtype=np.int32),
+        token_qubit1=np.asarray([-1, -1, 1, -1], dtype=np.int32),
     )
 
-    assert best_cost == np.float32(0.1)
-    assert best_indices.tolist() == [0, 1, 1]
-    assert best_two_qubit_count == 0
+    assert depth == 3
+    assert total_gates == 4
+    assert cnot_count == 1

@@ -181,11 +181,9 @@ def main():
     best_cost, best_indices = gqe(cost_fn, pool, cfg, u_target=u_target, logger=logger)
 
     # ── Report results ───────────────────────────────────────────────────────
-    best_fidelity = 1.0 - best_cost
     print(f"\n{'=' * 55}")
     print("Training complete!")
-    print(f"  Best cost  (1 - F):  {best_cost:.6f}")
-    print(f"  Best fidelity (F):   {best_fidelity:.6f}")
+    print(f"  Best cost (1 - F):    {best_cost:.6f}")
 
     if best_indices is not None:
         # best_indices includes start token at position 0 — skip it
@@ -195,6 +193,7 @@ def main():
             else best_indices[1:].tolist()
         )
         gate_names = [pool[i][0] for i in gate_indices]
+        selected_cnot_count = sum(name.startswith("CNOT") for name in gate_names)
         print(f"  Best circuit ({len(gate_names)} gates):")
         for k, name in enumerate(gate_names):
             print(f"    [{k}] {name}")
@@ -222,7 +221,8 @@ def main():
             verified_f = process_fidelity(u_target, u_circuit)
             gate_specs, opt_params = None, None
             gqe_qc = _build_qiskit_circuit_from_names(gate_names, cfg.target.num_qubits)
-        print(f"  Verified fidelity:   {verified_f:.6f}")
+        print(f"  Best raw fidelity:    {verified_f:.6f}")
+        print(f"  CNOT count:           {selected_cnot_count}")
 
         # ── Draw the optimized circuit ───────────────────────────────────────
         if gate_specs is not None:

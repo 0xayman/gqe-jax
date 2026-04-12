@@ -56,11 +56,6 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
-class GrammarConfig:
-    enabled: bool = False  # Set True to enforce structural sampling constraints
-
-
-@dataclass(frozen=True)
 class ContinuousOptConfig:
     enabled: bool = False
     steps: int = 50  # gradient steps per circuit; 50 is enough for L-BFGS
@@ -79,7 +74,6 @@ class GQEConfig:
     buffer: BufferConfig
     logging: LoggingConfig
     continuous_opt: ContinuousOptConfig = field(default_factory=ContinuousOptConfig)
-    grammar: GrammarConfig = field(default_factory=GrammarConfig)
 
 
 VALID_TARGET_TYPES = {"random_reachable", "haar_random", "file"}
@@ -114,7 +108,6 @@ def validate_config(raw: dict) -> None:
         raise ValueError("grad_norm_clip must be positive")
     if t["grpo_clip_ratio"] <= 0:
         raise ValueError("grpo_clip_ratio must be positive")
-
     temp = raw["temperature"]
     if temp["scheduler"] not in VALID_SCHEDULERS:
         raise ValueError(f"Invalid scheduler: {temp['scheduler']}")
@@ -153,8 +146,6 @@ def load_config(path: str) -> GQEConfig:
 
     validate_config(raw)
     co_raw = raw.get("continuous_opt", {})
-    grammar_raw = raw.get("grammar", {})
-
     return GQEConfig(
         target=TargetConfig(**raw["target"]),
         model=ModelConfig(**raw["model"]),
@@ -165,5 +156,4 @@ def load_config(path: str) -> GQEConfig:
         continuous_opt=ContinuousOptConfig(**co_raw)
         if co_raw
         else ContinuousOptConfig(),
-        grammar=GrammarConfig(**grammar_raw) if grammar_raw else GrammarConfig(),
     )

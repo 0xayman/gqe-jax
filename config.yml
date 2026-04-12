@@ -41,7 +41,4 @@ continuous_opt:
   steps: 100 # lbfgs: max L-BFGS iterations | adam: gradient steps
   lr: 0.1 # lbfgs is ~10x faster than adam for small param counts
   top_k: 0 # optimize all circuits; set to e.g. 20 to only optimize top-20% by discrete fidelity
-  num_restarts: 5 # independent random restarts per circuit; restart 0 uses π/4 defaults
-
-grammar:
-  enabled: true # Set true to enforce structural constraints during sampling
+  num_restarts: 3

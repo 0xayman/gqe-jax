@@ -55,31 +55,22 @@ def _update_best_from_latest_rollout(
     pipeline: Pipeline,
     best_cost: float,
     best_indices,
-    best_two_qubit_count: int | None,
+    best_raw_fidelity: float | None,
+    best_cnot_count: int | None,
 ):
-    if len(pipeline.buffer) == 0:
-        return best_cost, best_indices, best_two_qubit_count
+    if pipeline._last_rollout_costs.size == 0:
+        return best_cost, best_indices, best_raw_fidelity, best_cnot_count
 
-    tie_tolerance = 1.0e-7
-    start = max(0, len(pipeline.buffer) - pipeline.num_samples)
-    for i in range(start, len(pipeline.buffer)):
-        seq, cost_val = pipeline.buffer.buf[i]
-        cost_value = float(np.asarray(cost_val))
-        seq_arr = np.asarray(seq, dtype=np.int32)
-        two_qubit_count = int(
-            np.count_nonzero(pipeline.two_qubit_token_mask[seq_arr[1:]])
+    best_idx = int(np.argmin(pipeline._last_rollout_costs))
+    rollout_best_cost = float(pipeline._last_rollout_costs[best_idx])
+    if rollout_best_cost < best_cost:
+        return (
+            rollout_best_cost,
+            np.asarray(pipeline._last_rollout_indices[best_idx], dtype=np.int32),
+            float(pipeline._last_rollout_fidelities[best_idx]),
+            int(pipeline._last_rollout_cnot_counts[best_idx]),
         )
-        if cost_value < best_cost - tie_tolerance:
-            best_cost = cost_value
-            best_indices = seq
-            best_two_qubit_count = two_qubit_count
-            continue
-        if abs(cost_value - best_cost) <= tie_tolerance and (
-            best_two_qubit_count is None or two_qubit_count < best_two_qubit_count
-        ):
-            best_indices = seq
-            best_two_qubit_count = two_qubit_count
-    return best_cost, best_indices, best_two_qubit_count
+    return best_cost, best_indices, best_raw_fidelity, best_cnot_count
 
 
 def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
@@ -88,7 +79,8 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
 
     best_cost = float("inf")
     best_indices = None
-    best_two_qubit_count = None
+    best_raw_fidelity = None
+    best_cnot_count = None
     pipeline._starting_idx = np.zeros((pipeline.num_samples, 1), dtype=np.int32)
     run_start = time.perf_counter()
 
@@ -96,18 +88,35 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
         print("Warming up buffer...")
     while len(pipeline.buffer) < cfg.buffer.warmup_size:
         pipeline.collect_rollout()
-        best_cost, best_indices, best_two_qubit_count = _update_best_from_latest_rollout(
-            pipeline, best_cost, best_indices, best_two_qubit_count
+        best_cost, best_indices, best_raw_fidelity, best_cnot_count = _update_best_from_latest_rollout(
+            pipeline,
+            best_cost,
+            best_indices,
+            best_raw_fidelity,
+            best_cnot_count,
         )
 
     for epoch in range(cfg.training.max_epochs):
         epoch_start = time.perf_counter()
 
         pipeline.collect_rollout()
-        best_cost, best_indices, best_two_qubit_count = _update_best_from_latest_rollout(
-            pipeline, best_cost, best_indices, best_two_qubit_count
+        best_cost, best_indices, best_raw_fidelity, best_cnot_count = _update_best_from_latest_rollout(
+            pipeline,
+            best_cost,
+            best_indices,
+            best_raw_fidelity,
+            best_cnot_count,
         )
-        epoch_best_fidelity = 1.0 - float(np.min(pipeline._last_rollout_costs))
+        epoch_best_idx = int(np.argmin(pipeline._last_rollout_costs))
+        epoch_best_cost = float(pipeline._last_rollout_costs[epoch_best_idx])
+        epoch_best_fidelity = float(pipeline._last_rollout_fidelities[epoch_best_idx])
+        (
+            epoch_best_depth,
+            epoch_best_total_gates,
+            epoch_best_cnot_count,
+        ) = pipeline.sequence_structure_metrics(
+            pipeline._last_rollout_indices[epoch_best_idx, 1:]
+        )
 
         epoch_losses = []
         dataloader = pipeline.train_dataloader()
@@ -123,15 +132,32 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
         epoch_loss = (
             sum(epoch_losses) / len(epoch_losses) if epoch_losses else float("nan")
         )
-        fidelity_run_best = 1.0 - best_cost
         epoch_time = time.perf_counter() - epoch_start
         elapsed = time.perf_counter() - run_start
+        run_best_fidelity = (
+            float(best_raw_fidelity) if best_raw_fidelity is not None else float("nan")
+        )
+        run_best_depth = -1
+        run_best_total_gates = -1
+        run_best_cnot_count = int(best_cnot_count) if best_cnot_count is not None else -1
+        if best_indices is not None:
+            run_best_depth, run_best_total_gates, run_best_cnot_count = (
+                pipeline.sequence_structure_metrics(np.asarray(best_indices, dtype=np.int32)[1:])
+            )
 
         if cfg.logging.verbose:
             print(
                 f"Epoch {epoch + 1:03d}/{cfg.training.max_epochs:03d}"
-                f" | fidelity_epoch_best={epoch_best_fidelity:.6f}"
-                f" | fidelity_run_best={fidelity_run_best:.6f}"
+                f" | cost_epoch_best={epoch_best_cost:.6f}"
+                f" | raw_fidelity_epoch_best={epoch_best_fidelity:.6f}"
+                f" | depth_epoch_best={epoch_best_depth}"
+                f" | total_gates_epoch_best={epoch_best_total_gates}"
+                f" | cnot_epoch_best={epoch_best_cnot_count}"
+                f" | cost_run_best={best_cost:.6f}"
+                f" | raw_fidelity_run_best={run_best_fidelity:.6f}"
+                f" | depth_run_best={run_best_depth}"
+                f" | total_gates_run_best={run_best_total_gates}"
+                f" | cnot_run_best={run_best_cnot_count}"
                 f" | epoch_time={_format_elapsed(epoch_time)}"
                 f" | elapsed={_format_elapsed(elapsed)}"
             )
@@ -140,8 +166,16 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
             logger.log_metrics(
                 {
                     "loss": epoch_loss,
-                    "fidelity_best": fidelity_run_best,
-                    "fidelity_epoch_best": epoch_best_fidelity,
+                    "cost_best": best_cost,
+                    "cost_epoch_best": epoch_best_cost,
+                    "raw_fidelity_best": run_best_fidelity,
+                    "raw_fidelity_epoch_best": epoch_best_fidelity,
+                    "depth_best": run_best_depth,
+                    "depth_epoch_best": epoch_best_depth,
+                    "total_gates_best": run_best_total_gates,
+                    "total_gates_epoch_best": epoch_best_total_gates,
+                    "cnot_count_best": run_best_cnot_count,
+                    "cnot_count_epoch_best": epoch_best_cnot_count,
                     "inverse_temperature": pipeline.scheduler.get_inverse_temperature(),
                     "epoch_time_sec": epoch_time,
                     "elapsed_time_sec": elapsed,
@@ -149,7 +183,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
                 step=epoch,
             )
 
-        if cfg.training.early_stop and fidelity_run_best >= 1.0:
+        if cfg.training.early_stop and run_best_fidelity >= 1.0:
             if cfg.logging.verbose:
                 print(
                     f"Fidelity 1.0 reached at epoch {epoch + 1:03d}"

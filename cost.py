@@ -21,7 +21,8 @@ def compilation_cost(gate_matrices: List[np.ndarray], u_target: np.ndarray) -> f
     u_circuit = np.eye(d, dtype=np.complex128)
     for gate in gate_matrices:
         u_circuit = gate @ u_circuit
-    return 1.0 - process_fidelity(u_target, u_circuit)
+    fidelity = process_fidelity(u_target, u_circuit)
+    return 1.0 - fidelity
 
 
 def build_cost_fn(u_target: np.ndarray) -> Callable[[List[np.ndarray]], float]:

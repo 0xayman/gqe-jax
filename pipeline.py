@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import jax_setup  # noqa: F401
 import jax
 import jax.numpy as jnp
@@ -11,13 +9,40 @@ import numpy as np
 import optax
 from flax.training import train_state
 
-from circuit_grammar import CircuitGrammar
-from cost import compilation_cost_batch_jax
+from cost import compilation_cost_batch_jax, process_fidelity
 from data import BufferDataset, ReplayBuffer
 
 
 def _unbiased_std(values: jax.Array) -> jax.Array:
     return jnp.std(values, ddof=1)
+
+
+def _sequence_structure_metrics(
+    token_ids: np.ndarray,
+    num_qubits: int,
+    token_qubit0: np.ndarray,
+    token_qubit1: np.ndarray,
+) -> tuple[int, int, int]:
+    token_ids = np.asarray(token_ids, dtype=np.int32)
+    if token_ids.size == 0:
+        return 0, 0, 0
+
+    qubit_depths = np.zeros((num_qubits,), dtype=np.int32)
+    total_gates = 0
+    cnot_count = 0
+    for token_id in token_ids.tolist():
+        q0 = int(token_qubit0[token_id])
+        q1 = int(token_qubit1[token_id])
+        total_gates += 1
+        if q1 >= 0:
+            layer = max(int(qubit_depths[q0]), int(qubit_depths[q1])) + 1
+            qubit_depths[q0] = layer
+            qubit_depths[q1] = layer
+            cnot_count += 1
+        else:
+            qubit_depths[q0] += 1
+
+    return int(np.max(qubit_depths)), total_gates, cnot_count
 
 
 class Pipeline:
@@ -34,6 +59,9 @@ class Pipeline:
         self.buffer = ReplayBuffer(size=cfg.buffer.max_size)
         self._starting_idx = np.zeros((self.num_samples, 1), dtype=np.int32)
         self._last_rollout_costs = np.zeros((0,), dtype=np.float32)
+        self._last_rollout_fidelities = np.zeros((0,), dtype=np.float32)
+        self._last_rollout_cnot_counts = np.zeros((0,), dtype=np.int32)
+        self._last_rollout_indices = np.zeros((0, self.ngates + 1), dtype=np.int32)
         self._old_log_probs = None
         self._advantages = None
 
@@ -42,6 +70,13 @@ class Pipeline:
             [name.startswith("CNOT") for name in self.pool_names],
             dtype=bool,
         )
+        self.token_qubit0 = np.zeros((len(self.pool_names),), dtype=np.int32)
+        self.token_qubit1 = np.full((len(self.pool_names),), -1, dtype=np.int32)
+        for idx, name in enumerate(self.pool_names):
+            parts = name.split("_")
+            self.token_qubit0[idx] = int(parts[1][1:])
+            if name.startswith("CNOT"):
+                self.token_qubit1[idx] = int(parts[2][1:])
         self.pool_matrices = np.stack([matrix for _, matrix in pool], axis=0)
         self.pool_matrices_jax = jnp.asarray(self.pool_matrices, dtype=jnp.complex128)
         self.u_target_jax = (
@@ -76,19 +111,12 @@ class Pipeline:
             if u_target is not None
             else None
         )
-        grammar_cfg = getattr(cfg, "grammar", None)
-        self.grammar: Optional[CircuitGrammar] = (
-            CircuitGrammar(cfg.target.num_qubits, pool)
-            if grammar_cfg is not None and grammar_cfg.enabled
-            else None
-        )
 
         self._compile_functions()
 
     def _compile_functions(self) -> None:
         apply_fn = self.state.apply_fn
         clip_ratio = self.loss.clip_ratio
-        grammar = self.grammar
         batch_size = self.num_samples
         total_len = self.ngates + 1
 
@@ -160,65 +188,31 @@ class Pipeline:
             state = state.apply_gradients(grads=grads)
             return state, loss_value
 
-        if grammar is None:
+        def generate_rollout(params, rng_key, beta):
+            tokens = jnp.zeros((batch_size, total_len), dtype=jnp.int32)
+            active_mask = jnp.zeros((batch_size, total_len), dtype=bool)
+            active_mask = active_mask.at[:, 0].set(True)
 
-            def generate_rollout(params, rng_key, beta):
-                tokens = jnp.zeros((batch_size, total_len), dtype=jnp.int32)
-                active_mask = jnp.zeros((batch_size, total_len), dtype=bool)
-                active_mask = active_mask.at[:, 0].set(True)
+            def body(carry, step_idx):
+                tokens, active_mask, rng = carry
+                rng, dropout_key, sample_key = jax.random.split(rng, 3)
+                logits = model_logits(params, tokens, active_mask, dropout_key)
+                step_logits = logits[:, step_idx, :]
+                idx_next = jax.random.categorical(
+                    sample_key,
+                    -beta * step_logits,
+                    axis=-1,
+                ).astype(jnp.int32)
+                tokens = tokens.at[:, step_idx + 1].set(idx_next)
+                active_mask = active_mask.at[:, step_idx + 1].set(True)
+                return (tokens, active_mask, rng), None
 
-                def body(carry, step_idx):
-                    tokens, active_mask, rng = carry
-                    rng, dropout_key, sample_key = jax.random.split(rng, 3)
-                    logits = model_logits(params, tokens, active_mask, dropout_key)
-                    step_logits = logits[:, step_idx, :]
-                    idx_next = jax.random.categorical(
-                        sample_key,
-                        -beta * step_logits,
-                        axis=-1,
-                    ).astype(jnp.int32)
-                    tokens = tokens.at[:, step_idx + 1].set(idx_next)
-                    active_mask = active_mask.at[:, step_idx + 1].set(True)
-                    return (tokens, active_mask, rng), None
-
-                (tokens, _, _), _ = jax.lax.scan(
-                    body,
-                    (tokens, active_mask, rng_key),
-                    jnp.arange(self.ngates, dtype=jnp.int32),
-                )
-                return tokens
-
-        else:
-
-            def generate_rollout(params, rng_key, beta):
-                tokens = jnp.zeros((batch_size, total_len), dtype=jnp.int32)
-                active_mask = jnp.zeros((batch_size, total_len), dtype=bool)
-                active_mask = active_mask.at[:, 0].set(True)
-                grammar_state = grammar.initial_state(batch_size)
-
-                def body(carry, step_idx):
-                    tokens, active_mask, grammar_state, rng = carry
-                    rng, dropout_key, sample_key = jax.random.split(rng, 3)
-                    logits = model_logits(params, tokens, active_mask, dropout_key)
-                    step_logits = logits[:, step_idx, :]
-                    mask = grammar.forbidden_mask(grammar_state)
-                    step_logits = jnp.where(mask, jnp.inf, step_logits)
-                    idx_next = jax.random.categorical(
-                        sample_key,
-                        -beta * step_logits,
-                        axis=-1,
-                    ).astype(jnp.int32)
-                    grammar_state = grammar.update(grammar_state, idx_next)
-                    tokens = tokens.at[:, step_idx + 1].set(idx_next)
-                    active_mask = active_mask.at[:, step_idx + 1].set(True)
-                    return (tokens, active_mask, grammar_state, rng), None
-
-                (tokens, _, _, _), _ = jax.lax.scan(
-                    body,
-                    (tokens, active_mask, grammar_state, rng_key),
-                    jnp.arange(self.ngates, dtype=jnp.int32),
-                )
-                return tokens
+            (tokens, _, _), _ = jax.lax.scan(
+                body,
+                (tokens, active_mask, rng_key),
+                jnp.arange(self.ngates, dtype=jnp.int32),
+            )
+            return tokens
 
         self._model_logits = jax.jit(model_logits)
         self._first_batch_step = jax.jit(first_batch_step)
@@ -244,45 +238,85 @@ class Pipeline:
 
     def collect_rollout(self):
         idx_output = self.generate()
-        costs = self.computeCost(idx_output[:, 1:], self.pool)
+        costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
         for seq, cost_val in zip(idx_output, costs):
             self.buffer.push(seq, cost_val)
         self.scheduler.update(costs=costs)
         self._last_rollout_costs = np.asarray(costs, dtype=np.float32)
+        self._last_rollout_fidelities = np.asarray(fidelities, dtype=np.float32)
+        self._last_rollout_cnot_counts = np.asarray(cnot_counts, dtype=np.int32)
+        self._last_rollout_indices = np.asarray(idx_output, dtype=np.int32)
 
     def set_cost(self, cost):
         self._cost = cost
 
-    def _compute_discrete_costs(self, idx_output: np.ndarray) -> np.ndarray:
+    def sequence_structure_metrics(self, token_ids: np.ndarray) -> tuple[int, int, int]:
+        return _sequence_structure_metrics(
+            token_ids,
+            self.cfg.target.num_qubits,
+            self.token_qubit0,
+            self.token_qubit1,
+        )
+
+    def _count_cnot_tokens(self, idx_output: np.ndarray) -> np.ndarray:
+        return np.count_nonzero(self.two_qubit_token_mask[idx_output], axis=1).astype(np.int32)
+
+    def _compute_discrete_metrics(
+        self,
+        idx_output: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        cnot_counts = self._count_cnot_tokens(idx_output)
         if self._discrete_cost_batch is not None:
             costs = self._discrete_cost_batch(jnp.asarray(idx_output, dtype=jnp.int32))
-            return np.asarray(costs, dtype=np.float32)
+            fidelities = 1.0 - costs
+            return (
+                np.asarray(costs, dtype=np.float32),
+                np.asarray(fidelities, dtype=np.float32),
+                cnot_counts,
+            )
 
-        results = []
+        if self.u_target_jax is None:
+            raise RuntimeError("Discrete metric evaluation requires a target unitary")
+
+        u_target = np.asarray(self.u_target_jax, dtype=np.complex128)
+        d = u_target.shape[0]
+        costs = []
+        fidelities = []
         for row in idx_output:
             gate_matrices = [self.pool[j][1] for j in row.tolist()]
-            results.append(self._cost(gate_matrices))
-        return np.asarray(results, dtype=np.float32)
+            u_circuit = np.eye(d, dtype=np.complex128)
+            for gate in gate_matrices:
+                u_circuit = gate @ u_circuit
+            fidelity = process_fidelity(u_target, u_circuit)
+            fidelities.append(fidelity)
+            costs.append(1.0 - fidelity)
+        return (
+            np.asarray(costs, dtype=np.float32),
+            np.asarray(fidelities, dtype=np.float32),
+            cnot_counts,
+        )
 
     def computeCost(self, idx_output, pool, **kwargs):
+        del pool, kwargs
         idx_output = np.asarray(idx_output, dtype=np.int32)
+        cnot_counts = self._count_cnot_tokens(idx_output)
 
         if self.continuous_optimizer is None:
-            return self._compute_discrete_costs(idx_output)
+            return self._compute_discrete_metrics(idx_output)
 
         if self.continuous_optimizer.top_k > 0:
-            discrete_costs = self._compute_discrete_costs(idx_output)
-            top_indices = sorted(range(len(discrete_costs)), key=lambda i: discrete_costs[i])[
-                : self.continuous_optimizer.top_k
-            ]
-            results = discrete_costs.astype(np.float64).tolist()
+            discrete_costs, discrete_fidelities, _ = self._compute_discrete_metrics(idx_output)
+            top_indices = np.argsort(discrete_costs)[: self.continuous_optimizer.top_k]
+            results = discrete_costs.astype(np.float64)
+            fidelities = discrete_fidelities.astype(np.float64)
             selected_idx = idx_output[top_indices]
-            fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
+            optimized_fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
                 selected_idx,
                 self.rng_key,
                 simplify=False,
             )
-            for sample_idx, fidelity in zip(top_indices, fidelities.tolist()):
+            for sample_idx, fidelity in zip(top_indices.tolist(), optimized_fidelities.tolist()):
+                fidelities[sample_idx] = fidelity
                 results[sample_idx] = 1.0 - fidelity
         else:
             fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
@@ -290,9 +324,14 @@ class Pipeline:
                 self.rng_key,
                 simplify=False,
             )
-            results = (1.0 - fidelities).tolist()
+            fidelities = np.asarray(fidelities, dtype=np.float64)
+            results = 1.0 - fidelities
 
-        return np.asarray(results, dtype=np.float32)
+        return (
+            np.asarray(results, dtype=np.float32),
+            np.asarray(fidelities, dtype=np.float32),
+            cnot_counts,
+        )
 
     def train_dataloader(self):
         return BufferDataset(self.buffer, self.cfg.buffer.steps_per_epoch)
@@ -341,23 +380,15 @@ class Pipeline:
         ngates = self.ngates if ngates is None else ngates
         beta = float(self.scheduler.get_inverse_temperature())
         idx_jax = jnp.asarray(idx, dtype=jnp.int32)
-        grammar_state = (
-            self.grammar.initial_state(idx_jax.shape[0]) if self.grammar is not None else None
-        )
 
         for _ in range(ngates):
             attention_mask = jnp.ones_like(idx_jax, dtype=bool)
             self.rng_key, dropout_key, sample_key = jax.random.split(self.rng_key, 3)
             logits = self._model_logits(self.state.params, idx_jax, attention_mask, dropout_key)
             step_logits = logits[:, -1, :]
-            if grammar_state is not None:
-                mask = self.grammar.forbidden_mask(grammar_state)
-                step_logits = jnp.where(mask, jnp.inf, step_logits)
             idx_next = jax.random.categorical(sample_key, -beta * step_logits, axis=-1).astype(
                 jnp.int32
             )
-            if grammar_state is not None:
-                grammar_state = self.grammar.update(grammar_state, idx_next)
             idx_jax = jnp.concatenate((idx_jax, idx_next[:, None]), axis=1)
         return np.asarray(idx_jax, dtype=np.int32)
 
