@@ -14,6 +14,8 @@ from data import BufferDataset, ReplayBuffer
 
 
 def _unbiased_std(values: jax.Array) -> jax.Array:
+    if values.size <= 1:
+        return jnp.asarray(0.0, dtype=values.dtype)
     return jnp.std(values, ddof=1)
 
 
@@ -56,27 +58,33 @@ class Pipeline:
         self.scheduler = self.factory.create_temperature_scheduler(cfg)
         self.ngates = cfg.model.max_gates_count
         self.num_samples = cfg.training.num_samples
+        self.bos_token_id = 0
+        self.gate_token_offset = 1
+        self.vocab_size = len(pool) + self.gate_token_offset
+        model_vocab_size = getattr(self.model, "vocab_size", None)
+        if model_vocab_size is not None and int(model_vocab_size) != self.vocab_size:
+            raise ValueError(
+                f"Model vocab_size={model_vocab_size} does not match "
+                f"expected {self.vocab_size} (pool size + BOS token)"
+            )
         self.buffer = ReplayBuffer(size=cfg.buffer.max_size)
-        self._starting_idx = np.zeros((self.num_samples, 1), dtype=np.int32)
+        self._starting_idx = self._make_starting_idx(self.num_samples)
         self._last_rollout_costs = np.zeros((0,), dtype=np.float32)
         self._last_rollout_fidelities = np.zeros((0,), dtype=np.float32)
         self._last_rollout_cnot_counts = np.zeros((0,), dtype=np.int32)
         self._last_rollout_indices = np.zeros((0, self.ngates + 1), dtype=np.int32)
-        self._old_log_probs = None
-        self._advantages = None
+        self._reference_params = None
 
-        self.pool_names = [name for name, _ in pool]
-        self.two_qubit_token_mask = np.asarray(
-            [name.startswith("CNOT") for name in self.pool_names],
-            dtype=bool,
-        )
-        self.token_qubit0 = np.zeros((len(self.pool_names),), dtype=np.int32)
-        self.token_qubit1 = np.full((len(self.pool_names),), -1, dtype=np.int32)
-        for idx, name in enumerate(self.pool_names):
+        self.pool_names = ["<BOS>", *[name for name, _ in pool]]
+        self.two_qubit_token_mask = np.zeros((self.vocab_size,), dtype=bool)
+        self.token_qubit0 = np.zeros((self.vocab_size,), dtype=np.int32)
+        self.token_qubit1 = np.full((self.vocab_size,), -1, dtype=np.int32)
+        for idx, name in enumerate(self.pool_names[1:], start=self.gate_token_offset):
             parts = name.split("_")
             self.token_qubit0[idx] = int(parts[1][1:])
             if name.startswith("CNOT"):
                 self.token_qubit1[idx] = int(parts[2][1:])
+                self.two_qubit_token_mask[idx] = True
         self.pool_matrices = np.stack([matrix for _, matrix in pool], axis=0)
         self.pool_matrices_jax = jnp.asarray(self.pool_matrices, dtype=jnp.complex128)
         self.u_target_jax = (
@@ -84,14 +92,14 @@ class Pipeline:
         )
 
         self.rng_key = jax.random.PRNGKey(cfg.training.seed)
-        self.rng_key, params_key, dropout_key = jax.random.split(self.rng_key, 3)
+        self.rng_key, params_key = jax.random.split(self.rng_key)
         dummy_input = jnp.zeros((1, self.ngates + 1), dtype=jnp.int32)
         dummy_mask = jnp.ones_like(dummy_input, dtype=bool)
         variables = self.model.init(
-            {"params": params_key, "dropout": dropout_key},
+            {"params": params_key},
             dummy_input,
             attention_mask=dummy_mask,
-            deterministic=False,
+            deterministic=True,
         )
         tx = optax.chain(
             optax.clip_by_global_norm(cfg.training.grad_norm_clip),
@@ -114,90 +122,85 @@ class Pipeline:
 
         self._compile_functions()
 
+    def _make_starting_idx(self, batch_size: int) -> np.ndarray:
+        return np.full((batch_size, 1), self.bos_token_id, dtype=np.int32)
+
+    def _decode_gate_token_ids(self, token_ids: np.ndarray) -> np.ndarray:
+        token_ids = np.asarray(token_ids, dtype=np.int32)
+        if token_ids.size == 0:
+            return token_ids
+        if np.any(token_ids < self.gate_token_offset) or np.any(token_ids >= self.vocab_size):
+            raise ValueError("Gate token ids must be shifted by +1 and exclude the BOS token")
+        return token_ids - self.gate_token_offset
+
     def _compile_functions(self) -> None:
         apply_fn = self.state.apply_fn
         clip_ratio = self.loss.clip_ratio
         batch_size = self.num_samples
         total_len = self.ngates + 1
 
-        def model_logits(params, input_ids, attention_mask, dropout_key):
+        def model_logits(params, input_ids, attention_mask):
             return apply_fn(
                 {"params": params},
                 input_ids,
                 attention_mask=attention_mask,
-                deterministic=False,
-                rngs={"dropout": dropout_key},
+                deterministic=True,
             )
 
+        def mask_invalid_action_logits(logits):
+            return logits.at[..., self.bos_token_id].set(jnp.asarray(jnp.inf, dtype=logits.dtype))
+
         def selected_log_probs(logits, gate_indices, beta):
-            aligned_logits = logits[:, : gate_indices.shape[1], :]
+            aligned_logits = mask_invalid_action_logits(logits[:, : gate_indices.shape[1], :])
             log_probs = jax.nn.log_softmax(-beta * aligned_logits, axis=-1)
             return jnp.take_along_axis(log_probs, gate_indices[..., None], axis=-1).squeeze(-1)
+
+        def sequence_log_probs(logits, gate_indices, beta):
+            return jnp.sum(selected_log_probs(logits, gate_indices, beta), axis=-1)
 
         def calc_advantage(costs):
             return (jnp.mean(costs) - costs) / (_unbiased_std(costs) + 1e-8)
 
-        def first_batch_step(state, idx, costs, beta, dropout_key):
+        def grpo_loss(params, reference_params, idx, costs, beta):
             attention_mask = jnp.ones_like(idx, dtype=bool)
+            gate_indices = idx[:, 1:]
+            advantages = jax.lax.stop_gradient(calc_advantage(costs))
+            current_logits = model_logits(params, idx, attention_mask)
+            reference_logits = model_logits(reference_params, idx, attention_mask)
+            current_sequence_log_probs = sequence_log_probs(current_logits, gate_indices, beta)
+            old_sequence_log_probs = jax.lax.stop_gradient(
+                sequence_log_probs(reference_logits, gate_indices, beta)
+            )
+            ratio = jnp.exp(current_sequence_log_probs - old_sequence_log_probs)
+            clipped_ratio = jnp.clip(
+                ratio,
+                1.0 - clip_ratio,
+                1.0 + clip_ratio,
+            )
+            surrogate = jnp.minimum(ratio * advantages, clipped_ratio * advantages)
+            return -jnp.mean(surrogate)
 
-            def loss_fn(params):
-                logits = model_logits(params, idx, attention_mask, dropout_key)
-                gate_indices = idx[:, 1:]
-                current_log_probs = selected_log_probs(logits, gate_indices, beta)
-                winner_loss = -jnp.mean(current_log_probs[jnp.argmin(costs)])
-                advantages = calc_advantage(costs)
-                identical = _unbiased_std(costs) == 0
-                full_loss = winner_loss - jnp.mean(advantages[:, None])
-                final_loss = jnp.where(identical, winner_loss, full_loss)
-                return final_loss, (current_log_probs, advantages, identical)
-
-            (loss_value, (current_log_probs, advantages, identical)), grads = jax.value_and_grad(
-                loss_fn,
-                has_aux=True,
-            )(state.params)
-            state = state.apply_gradients(grads=grads)
-            return state, loss_value, current_log_probs, advantages, identical
-
-        def later_batch_step(
-            state,
-            idx,
-            costs,
-            beta,
-            old_log_probs,
-            advantages,
-            dropout_key,
-        ):
-            attention_mask = jnp.ones_like(idx, dtype=bool)
-
-            def loss_fn(params):
-                logits = model_logits(params, idx, attention_mask, dropout_key)
-                gate_indices = idx[:, 1:]
-                current_log_probs = selected_log_probs(logits, gate_indices, beta)
-                winner_loss = -jnp.mean(current_log_probs[jnp.argmin(costs)])
-                ratio = jnp.exp(current_log_probs - old_log_probs)
-                clipped_ratio = jnp.clip(
-                    ratio,
-                    1.0 - clip_ratio,
-                    1.0 + clip_ratio,
-                )
-                ppo_loss = winner_loss - jnp.mean(clipped_ratio * advantages[:, None])
-                final_loss = jnp.where(_unbiased_std(costs) == 0, winner_loss, ppo_loss)
-                return final_loss
-
-            loss_value, grads = jax.value_and_grad(loss_fn)(state.params)
+        def grpo_step(state, reference_params, idx, costs, beta):
+            loss_value, grads = jax.value_and_grad(grpo_loss)(
+                state.params,
+                reference_params,
+                idx,
+                costs,
+                beta,
+            )
             state = state.apply_gradients(grads=grads)
             return state, loss_value
 
         def generate_rollout(params, rng_key, beta):
-            tokens = jnp.zeros((batch_size, total_len), dtype=jnp.int32)
+            tokens = jnp.full((batch_size, total_len), self.bos_token_id, dtype=jnp.int32)
             active_mask = jnp.zeros((batch_size, total_len), dtype=bool)
             active_mask = active_mask.at[:, 0].set(True)
 
             def body(carry, step_idx):
                 tokens, active_mask, rng = carry
-                rng, dropout_key, sample_key = jax.random.split(rng, 3)
-                logits = model_logits(params, tokens, active_mask, dropout_key)
-                step_logits = logits[:, step_idx, :]
+                rng, sample_key = jax.random.split(rng)
+                logits = model_logits(params, tokens, active_mask)
+                step_logits = mask_invalid_action_logits(logits[:, step_idx, :])
                 idx_next = jax.random.categorical(
                     sample_key,
                     -beta * step_logits,
@@ -215,8 +218,8 @@ class Pipeline:
             return tokens
 
         self._model_logits = jax.jit(model_logits)
-        self._first_batch_step = jax.jit(first_batch_step)
-        self._later_batch_step = jax.jit(later_batch_step)
+        self._grpo_loss = jax.jit(grpo_loss)
+        self._grpo_step = jax.jit(grpo_step)
         self._generate_rollout = jax.jit(generate_rollout)
         if self.u_target_jax is not None:
             self._discrete_cost_batch = jax.jit(
@@ -229,7 +232,7 @@ class Pipeline:
             self._discrete_cost_batch = None
 
     def on_fit_start(self):
-        self._starting_idx = np.zeros((self.num_samples, 1), dtype=np.int32)
+        self._starting_idx = self._make_starting_idx(self.num_samples)
         while len(self.buffer) < self.cfg.buffer.warmup_size:
             self.collect_rollout()
 
@@ -263,11 +266,11 @@ class Pipeline:
 
     def _compute_discrete_metrics(
         self,
-        idx_output: np.ndarray,
+        pool_idx_output: np.ndarray,
+        cnot_counts: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        cnot_counts = self._count_cnot_tokens(idx_output)
         if self._discrete_cost_batch is not None:
-            costs = self._discrete_cost_batch(jnp.asarray(idx_output, dtype=jnp.int32))
+            costs = self._discrete_cost_batch(jnp.asarray(pool_idx_output, dtype=jnp.int32))
             fidelities = 1.0 - costs
             return (
                 np.asarray(costs, dtype=np.float32),
@@ -282,7 +285,7 @@ class Pipeline:
         d = u_target.shape[0]
         costs = []
         fidelities = []
-        for row in idx_output:
+        for row in pool_idx_output:
             gate_matrices = [self.pool[j][1] for j in row.tolist()]
             u_circuit = np.eye(d, dtype=np.complex128)
             for gate in gate_matrices:
@@ -300,16 +303,20 @@ class Pipeline:
         del pool, kwargs
         idx_output = np.asarray(idx_output, dtype=np.int32)
         cnot_counts = self._count_cnot_tokens(idx_output)
+        pool_idx_output = self._decode_gate_token_ids(idx_output)
 
         if self.continuous_optimizer is None:
-            return self._compute_discrete_metrics(idx_output)
+            return self._compute_discrete_metrics(pool_idx_output, cnot_counts)
 
         if self.continuous_optimizer.top_k > 0:
-            discrete_costs, discrete_fidelities, _ = self._compute_discrete_metrics(idx_output)
+            discrete_costs, discrete_fidelities, _ = self._compute_discrete_metrics(
+                pool_idx_output,
+                cnot_counts,
+            )
             top_indices = np.argsort(discrete_costs)[: self.continuous_optimizer.top_k]
             results = discrete_costs.astype(np.float64)
             fidelities = discrete_fidelities.astype(np.float64)
-            selected_idx = idx_output[top_indices]
+            selected_idx = pool_idx_output[top_indices]
             optimized_fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
                 selected_idx,
                 self.rng_key,
@@ -320,7 +327,7 @@ class Pipeline:
                 results[sample_idx] = 1.0 - fidelity
         else:
             fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
-                idx_output,
+                pool_idx_output,
                 self.rng_key,
                 simplify=False,
             )
@@ -340,31 +347,21 @@ class Pipeline:
         idx_jax = jnp.asarray(idx, dtype=jnp.int32)
         costs_jax = jnp.asarray(costs, dtype=jnp.float32)
         beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
-        self.rng_key, dropout_key = jax.random.split(self.rng_key)
 
         if batch_idx == 0:
-            self.state, loss_value, old_log_probs, advantages, identical = self._first_batch_step(
-                self.state,
-                idx_jax,
-                costs_jax,
-                beta,
-                dropout_key,
+            self._reference_params = jax.tree_util.tree_map(
+                jax.lax.stop_gradient,
+                self.state.params,
             )
-            if not bool(np.asarray(identical)):
-                self._old_log_probs = jax.lax.stop_gradient(old_log_probs)
-                self._advantages = jax.lax.stop_gradient(advantages)
-        else:
-            if self._old_log_probs is None or self._advantages is None:
-                raise RuntimeError("GRPO reference tensors were not initialized on batch 0")
-            self.state, loss_value = self._later_batch_step(
-                self.state,
-                idx_jax,
-                costs_jax,
-                beta,
-                self._old_log_probs,
-                self._advantages,
-                dropout_key,
-            )
+        if self._reference_params is None:
+            raise RuntimeError("GRPO reference parameters were not initialized on batch 0")
+        self.state, loss_value = self._grpo_step(
+            self.state,
+            self._reference_params,
+            idx_jax,
+            costs_jax,
+            beta,
+        )
         return float(np.asarray(loss_value, dtype=np.float32))
 
     def generate(self, idx=None, ngates=None):
@@ -383,9 +380,11 @@ class Pipeline:
 
         for _ in range(ngates):
             attention_mask = jnp.ones_like(idx_jax, dtype=bool)
-            self.rng_key, dropout_key, sample_key = jax.random.split(self.rng_key, 3)
-            logits = self._model_logits(self.state.params, idx_jax, attention_mask, dropout_key)
-            step_logits = logits[:, -1, :]
+            self.rng_key, sample_key = jax.random.split(self.rng_key)
+            logits = self._model_logits(self.state.params, idx_jax, attention_mask)
+            step_logits = logits[:, -1, :].at[:, self.bos_token_id].set(
+                jnp.asarray(jnp.inf, dtype=logits.dtype)
+            )
             idx_next = jax.random.categorical(sample_key, -beta * step_logits, axis=-1).astype(
                 jnp.int32
             )
@@ -395,8 +394,7 @@ class Pipeline:
     def logits(self, idx):
         idx_jax = jnp.asarray(idx, dtype=jnp.int32)
         attention_mask = jnp.ones_like(idx_jax, dtype=bool)
-        self.rng_key, dropout_key = jax.random.split(self.rng_key)
-        logits_base = self._model_logits(self.state.params, idx_jax, attention_mask, dropout_key)
+        logits_base = self._model_logits(self.state.params, idx_jax, attention_mask)
         target_idx = idx_jax[:, 1:]
         aligned_logits = logits_base[:, : target_idx.shape[1], :]
         return jnp.take_along_axis(aligned_logits, target_idx[..., None], axis=-1).squeeze(-1)

@@ -12,6 +12,8 @@ import numpy as np
 
 
 def _unbiased_std(values: jax.Array) -> jax.Array:
+    if values.size <= 1:
+        return jnp.asarray(0.0, dtype=values.dtype)
     return jnp.std(values, ddof=1)
 
 
@@ -29,7 +31,7 @@ class Loss(ABC):
 
 
 class GRPOLoss(Loss):
-    """Generalized-RPO / clipped-PPO variant used in the original code."""
+    """Clipped GRPO objective using a frozen reference policy."""
 
     def __init__(self, clip_ratio: float = 0.2):
         self.clip_ratio = clip_ratio
@@ -46,41 +48,49 @@ class GRPOLoss(Loss):
             gate_indices,
             gate_logits,
             kwargs["inverse_temperature"],
+            invalid_token_ids=kwargs.get("invalid_token_ids"),
         )
-
-        win_id = jnp.argmin(costs)
-        loss = -jnp.mean(current_log_probs[win_id])
         costs_std = _unbiased_std(costs)
         identical_costs = bool(np.asarray(costs_std == 0))
-        if identical_costs:
-            return loss, None, None, True
+        advantages = jax.lax.stop_gradient(self.calc_advantage(costs))
+        current_sequence_log_probs = jnp.sum(current_log_probs, axis=-1)
 
-        if kwargs["current_step"] == 0:
-            advantages = self.calc_advantage(costs)
-            loss = loss - jnp.mean(advantages[:, None])
-            return (
-                loss,
-                jax.lax.stop_gradient(current_log_probs),
-                jax.lax.stop_gradient(advantages),
-                False,
+        if "reference_gate_logits" in kwargs:
+            old_log_probs = self.log_prob(
+                gate_indices,
+                kwargs["reference_gate_logits"],
+                kwargs["inverse_temperature"],
+                invalid_token_ids=kwargs.get("invalid_token_ids"),
+            )
+        elif "old_log_probs" in kwargs:
+            old_log_probs = kwargs["old_log_probs"]
+        else:
+            raise ValueError(
+                "GRPOLoss.compute requires reference_gate_logits or old_log_probs"
             )
 
-        old_log_probs = kwargs["old_log_probs"]
-        advantages = kwargs["advantages"]
-        ratio = jnp.exp(current_log_probs - old_log_probs)
+        old_sequence_log_probs = (
+            old_log_probs if old_log_probs.ndim == 1 else jnp.sum(old_log_probs, axis=-1)
+        )
+        ratio = jnp.exp(current_sequence_log_probs - old_sequence_log_probs)
         clipped_ratio = jnp.clip(
             ratio,
             1.0 - self.clip_ratio,
             1.0 + self.clip_ratio,
         )
-        loss = loss - jnp.mean(clipped_ratio * advantages[:, None])
-        return loss, None, None, False
+        surrogate = jnp.minimum(ratio * advantages, clipped_ratio * advantages)
+        loss = -jnp.mean(surrogate)
+        return loss, None, advantages, identical_costs
 
     def calc_advantage(self, costs):
         return (jnp.mean(costs) - costs) / (_unbiased_std(costs) + 1e-8)
 
-    def log_prob(self, gate_seqs, gate_logits, inverse_temperature):
+    def log_prob(self, gate_seqs, gate_logits, inverse_temperature, invalid_token_ids=None):
         steps = gate_seqs.shape[1]
         aligned_logits = gate_logits[:, :steps, :]
+        if invalid_token_ids is not None:
+            aligned_logits = aligned_logits.at[..., invalid_token_ids].set(
+                jnp.asarray(jnp.inf, dtype=aligned_logits.dtype)
+            )
         log_probs = jax.nn.log_softmax(-inverse_temperature * aligned_logits, axis=-1)
         return jnp.take_along_axis(log_probs, gate_seqs[..., None], axis=-1).squeeze(-1)

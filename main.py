@@ -155,7 +155,8 @@ def main():
 
     # ── Build operator pool ─────────────────────────────────────────────────
     pool = build_operator_pool(num_qubits=cfg.target.num_qubits)
-    print(f"  Pool size (vocab):    {len(pool)}")
+    print(f"  Gate pool size:       {len(pool)}")
+    print(f"  Model vocab size:     {len(pool) + 1}")
 
     # ── Build target unitary ────────────────────────────────────────────────
     # Delegated entirely to target.py — changing cfg.target.type selects
@@ -192,6 +193,7 @@ def main():
             if isinstance(best_indices, list)
             else best_indices[1:].tolist()
         )
+        gate_indices = [token_id - 1 for token_id in gate_indices]
         gate_names = [pool[i][0] for i in gate_indices]
         selected_cnot_count = sum(name.startswith("CNOT") for name in gate_names)
         print(f"  Best circuit ({len(gate_names)} gates):")

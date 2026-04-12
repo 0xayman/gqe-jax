@@ -1,13 +1,13 @@
 # config.yml — GQE Quantum Compilation Configuration
 
 target:
-  num_qubits: 3
-  type: "haar_random" # Load a saved target unitary from disk
-  path: "targets/haar_random_q3.npy"
+  num_qubits: 2
+  type: "file" # Load a saved target unitary from disk
+  path: "targets/haar_random_q2.npy"
 
 model:
   size: "small" # tiny | small | medium | large
-  max_gates_count: 125 # Sequence length N
+  max_gates_count: 28 # Sequence length N
 
 training:
   max_epochs: 100

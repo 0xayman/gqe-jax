@@ -81,7 +81,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
     best_indices = None
     best_raw_fidelity = None
     best_cnot_count = None
-    pipeline._starting_idx = np.zeros((pipeline.num_samples, 1), dtype=np.int32)
+    pipeline._starting_idx = pipeline._make_starting_idx(pipeline.num_samples)
     run_start = time.perf_counter()
 
     if cfg.logging.verbose:
@@ -203,6 +203,6 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
 def gqe(cost_fn, pool, cfg: GQEConfig, model=None, u_target=None, logger=None):
     factory = Factory()
     if model is None:
-        model = GPT2(cfg.model.size, len(pool))
+        model = GPT2(cfg.model.size, len(pool) + 1)
     pipeline = Pipeline(cfg, cost_fn, pool, model, factory, u_target=u_target)
     return _run_training(cfg, pipeline, logger=logger)

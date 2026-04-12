@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from config import (
@@ -18,9 +19,11 @@ from config import (
 )
 from continuous_optimizer import ContinuousOptimizer
 from cost import build_cost_fn
+from factory import Factory
 from gqe import gqe
+from model import GPT2
 from operator_pool import build_operator_pool
-from pipeline import _sequence_structure_metrics
+from pipeline import Pipeline, _sequence_structure_metrics
 from target import build_target
 
 
@@ -55,6 +58,23 @@ def _tiny_cfg(*, continuous_opt_enabled: bool, batch_size: int = 2) -> GQEConfig
             top_k=1,
             num_restarts=2,
         ),
+    )
+
+
+def _build_pipeline(*, continuous_opt_enabled: bool, batch_size: int = 2) -> tuple[Pipeline, list]:
+    cfg = _tiny_cfg(continuous_opt_enabled=continuous_opt_enabled, batch_size=batch_size)
+    pool = build_operator_pool(cfg.target.num_qubits)
+    u_target, _ = build_target(pool, cfg)
+    cost_fn = build_cost_fn(u_target)
+    model = GPT2(cfg.model.size, len(pool) + 1)
+    pipeline = Pipeline(cfg, cost_fn, pool, model, Factory(), u_target=u_target)
+    return pipeline, pool
+
+
+def _tree_equal(left, right) -> bool:
+    return all(
+        np.array_equal(np.asarray(a), np.asarray(b))
+        for a, b in zip(jax.tree_util.tree_leaves(left), jax.tree_util.tree_leaves(right))
     )
 
 
@@ -200,3 +220,104 @@ def test_sequence_structure_metrics_reports_depth_and_gate_counts():
     assert depth == 3
     assert total_gates == 4
     assert cnot_count == 1
+
+
+def test_pipeline_rollout_uses_distinct_bos_token():
+    pipeline, pool = _build_pipeline(continuous_opt_enabled=False)
+
+    rollout = pipeline.generate()
+
+    assert rollout.shape == (pipeline.num_samples, pipeline.ngates + 1)
+    assert np.all(rollout[:, 0] == pipeline.bos_token_id)
+    assert np.all(rollout[:, 1:] >= pipeline.gate_token_offset)
+    assert np.all(rollout[:, 1:] < len(pool) + pipeline.gate_token_offset)
+
+
+def test_grpo_loss_is_zero_when_batch_costs_are_identical():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False)
+    beta = jnp.asarray(pipeline.scheduler.get_inverse_temperature(), dtype=jnp.float32)
+    idx = jnp.asarray(
+        [
+            [0, 1, 2, 3, 4],
+            [0, 4, 3, 2, 1],
+        ],
+        dtype=jnp.int32,
+    )
+    identical_costs = jnp.asarray([0.25, 0.25], dtype=jnp.float32)
+
+    loss = pipeline._grpo_loss(
+        pipeline.state.params,
+        pipeline.state.params,
+        idx,
+        identical_costs,
+        beta,
+    )
+
+    assert float(np.asarray(loss)) == 0.0
+
+
+def test_train_batch_freezes_reference_params_for_epoch():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False)
+    idx = np.asarray(
+        [
+            [0, 1, 2, 3, 4],
+            [0, 4, 3, 2, 1],
+        ],
+        dtype=np.int32,
+    )
+    initial_params = pipeline.state.params
+
+    pipeline.train_batch(idx, np.asarray([0.1, 0.9], dtype=np.float32), batch_idx=0)
+    reference_after_batch0 = pipeline._reference_params
+    params_after_batch0 = pipeline.state.params
+
+    assert _tree_equal(reference_after_batch0, initial_params)
+    assert any(
+        not np.array_equal(np.asarray(a), np.asarray(b))
+        for a, b in zip(
+            jax.tree_util.tree_leaves(reference_after_batch0),
+            jax.tree_util.tree_leaves(params_after_batch0),
+        )
+    )
+
+    pipeline.train_batch(idx[::-1], np.asarray([0.8, 0.2], dtype=np.float32), batch_idx=1)
+
+    assert _tree_equal(pipeline._reference_params, reference_after_batch0)
+
+
+def test_continuous_optimizer_simplify_batch_with_remaining_params():
+    cfg = _tiny_cfg(continuous_opt_enabled=True)
+    pool = build_operator_pool(cfg.target.num_qubits)
+    u_target, _ = build_target(pool, cfg)
+    optimizer = ContinuousOptimizer(
+        u_target=u_target,
+        num_qubits=cfg.target.num_qubits,
+        steps=2,
+        lr=0.1,
+        optimizer_type="lbfgs",
+        top_k=0,
+        max_gates=cfg.model.max_gates_count,
+        num_restarts=1,
+        pool_token_names=[name for name, _ in pool],
+    )
+    name_to_idx = {name: idx for idx, (name, _) in enumerate(pool)}
+    token_ids = np.asarray(
+        [
+            [
+                name_to_idx["RZ_q0"],
+                name_to_idx["RZ_q0"],
+                name_to_idx["RZ_q1"],
+                name_to_idx["SX_q1"],
+            ]
+        ],
+        dtype=np.int32,
+    )
+
+    fidelities, _ = optimizer.optimize_token_index_batch(
+        token_ids,
+        jax.random.PRNGKey(cfg.training.seed),
+        simplify=True,
+    )
+
+    assert fidelities.shape == (1,)
+    assert 0.0 <= float(fidelities[0]) <= 1.0

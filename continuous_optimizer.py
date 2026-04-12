@@ -728,7 +728,7 @@ class ContinuousOptimizer:
             if int(simp_params.size) > 0:
                 simplified_specs_batch.append(simp_specs)
                 simplified_full_init_batch.append(np.asarray(simp_full_init, dtype=np.float64))
-                simplified_global_indices.append(batch_idx)
+                simplified_global_indices.append(global_idx)
                 continue
 
             gate_type_ids, qubit0, cnot_pair = self._encode_gate_specs(simp_specs)
