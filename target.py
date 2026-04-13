@@ -42,6 +42,12 @@ TargetGenerator = Callable[
 ]
 
 
+def _infer_num_qubits_from_dimension(dim: int) -> int | None:
+    if dim <= 0 or dim & (dim - 1):
+        return None
+    return dim.bit_length() - 1
+
+
 def _compose_unitary(gate_matrices: List[np.ndarray], d: int) -> np.ndarray:
     """Compose an ordered gate list into a single unitary.
 
@@ -124,8 +130,19 @@ def file_target_generator(
     u_target = np.load(path).astype(np.complex128, copy=False)
     d = 2**cfg.target.num_qubits
     if u_target.shape != (d, d):
+        inferred_qubits = None
+        if len(u_target.shape) == 2 and u_target.shape[0] == u_target.shape[1]:
+            inferred_qubits = _infer_num_qubits_from_dimension(u_target.shape[0])
+        inferred_hint = (
+            f" The file looks like a {inferred_qubits}-qubit unitary."
+            if inferred_qubits is not None
+            else ""
+        )
         raise ValueError(
-            f"Loaded unitary shape {u_target.shape} does not match expected {(d, d)}"
+            f"Loaded unitary from {path} has shape {u_target.shape}, but "
+            f"target.num_qubits={cfg.target.num_qubits} expects {(d, d)}."
+            f"{inferred_hint} Update either target.path or target.num_qubits "
+            f"so they refer to the same system size."
         )
     desc = f"file:{path}"
     return u_target, desc

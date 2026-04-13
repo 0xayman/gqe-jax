@@ -9,14 +9,8 @@ import numpy as np
 import optax
 from flax.training import train_state
 
-from cost import compilation_cost_batch_jax, process_fidelity
+from cost import _unbiased_std, compilation_cost_batch_jax, process_fidelity
 from data import BufferDataset, ReplayBuffer
-
-
-def _unbiased_std(values: jax.Array) -> jax.Array:
-    if values.size <= 1:
-        return jnp.asarray(0.0, dtype=values.dtype)
-    return jnp.std(values, ddof=1)
 
 
 def _sequence_structure_metrics(
@@ -72,8 +66,9 @@ class Pipeline:
         self._last_rollout_costs = np.zeros((0,), dtype=np.float32)
         self._last_rollout_fidelities = np.zeros((0,), dtype=np.float32)
         self._last_rollout_cnot_counts = np.zeros((0,), dtype=np.int32)
+        self._last_rollout_old_log_probs = np.zeros((0,), dtype=np.float32)
         self._last_rollout_indices = np.zeros((0, self.ngates + 1), dtype=np.int32)
-        self._reference_params = None
+        self.batch_rng = np.random.default_rng(cfg.training.seed)
 
         self.pool_names = ["<BOS>", *[name for name, _ in pool]]
         self.two_qubit_token_mask = np.zeros((self.vocab_size,), dtype=bool)
@@ -161,16 +156,15 @@ class Pipeline:
         def calc_advantage(costs):
             return (jnp.mean(costs) - costs) / (_unbiased_std(costs) + 1e-8)
 
-        def grpo_loss(params, reference_params, idx, costs, beta):
+        def rollout_sequence_log_probs(params, idx, beta):
             attention_mask = jnp.ones_like(idx, dtype=bool)
             gate_indices = idx[:, 1:]
-            advantages = jax.lax.stop_gradient(calc_advantage(costs))
             current_logits = model_logits(params, idx, attention_mask)
-            reference_logits = model_logits(reference_params, idx, attention_mask)
-            current_sequence_log_probs = sequence_log_probs(current_logits, gate_indices, beta)
-            old_sequence_log_probs = jax.lax.stop_gradient(
-                sequence_log_probs(reference_logits, gate_indices, beta)
-            )
+            return sequence_log_probs(current_logits, gate_indices, beta)
+
+        def grpo_loss(params, idx, costs, beta, old_sequence_log_probs):
+            current_sequence_log_probs = rollout_sequence_log_probs(params, idx, beta)
+            advantages = jax.lax.stop_gradient(calc_advantage(costs))
             ratio = jnp.exp(current_sequence_log_probs - old_sequence_log_probs)
             clipped_ratio = jnp.clip(
                 ratio,
@@ -180,13 +174,13 @@ class Pipeline:
             surrogate = jnp.minimum(ratio * advantages, clipped_ratio * advantages)
             return -jnp.mean(surrogate)
 
-        def grpo_step(state, reference_params, idx, costs, beta):
+        def grpo_step(state, idx, costs, beta, old_sequence_log_probs):
             loss_value, grads = jax.value_and_grad(grpo_loss)(
                 state.params,
-                reference_params,
                 idx,
                 costs,
                 beta,
+                old_sequence_log_probs,
             )
             state = state.apply_gradients(grads=grads)
             return state, loss_value
@@ -220,6 +214,7 @@ class Pipeline:
         self._model_logits = jax.jit(model_logits)
         self._grpo_loss = jax.jit(grpo_loss)
         self._grpo_step = jax.jit(grpo_step)
+        self._rollout_sequence_log_probs = jax.jit(rollout_sequence_log_probs)
         self._generate_rollout = jax.jit(generate_rollout)
         if self.u_target_jax is not None:
             self._discrete_cost_batch = jax.jit(
@@ -241,13 +236,23 @@ class Pipeline:
 
     def collect_rollout(self):
         idx_output = self.generate()
+        beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
+        old_log_probs = np.asarray(
+            self._rollout_sequence_log_probs(
+                self.state.params,
+                jnp.asarray(idx_output, dtype=jnp.int32),
+                beta,
+            ),
+            dtype=np.float32,
+        )
         costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
-        for seq, cost_val in zip(idx_output, costs):
-            self.buffer.push(seq, cost_val)
+        for seq, cost_val, old_log_prob in zip(idx_output, costs, old_log_probs):
+            self.buffer.push(seq, cost_val, old_log_prob)
         self.scheduler.update(costs=costs)
         self._last_rollout_costs = np.asarray(costs, dtype=np.float32)
         self._last_rollout_fidelities = np.asarray(fidelities, dtype=np.float32)
         self._last_rollout_cnot_counts = np.asarray(cnot_counts, dtype=np.int32)
+        self._last_rollout_old_log_probs = old_log_probs
         self._last_rollout_indices = np.asarray(idx_output, dtype=np.int32)
 
     def set_cost(self, cost):
@@ -269,30 +274,11 @@ class Pipeline:
         pool_idx_output: np.ndarray,
         cnot_counts: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._discrete_cost_batch is not None:
-            costs = self._discrete_cost_batch(jnp.asarray(pool_idx_output, dtype=jnp.int32))
-            fidelities = 1.0 - costs
-            return (
-                np.asarray(costs, dtype=np.float32),
-                np.asarray(fidelities, dtype=np.float32),
-                cnot_counts,
-            )
-
-        if self.u_target_jax is None:
+        if self._discrete_cost_batch is None:
             raise RuntimeError("Discrete metric evaluation requires a target unitary")
 
-        u_target = np.asarray(self.u_target_jax, dtype=np.complex128)
-        d = u_target.shape[0]
-        costs = []
-        fidelities = []
-        for row in pool_idx_output:
-            gate_matrices = [self.pool[j][1] for j in row.tolist()]
-            u_circuit = np.eye(d, dtype=np.complex128)
-            for gate in gate_matrices:
-                u_circuit = gate @ u_circuit
-            fidelity = process_fidelity(u_target, u_circuit)
-            fidelities.append(fidelity)
-            costs.append(1.0 - fidelity)
+        costs = self._discrete_cost_batch(jnp.asarray(pool_idx_output, dtype=jnp.int32))
+        fidelities = 1.0 - costs
         return (
             np.asarray(costs, dtype=np.float32),
             np.asarray(fidelities, dtype=np.float32),
@@ -343,24 +329,28 @@ class Pipeline:
     def train_dataloader(self):
         return BufferDataset(self.buffer, self.cfg.buffer.steps_per_epoch)
 
-    def train_batch(self, idx: np.ndarray, costs: np.ndarray, batch_idx: int) -> float:
+    def train_batch(
+        self,
+        idx: np.ndarray,
+        costs: np.ndarray,
+        old_log_probs: np.ndarray,
+    ) -> float:
         idx_jax = jnp.asarray(idx, dtype=jnp.int32)
         costs_jax = jnp.asarray(costs, dtype=jnp.float32)
+        old_log_probs_jax = jnp.asarray(old_log_probs, dtype=jnp.float32)
         beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
 
-        if batch_idx == 0:
-            self._reference_params = jax.tree_util.tree_map(
-                jax.lax.stop_gradient,
-                self.state.params,
+        if np.isnan(np.asarray(old_log_probs)).any():
+            raise RuntimeError(
+                "Replay buffer entry is missing behavior log-probabilities. "
+                "Clear legacy buffer contents and collect fresh rollouts."
             )
-        if self._reference_params is None:
-            raise RuntimeError("GRPO reference parameters were not initialized on batch 0")
         self.state, loss_value = self._grpo_step(
             self.state,
-            self._reference_params,
             idx_jax,
             costs_jax,
             beta,
+            old_log_probs_jax,
         )
         return float(np.asarray(loss_value, dtype=np.float32))
 

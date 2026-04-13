@@ -29,6 +29,7 @@ _INIT_STDDEV = 0.02
 _LAYER_NORM_EPS = 1.0e-5
 _N_POSITIONS = 1024
 _DROPOUT_RATE = 0.1
+_CAUSAL_MASK = jnp.tril(jnp.ones((_N_POSITIONS, _N_POSITIONS), dtype=bool))
 
 
 def _gelu_new(x: jax.Array) -> jax.Array:
@@ -77,7 +78,7 @@ class _CausalSelfAttention(nn.Module):
         scale = jnp.asarray(head_dim, dtype=hidden_states.dtype) ** -0.5
         attn_scores = jnp.einsum("bnth,bnsh->bnts", query, key) * scale
 
-        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=bool))
+        causal_mask = _CAUSAL_MASK[:seq_len, :seq_len]
         if attention_mask is None:
             key_mask = jnp.ones((batch_size, seq_len), dtype=bool)
         else:

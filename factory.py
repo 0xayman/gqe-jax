@@ -2,7 +2,7 @@
 
 from continuous_optimizer import ContinuousOptimizer
 from loss import GRPOLoss
-from scheduler import CosineScheduler, DefaultScheduler, VarBasedScheduler
+from scheduler import CosineScheduler, DefaultScheduler
 
 
 class Factory:
@@ -22,11 +22,6 @@ class Factory:
                 minimum=cfg.temperature.min_value,
                 maximum=cfg.temperature.max_value,
                 frequency=max(1, cfg.training.max_epochs // 2),
-            ),
-            "variance": lambda: VarBasedScheduler(
-                initial=cfg.temperature.initial_value,
-                delta=cfg.temperature.delta,
-                target_var=1e-5,
             ),
         }
         if scheduler_type not in scheduler_builders:

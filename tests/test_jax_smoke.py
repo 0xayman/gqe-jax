@@ -18,9 +18,11 @@ from config import (
     TrainingConfig,
 )
 from continuous_optimizer import ContinuousOptimizer
-from cost import build_cost_fn
+from cost import build_cost_fn, process_fidelity
+from data import BufferDataset, ReplayBuffer
 from factory import Factory
 from gqe import gqe
+from main import _build_qiskit_circuit
 from model import GPT2
 from operator_pool import build_operator_pool
 from pipeline import Pipeline, _sequence_structure_metrics
@@ -69,14 +71,6 @@ def _build_pipeline(*, continuous_opt_enabled: bool, batch_size: int = 2) -> tup
     model = GPT2(cfg.model.size, len(pool) + 1)
     pipeline = Pipeline(cfg, cost_fn, pool, model, Factory(), u_target=u_target)
     return pipeline, pool
-
-
-def _tree_equal(left, right) -> bool:
-    return all(
-        np.array_equal(np.asarray(a), np.asarray(b))
-        for a, b in zip(jax.tree_util.tree_leaves(left), jax.tree_util.tree_leaves(right))
-    )
-
 
 def test_discrete_gqe_smoke():
     cfg = _tiny_cfg(continuous_opt_enabled=False)
@@ -222,6 +216,36 @@ def test_sequence_structure_metrics_reports_depth_and_gate_counts():
     assert cnot_count == 1
 
 
+def test_replay_buffer_batches_include_behavior_log_probs():
+    buffer = ReplayBuffer(size=8)
+    for idx, old_log_prob in enumerate([-1.5, -0.5, -2.0, -1.0]):
+        buffer.push([0, idx + 1], 0.1 * idx, old_log_prob)
+
+    dataset = BufferDataset(buffer, repetition=1)
+    batch = next(
+        dataset.iter_batches(
+            2,
+            shuffle=True,
+            rng=np.random.default_rng(0),
+        )
+    )
+
+    assert set(batch) == {"idx", "cost", "old_log_prob"}
+    assert batch["idx"].shape == (2, 2)
+    assert batch["cost"].shape == (2,)
+    assert batch["old_log_prob"].shape == (2,)
+    assert np.isfinite(batch["old_log_prob"]).all()
+
+
+def test_replay_buffer_legacy_entries_get_nan_old_log_prob():
+    buffer = ReplayBuffer(size=1)
+    buffer.buf.append((np.asarray([0, 1], dtype=np.int32), np.float32(0.25)))
+
+    item = buffer[0]
+
+    assert np.isnan(item["old_log_prob"])
+
+
 def test_pipeline_rollout_uses_distinct_bos_token():
     pipeline, pool = _build_pipeline(continuous_opt_enabled=False)
 
@@ -244,19 +268,24 @@ def test_grpo_loss_is_zero_when_batch_costs_are_identical():
         dtype=jnp.int32,
     )
     identical_costs = jnp.asarray([0.25, 0.25], dtype=jnp.float32)
+    old_log_probs = pipeline._rollout_sequence_log_probs(
+        pipeline.state.params,
+        idx,
+        beta,
+    )
 
     loss = pipeline._grpo_loss(
-        pipeline.state.params,
         pipeline.state.params,
         idx,
         identical_costs,
         beta,
+        old_log_probs,
     )
 
     assert float(np.asarray(loss)) == 0.0
 
 
-def test_train_batch_freezes_reference_params_for_epoch():
+def test_train_batch_updates_params_with_behavior_log_probs():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False)
     idx = np.asarray(
         [
@@ -266,23 +295,68 @@ def test_train_batch_freezes_reference_params_for_epoch():
         dtype=np.int32,
     )
     initial_params = pipeline.state.params
+    beta = jnp.asarray(pipeline.scheduler.get_inverse_temperature(), dtype=jnp.float32)
+    old_log_probs = np.asarray(
+        pipeline._rollout_sequence_log_probs(
+            pipeline.state.params,
+            jnp.asarray(idx, dtype=jnp.int32),
+            beta,
+        ),
+        dtype=np.float32,
+    )
 
-    pipeline.train_batch(idx, np.asarray([0.1, 0.9], dtype=np.float32), batch_idx=0)
-    reference_after_batch0 = pipeline._reference_params
-    params_after_batch0 = pipeline.state.params
+    pipeline.train_batch(
+        idx,
+        np.asarray([0.1, 0.9], dtype=np.float32),
+        old_log_probs,
+    )
+    params_after_batch = pipeline.state.params
 
-    assert _tree_equal(reference_after_batch0, initial_params)
     assert any(
         not np.array_equal(np.asarray(a), np.asarray(b))
         for a, b in zip(
-            jax.tree_util.tree_leaves(reference_after_batch0),
-            jax.tree_util.tree_leaves(params_after_batch0),
+            jax.tree_util.tree_leaves(initial_params),
+            jax.tree_util.tree_leaves(params_after_batch),
         )
     )
 
-    pipeline.train_batch(idx[::-1], np.asarray([0.8, 0.2], dtype=np.float32), batch_idx=1)
 
-    assert _tree_equal(pipeline._reference_params, reference_after_batch0)
+def test_qiskit_reconstruction_matches_internal_optimizer_unitary():
+    from qiskit.quantum_info import Operator
+
+    root = Path(__file__).resolve().parents[1]
+    num_qubits = 2
+    u_target = np.load(root / "targets" / "haar_random_q2.npy").astype(np.complex128)
+    gate_names = [
+        "RZ_q0", "SX_q0", "RZ_q0", "RZ_q1", "CNOT_q0_q1", "SX_q0", "RZ_q0",
+        "RZ_q1", "SX_q1", "RZ_q1", "RZ_q1", "CNOT_q0_q1", "SX_q0", "RZ_q1",
+        "CNOT_q0_q1", "RZ_q0", "RZ_q1", "SX_q1", "CNOT_q1_q0", "RZ_q0",
+        "RZ_q1", "SX_q1", "RZ_q1", "CNOT_q1_q0", "RZ_q0", "SX_q0", "RZ_q0",
+        "RZ_q1",
+    ]
+    verifier = ContinuousOptimizer(
+        u_target=u_target,
+        num_qubits=num_qubits,
+        steps=100,
+        lr=0.1,
+        optimizer_type="lbfgs",
+        top_k=0,
+        max_gates=28,
+        num_restarts=3,
+    )
+
+    verified_f, gate_specs, opt_params, _ = verifier.optimize_circuit_with_params(
+        gate_names,
+        jax.random.PRNGKey(42),
+    )
+    qc = _build_qiskit_circuit(gate_specs, opt_params, num_qubits)
+    qc_fidelity = process_fidelity(
+        u_target,
+        np.asarray(Operator(qc).data, dtype=np.complex128),
+    )
+
+    assert verified_f > 1.0 - 1e-10
+    assert qc_fidelity > 1.0 - 1e-10
 
 
 def test_continuous_optimizer_simplify_batch_with_remaining_params():

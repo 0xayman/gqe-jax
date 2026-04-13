@@ -76,9 +76,9 @@ class GQEConfig:
     continuous_opt: ContinuousOptConfig = field(default_factory=ContinuousOptConfig)
 
 
-VALID_TARGET_TYPES = {"random_reachable", "haar_random", "file"}
+VALID_TARGET_TYPES = {"random", "random_reachable", "haar_random", "file"}
 VALID_MODEL_SIZES = {"tiny", "small", "medium", "large"}
-VALID_SCHEDULERS = {"fixed", "cosine", "variance"}
+VALID_SCHEDULERS = {"fixed", "cosine"}
 
 
 def validate_config(raw: dict) -> None:
@@ -126,6 +126,23 @@ def validate_config(raw: dict) -> None:
 
     _require_bool("logging.verbose", raw["logging"]["verbose"])
     _require_bool("logging.wandb", raw["logging"]["wandb"])
+
+    co = raw.get("continuous_opt", {})
+    if co:
+        _require_bool("continuous_opt.enabled", co.get("enabled", False))
+        if co.get("steps", 1) <= 0:
+            raise ValueError("continuous_opt.steps must be positive")
+        if co.get("lr", 1.0) <= 0:
+            raise ValueError("continuous_opt.lr must be positive")
+        if co.get("optimizer", "lbfgs") not in {"lbfgs", "adam"}:
+            raise ValueError(
+                f"Invalid continuous_opt.optimizer: {co['optimizer']!r}. "
+                "Must be 'lbfgs' or 'adam'."
+            )
+        if co.get("top_k", 0) < 0:
+            raise ValueError("continuous_opt.top_k must be >= 0")
+        if co.get("num_restarts", 1) < 1:
+            raise ValueError("continuous_opt.num_restarts must be >= 1")
 
 
 def load_config(path: str) -> GQEConfig:

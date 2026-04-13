@@ -1,23 +1,23 @@
 # config.yml — GQE Quantum Compilation Configuration
 
 target:
-  num_qubits: 2
+  num_qubits: 3
   type: "file" # Load a saved target unitary from disk
-  path: "targets/haar_random_q2.npy"
+  path: "targets/haar_random_q3.npy"
 
 model:
   size: "small" # tiny | small | medium | large
-  max_gates_count: 28 # Sequence length N
+  max_gates_count: 125 # Sequence length N
 
 training:
-  max_epochs: 100
-  num_samples: 100 # Circuits generated per epoch (rollout size)
+  max_epochs: 200
+  num_samples: 200 # Circuits generated per epoch (rollout size)
   batch_size: 32 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
   grad_norm_clip: 1.0
   seed: 42
   grpo_clip_ratio: 0.2
-  early_stop: true # Stop training once fidelity reaches 1.0
+  early_stop: false # Stop training once fidelity reaches 1.0
 
 temperature:
   scheduler: "fixed"
@@ -28,7 +28,7 @@ temperature:
 
 buffer:
   max_size: 500
-  warmup_size: 50
+  warmup_size: 100
   steps_per_epoch: 4
 
 logging:
@@ -38,7 +38,7 @@ logging:
 continuous_opt:
   enabled: true
   optimizer: lbfgs # lbfgs | adam
-  steps: 100 # lbfgs: max L-BFGS iterations | adam: gradient steps
+  steps: 200 # lbfgs: max L-BFGS iterations | adam: gradient steps
   lr: 0.1 # lbfgs is ~10x faster than adam for small param counts
   top_k: 0 # optimize all circuits; set to e.g. 20 to only optimize top-20% by discrete fidelity
   num_restarts: 3

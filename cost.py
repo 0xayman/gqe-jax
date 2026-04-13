@@ -10,6 +10,12 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _unbiased_std(values: jax.Array) -> jax.Array:
+    if values.size <= 1:
+        return jnp.asarray(0.0, dtype=values.dtype)
+    return jnp.std(values, ddof=1)
+
+
 def process_fidelity(u_target: np.ndarray, u_circuit: np.ndarray) -> float:
     d = u_target.shape[0]
     trace = np.trace(u_target.conj().T @ u_circuit)

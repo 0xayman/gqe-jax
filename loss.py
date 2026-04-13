@@ -10,11 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-
-def _unbiased_std(values: jax.Array) -> jax.Array:
-    if values.size <= 1:
-        return jnp.asarray(0.0, dtype=values.dtype)
-    return jnp.std(values, ddof=1)
+from cost import _unbiased_std
 
 
 class Loss(ABC):

@@ -40,7 +40,7 @@ class _WandbLogger:
 
 def _build_logger(cfg: GQEConfig):
     if not cfg.logging.wandb:
-        return False
+        return None
     return _WandbLogger(cfg)
 
 
@@ -124,9 +124,15 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
             dataloader.iter_batches(
                 cfg.training.batch_size,
                 drop_last=True,
+                shuffle=True,
+                rng=pipeline.batch_rng,
             )
         ):
-            loss = pipeline.train_batch(batch["idx"], batch["cost"], batch_idx)
+            loss = pipeline.train_batch(
+                batch["idx"],
+                batch["cost"],
+                batch["old_log_prob"],
+            )
             epoch_losses.append(loss)
 
         epoch_loss = (
@@ -139,7 +145,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
         )
         run_best_depth = -1
         run_best_total_gates = -1
-        run_best_cnot_count = int(best_cnot_count) if best_cnot_count is not None else -1
+        run_best_cnot_count = -1
         if best_indices is not None:
             run_best_depth, run_best_total_gates, run_best_cnot_count = (
                 pipeline.sequence_structure_metrics(np.asarray(best_indices, dtype=np.int32)[1:])
@@ -183,7 +189,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
                 step=epoch,
             )
 
-        if cfg.training.early_stop and run_best_fidelity >= 1.0:
+        if cfg.training.early_stop and run_best_fidelity >= 1.0 - 1e-8:
             if cfg.logging.verbose:
                 print(
                     f"Fidelity 1.0 reached at epoch {epoch + 1:03d}"

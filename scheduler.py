@@ -55,23 +55,3 @@ class CosineScheduler(TemperatureScheduler):
         ) / 2 * math.cos(2 * math.pi * self.current_iter / self.frequency)
 
 
-class VarBasedScheduler(TemperatureScheduler):
-    def __init__(self, initial: float, delta: float, target_var: float):
-        self.delta = delta
-        self.current_temperature = initial
-        self.target_var = target_var
-
-    def get_inverse_temperature(self) -> float:
-        return self.current_temperature
-
-    def update(self, **kwargs) -> None:
-        costs = kwargs.get("costs", kwargs.get("energies"))
-        if costs is None:
-            return
-        costs = np.asarray(costs, dtype=np.float64)
-        current_var = float(np.var(costs, ddof=1))
-        if current_var > self.target_var:
-            self.current_temperature += self.delta
-        else:
-            self.current_temperature -= self.delta
-        self.current_temperature = max(self.current_temperature, 0.01)

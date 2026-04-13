@@ -63,31 +63,25 @@ def _build_qiskit_circuit_from_names(gate_names: list[str], num_qubits: int):
 
     qc = QuantumCircuit(num_qubits)
     default_angle = np.pi / 4
+    def _map_qubit(qubit: int) -> int:
+        return num_qubits - 1 - qubit
     for name in gate_names:
         parts = name.split("_")
         gate_type = parts[0]
         if gate_type in ("RX", "RY", "RZ"):
             qubit = int(parts[1][1:])
-            getattr(qc, gate_type.lower())(default_angle, qubit)
+            getattr(qc, gate_type.lower())(default_angle, _map_qubit(qubit))
         elif gate_type == "SX":
             qubit = int(parts[1][1:])
-            qc.sx(qubit)
+            qc.sx(_map_qubit(qubit))
         elif gate_type == "CNOT":
             ctrl, tgt = int(parts[1][1:]), int(parts[2][1:])
-            qc.cx(ctrl, tgt)
+            qc.cx(_map_qubit(ctrl), _map_qubit(tgt))
     return qc
 
 
-def _print_comparison_table(
-    gqe_fidelity: float,
-    gqe_depth: int,
-    gqe_total: int,
-    gqe_two_q: int,
-    qiskit_depth: int,
-    qiskit_total: int,
-    qiskit_two_q: int,
-) -> None:
-    """Print a side-by-side comparison table of GQE vs Qiskit compilation."""
+def _print_comparison_table(rows) -> None:
+    """Print a side-by-side comparison table for compiled circuits."""
     col_w = [10, 12, 9, 15, 17]
     header = ["", "Fidelity", "Depth", "Total gates", "2-qubit gates"]
     sep = "+" + "+".join("-" * w for w in col_w) + "+"
@@ -103,12 +97,12 @@ def _print_comparison_table(
         )
 
     print(f"\n{'=' * 55}")
-    print("GQE vs Qiskit Compilation Comparison")
+    print("Compilation Comparison")
     print(sep)
     print(f"| {'':>{col_w[0]-2}} | {header[1]:>{col_w[1]-2}} | {header[2]:>{col_w[2]-2}} | {header[3]:>{col_w[3]-2}} | {header[4]:>{col_w[4]-2}} |")
     print(sep)
-    print(row("GQE", gqe_fidelity, gqe_depth, gqe_total, gqe_two_q))
-    print(row("Qiskit", 1.0, qiskit_depth, qiskit_total, qiskit_two_q))
+    for label, fidelity, depth, total, two_q in rows:
+        print(row(label, fidelity, depth, total, two_q))
     print(sep)
 
 
@@ -117,20 +111,22 @@ def _build_qiskit_circuit(gate_specs, opt_params, num_qubits):
     from qiskit import QuantumCircuit
     qc = QuantumCircuit(num_qubits)
     param_idx = 0
+    def _map_qubit(qubit: int) -> int:
+        return num_qubits - 1 - qubit
     for spec in gate_specs:
         if spec.is_parametric:
             theta = float(opt_params[param_idx])
             param_idx += 1
             if spec.gate_type == "RX":
-                qc.rx(theta, spec.qubits[0])
+                qc.rx(theta, _map_qubit(spec.qubits[0]))
             elif spec.gate_type == "RY":
-                qc.ry(theta, spec.qubits[0])
+                qc.ry(theta, _map_qubit(spec.qubits[0]))
             elif spec.gate_type == "RZ":
-                qc.rz(theta, spec.qubits[0])
+                qc.rz(theta, _map_qubit(spec.qubits[0]))
         elif spec.gate_type == "SX":
-            qc.sx(spec.qubits[0])
+            qc.sx(_map_qubit(spec.qubits[0]))
         elif spec.gate_type == "CNOT":
-            qc.cx(spec.qubits[0], spec.qubits[1])
+            qc.cx(_map_qubit(spec.qubits[0]), _map_qubit(spec.qubits[1]))
     return qc
 
 
@@ -150,9 +146,6 @@ def main():
     print(f"  JAX backend:          {jax.default_backend()}")
     print(f"  JAX devices:          {jax.devices()}")
 
-    # ── Initialize W&B logger immediately (before any training work) ────────
-    logger = _build_logger(cfg)
-
     # ── Build operator pool ─────────────────────────────────────────────────
     pool = build_operator_pool(num_qubits=cfg.target.num_qubits)
     print(f"  Gate pool size:       {len(pool)}")
@@ -169,6 +162,9 @@ def main():
     deviation = np.max(np.abs(u_target @ u_target.conj().T - np.eye(d)))
     assert deviation < 1e-10, f"Target is not unitary! Max deviation: {deviation}"
     print(f"  Unitarity verified (d={d})")
+
+    # ── Initialize W&B logger only after config/target validation succeeds ──
+    logger = _build_logger(cfg)
 
     # ── Compile target with Qiskit (reference circuit) ──────────────────────
     qiskit_compiled = _compile_target_with_qiskit(u_target, cfg.target.num_qubits)
@@ -200,6 +196,8 @@ def main():
         for k, name in enumerate(gate_names):
             print(f"    [{k}] {name}")
 
+        from qiskit.quantum_info import Operator
+
         # Independently verify by re-running the optimizer on the best gate structure
         if cfg.continuous_opt.enabled:
             verifier = ContinuousOptimizer(
@@ -223,25 +221,29 @@ def main():
             verified_f = process_fidelity(u_target, u_circuit)
             gate_specs, opt_params = None, None
             gqe_qc = _build_qiskit_circuit_from_names(gate_names, cfg.target.num_qubits)
+
+        gqe_fidelity = process_fidelity(
+            u_target,
+            np.asarray(Operator(gqe_qc).data, dtype=np.complex128),
+        )
+
         print(f"  Best raw fidelity:    {verified_f:.6f}")
-        print(f"  CNOT count:           {selected_cnot_count}")
+        print(f"  GQE fidelity:         {gqe_fidelity:.6f}")
+        print(f"  Raw decoded CNOTs:    {selected_cnot_count}")
+        print(f"  GQE CNOTs:            {int(gqe_qc.count_ops().get('cx', 0))}")
 
         # ── Draw the optimized circuit ───────────────────────────────────────
-        if gate_specs is not None:
-            print(f"\n{'=' * 55}")
-            print("Best circuit (Qiskit draw):")
-            print(gqe_qc.draw("text", fold=-1))
+        print(f"\n{'=' * 55}")
+        print("Best GQE circuit (Qiskit draw):")
+        print(gqe_qc.draw("text", fold=-1))
 
         # ── Comparison table ─────────────────────────────────────────────────
         gqe_depth, gqe_total, gqe_two_q = _circuit_stats(gqe_qc)
         _print_comparison_table(
-            gqe_fidelity=verified_f,
-            gqe_depth=gqe_depth,
-            gqe_total=gqe_total,
-            gqe_two_q=gqe_two_q,
-            qiskit_depth=qiskit_depth,
-            qiskit_total=qiskit_total,
-            qiskit_two_q=qiskit_two_q,
+            [
+                ("GQE", gqe_fidelity, gqe_depth, gqe_total, gqe_two_q),
+                ("Qiskit", 1.0, qiskit_depth, qiskit_total, qiskit_two_q),
+            ]
         )
 
 
