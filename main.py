@@ -130,6 +130,69 @@ def _build_qiskit_circuit(gate_specs, opt_params, num_qubits):
     return qc
 
 
+def _print_pareto_summary(pareto_archive, qiskit_depth: int, qiskit_total: int, qiskit_two_q: int) -> None:
+    """Print a summary table of all Pareto-optimal circuits found during training."""
+    if pareto_archive is None or len(pareto_archive) == 0:
+        return
+
+    entries = pareto_archive.to_sorted_list()
+    hv = pareto_archive.hypervolume_2d()
+
+    print(f"\n{'=' * 55}")
+    print(f"Pareto Front  ({len(entries)} non-dominated circuits | HV={hv:.6f})")
+
+    # Column widths: label, fidelity, depth, total gates, 2-qubit gates, epoch
+    col_w = [14, 10, 7, 13, 15, 7]
+    header = ["Label", "Fidelity", "Depth", "Total gates", "2-qubit gates", "Epoch"]
+    sep = "+" + "+".join("-" * w for w in col_w) + "+"
+
+    def fmt_row(label, fidelity, depth, total, two_q, epoch):
+        return (
+            f"| {label:<{col_w[0]-2}} "
+            f"| {fidelity:>{col_w[1]-2}.6f} "
+            f"| {depth:>{col_w[2]-2}} "
+            f"| {total:>{col_w[3]-2}} "
+            f"| {two_q:>{col_w[4]-2}} "
+            f"| {epoch:>{col_w[5]-2}} |"
+        )
+
+    print(sep)
+    print(
+        f"| {'Label':<{col_w[0]-2}} "
+        f"| {'Fidelity':>{col_w[1]-2}} "
+        f"| {'Depth':>{col_w[2]-2}} "
+        f"| {'Total gates':>{col_w[3]-2}} "
+        f"| {'2-qubit gates':>{col_w[4]-2}} "
+        f"| {'Epoch':>{col_w[5]-2}} |"
+    )
+    print(sep)
+
+    for i, p in enumerate(entries):
+        # Mark notable circuits
+        best_f = pareto_archive.best_by_fidelity()
+        best_c = pareto_archive.best_by_cnot(min_fidelity=0.99)
+        best_d = pareto_archive.best_by_depth(min_fidelity=0.99)
+
+        tags = []
+        if best_f is not None and p is best_f:
+            tags.append("BF")   # best fidelity
+        if best_c is not None and p is best_c:
+            tags.append("BC")   # best CNOT at F≥0.99
+        if best_d is not None and p is best_d and p is not best_c:
+            tags.append("BD")   # best depth at F≥0.99
+        label = f"[{i}]{''.join(tags)}"
+
+        print(fmt_row(label, p.fidelity, p.depth, p.total_gates, p.cnot_count, p.epoch))
+
+    print(sep)
+
+    # Qiskit reference row
+    print(fmt_row("Qiskit ref", 1.0, qiskit_depth, qiskit_total, qiskit_two_q, -1))
+    print(sep)
+
+    print("Tags: BF=best fidelity  BC=best CNOT (F≥0.99)  BD=best depth (F≥0.99)")
+
+
 def main():
     load_dotenv()  # Load WANDB_API_KEY / WANDB_PROJECT from .env before W&B init
 
@@ -175,7 +238,7 @@ def main():
 
     # ── Run GQE training ────────────────────────────────────────────────────
     print("\nStarting GQE training...\n")
-    best_cost, best_indices = gqe(cost_fn, pool, cfg, u_target=u_target, logger=logger)
+    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target, logger=logger)
 
     # ── Report results ───────────────────────────────────────────────────────
     print(f"\n{'=' * 55}")
@@ -245,6 +308,9 @@ def main():
                 ("Qiskit", 1.0, qiskit_depth, qiskit_total, qiskit_two_q),
             ]
         )
+
+    # ── Pareto front summary ─────────────────────────────────────────────────
+    _print_pareto_summary(pareto_archive, qiskit_depth, qiskit_total, qiskit_two_q)
 
 
 if __name__ == "__main__":

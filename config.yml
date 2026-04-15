@@ -1,13 +1,13 @@
 # config.yml — GQE Quantum Compilation Configuration
 
 target:
-  num_qubits: 3
+  num_qubits: 2
   type: "file" # Load a saved target unitary from disk
-  path: "targets/haar_random_q3.npy"
+  path: "targets/haar_random_q2.npy"
 
 model:
   size: "small" # tiny | small | medium | large
-  max_gates_count: 125 # Sequence length N
+  max_gates_count: 28 # Sequence length N
 
 training:
   max_epochs: 200
@@ -42,3 +42,25 @@ continuous_opt:
   lr: 0.1 # lbfgs is ~10x faster than adam for small param counts
   top_k: 0 # optimize all circuits; set to e.g. 20 to only optimize top-20% by discrete fidelity
   num_restarts: 3
+
+pareto_gd:
+  enabled: true            # Run GD angle optimization on Pareto circuits after training
+  steps: 200               # Optimizer iterations per circuit (L-BFGS: 200 is usually enough)
+  lr: 0.1                  # Learning rate / step size
+  optimizer: lbfgs         # lbfgs (recommended) | adam
+  num_restarts: 3          # Random angle restarts — best result is kept
+  fidelity_eps: 1.0e-6     # Circuits with fidelity >= 1-eps are skipped (already perfect)
+
+pareto:
+  enabled: true
+  fidelity_floor: 0.5       # circuits below this fidelity are not archived
+  fidelity_floor_late: 0.9  # floor raised to this after floor_ramp_epoch
+  floor_ramp_epoch: 100     # epoch at which the floor is raised
+  max_archive_size: 500
+  alpha_F: 3.0              # Dirichlet param — higher = more weight on fidelity
+  alpha_d: 1.0              # Dirichlet param for depth weight
+  alpha_c: 1.0              # Dirichlet param for CNOT weight
+  w_F_min: 0.6              # hard minimum for fidelity weight after sampling
+  fidelity_threshold: 0.90  # complexity penalty only activates at or above this fidelity
+  # Depth and CNOT count are z-scored within each rollout batch — no reference
+  # values needed. The scalarization is fully self-referential.

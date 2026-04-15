@@ -11,6 +11,7 @@ from flax.training import train_state
 
 from cost import _unbiased_std, compilation_cost_batch_jax, process_fidelity
 from data import BufferDataset, ReplayBuffer
+from pareto import ParetoArchive, ParetoPoint
 
 
 def _sequence_structure_metrics(
@@ -114,6 +115,21 @@ class Pipeline:
             if u_target is not None
             else None
         )
+
+        # ── Pareto archive ──────────────────────────────────────────────────
+        pareto_cfg = cfg.pareto
+        if pareto_cfg.enabled:
+            self.pareto_archive: ParetoArchive | None = ParetoArchive(
+                max_size=pareto_cfg.max_archive_size,
+                fidelity_floor=pareto_cfg.fidelity_floor,
+            )
+        else:
+            self.pareto_archive = None
+        # Weight vector for the current rollout epoch.
+        # During warmup this stays at (1, 0, 0) — fidelity only.
+        self._warmup_mode: bool = True
+        self._current_epoch: int = 0
+        self._current_weights: np.ndarray = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
         self._compile_functions()
 
@@ -245,15 +261,47 @@ class Pipeline:
             ),
             dtype=np.float32,
         )
-        costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
-        for seq, cost_val, old_log_prob in zip(idx_output, costs, old_log_probs):
+        # fidelity_costs = 1 − F; used for tracking, best-circuit selection,
+        # and temperature scheduling — always fidelity-only regardless of Pareto mode.
+        fidelity_costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
+
+        # When Pareto is active, compute structure metrics and build the
+        # scalarized cost that goes into the replay buffer.
+        if self.pareto_archive is not None:
+            depths, total_gates = self._batch_compute_structure(idx_output[:, 1:])
+            if not self._warmup_mode:
+                self._current_weights = self._sample_weights()
+                buffer_costs = self._scalarize(fidelities, depths, cnot_counts)
+            else:
+                buffer_costs = fidelity_costs
+        else:
+            buffer_costs = fidelity_costs
+
+        for seq, cost_val, old_log_prob in zip(idx_output, buffer_costs, old_log_probs):
             self.buffer.push(seq, cost_val, old_log_prob)
-        self.scheduler.update(costs=costs)
-        self._last_rollout_costs = np.asarray(costs, dtype=np.float32)
+
+        # Scheduler always sees fidelity costs so its annealing is not confused
+        # by the changing scale of scalarized costs.
+        self.scheduler.update(costs=fidelity_costs)
+        self._last_rollout_costs = np.asarray(fidelity_costs, dtype=np.float32)
         self._last_rollout_fidelities = np.asarray(fidelities, dtype=np.float32)
         self._last_rollout_cnot_counts = np.asarray(cnot_counts, dtype=np.int32)
         self._last_rollout_old_log_probs = old_log_probs
         self._last_rollout_indices = np.asarray(idx_output, dtype=np.int32)
+
+        # Update the Pareto archive with every circuit from this rollout.
+        if self.pareto_archive is not None:
+            for i in range(len(idx_output)):
+                self.pareto_archive.update(
+                    ParetoPoint(
+                        fidelity=float(fidelities[i]),
+                        depth=int(depths[i]),
+                        total_gates=int(total_gates[i]),
+                        cnot_count=int(cnot_counts[i]),
+                        token_sequence=np.asarray(idx_output[i], dtype=np.int32).copy(),
+                        epoch=self._current_epoch,
+                    )
+                )
 
     def set_cost(self, cost):
         self._cost = cost
@@ -268,6 +316,80 @@ class Pipeline:
 
     def _count_cnot_tokens(self, idx_output: np.ndarray) -> np.ndarray:
         return np.count_nonzero(self.two_qubit_token_mask[idx_output], axis=1).astype(np.int32)
+
+    def _batch_compute_structure(
+        self, token_ids: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (depths, total_gates) for each sequence in the batch.
+
+        token_ids: shape (batch, ngates) — gate tokens without BOS.
+        Both returned arrays have shape (batch,) and dtype int32.
+        """
+        token_ids = np.asarray(token_ids, dtype=np.int32)
+        n = len(token_ids)
+        depths = np.zeros(n, dtype=np.int32)
+        total_gates = np.zeros(n, dtype=np.int32)
+        for i, row in enumerate(token_ids):
+            d, t, _ = self.sequence_structure_metrics(row)
+            depths[i] = d
+            total_gates[i] = t
+        return depths, total_gates
+
+    def _sample_weights(self) -> np.ndarray:
+        """Sample a weight vector (w_F, w_d, w_c) from the configured Dirichlet.
+
+        Enforces a hard minimum on w_F so fidelity is never fully ignored,
+        then re-normalises so the weights sum to 1.
+        """
+        p = self.cfg.pareto
+        w = np.random.dirichlet([p.alpha_F, p.alpha_d, p.alpha_c]).astype(np.float32)
+        if w[0] < p.w_F_min:
+            w[0] = p.w_F_min
+            w = w / w.sum()
+        return w
+
+    def _scalarize(
+        self,
+        fidelities: np.ndarray,
+        depths: np.ndarray,
+        cnot_counts: np.ndarray,
+    ) -> np.ndarray:
+        """Compute the scalarized cost with fidelity-threshold gating.
+
+        cost_i = w_F × (1 − F_i)
+               + gate_i × [ w_d × (d_i − μ_d) / (σ_d + ε)
+                           + w_c × (c_i − μ_c) / (σ_c + ε) ]
+
+        where gate_i = 1 if F_i >= fidelity_threshold, else 0.
+
+        The gate prevents mode collapse: circuits below the fidelity threshold
+        receive pure fidelity cost with no complexity bonus or penalty.  This
+        means the model cannot improve its reward by generating trivially short
+        but low-fidelity circuits (e.g. 0-CNOT, F≈0.39 for an entangled
+        2-qubit target).
+
+        The z-score is computed over the full batch for stability but is only
+        applied to circuits that have already earned the right to trade off
+        fidelity for shorter circuits.
+        """
+        w_F, w_d, w_c = self._current_weights
+        eps = 1e-8
+        threshold = self.cfg.pareto.fidelity_threshold
+
+        fidelities_f = np.asarray(fidelities, dtype=np.float32)
+        depths_f = np.asarray(depths, dtype=np.float32)
+        cnots_f = np.asarray(cnot_counts, dtype=np.float32)
+
+        # Gate: 1 for circuits above threshold, 0 below it.
+        gate = (fidelities_f >= threshold).astype(np.float32)
+
+        d_norm = (depths_f - depths_f.mean()) / (depths_f.std() + eps)
+        c_norm = (cnots_f - cnots_f.mean()) / (cnots_f.std() + eps)
+
+        return (
+            w_F * (1.0 - fidelities_f)
+            + gate * (w_d * d_norm + w_c * c_norm)
+        ).astype(np.float32)
 
     def _compute_discrete_metrics(
         self,

@@ -1,0 +1,648 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{Unitary Synthesis Methodology in the Current Codebase}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Introduction}
+
+This document describes the methodology currently implemented in this repository for quantum unitary synthesis. It is grounded in the active code paths in \texttt{main.py}, \texttt{gqe.py}, \texttt{pipeline.py}, \texttt{model.py}, \texttt{cost.py}, \texttt{continuous\_optimizer.py}, \texttt{pareto.py}, \texttt{pareto\_gd\_optimizer.py}, \texttt{operator\_pool.py}, \texttt{target.py}, and \texttt{config.yml}.
+
+The repository solves unitary synthesis as a hybrid discrete-continuous optimization problem:
+
+\begin{itemize}[leftmargin=*]
+\item the discrete part is the circuit structure, represented as a sequence of gate tokens sampled by a transformer policy;
+\item the continuous part is the optimization of rotation angles for parameterized gates;
+\item the training signal is fidelity-driven, optionally augmented by Pareto-style pressure toward lower depth and fewer CNOT gates.
+\end{itemize}
+
+\section{Formal Problem Definition}
+
+Let:
+
+\begin{itemize}[leftmargin=*]
+\item $n$ be the number of qubits,
+\item $d = 2^n$ be the Hilbert-space dimension,
+\item $U_{\mathrm{target}} \in U(d)$ be the target unitary,
+\item $V$ be the discrete gate vocabulary induced by the operator pool,
+\item $N = \texttt{max\_gates\_count}$ be the fixed sequence length used by the current model.
+\end{itemize}
+
+In the current code, a candidate circuit is represented by a token sequence
+\[
+x = (x_1, \ldots, x_N), \qquad x_t \in V
+\]
+and, for parameterized gates, a continuous parameter vector
+\[
+\theta = (\theta_1, \ldots, \theta_m).
+\]
+
+Each token $x_t$ maps to a gate matrix $G_t$. For non-parameterized gates, $G_t$ is fixed. For parameterized gates, $G_t$ depends on the relevant entry of $\theta$. The synthesized circuit unitary is
+\[
+U(x,\theta) = G_N(\theta)\cdots G_2(\theta)G_1(\theta).
+\]
+
+The quality measure used by the code is process fidelity:
+\[
+F(U_{\mathrm{target}}, U(x,\theta)) =
+\frac{\left|\mathrm{Tr}\left(U_{\mathrm{target}}^\dagger U(x,\theta)\right)\right|^2}{d^2}.
+\]
+
+The baseline unitary-synthesis objective is therefore
+\[
+\min_{x,\theta} C_F(x,\theta)
+=
+1 - F(U_{\mathrm{target}}, U(x,\theta)).
+\]
+
+When Pareto mode is enabled, the training pipeline does not directly optimize only $C_F$. Instead, after warmup it uses a scalarized rollout cost
+\[
+C_i =
+w_F (1 - F_i)
+    + \mathbf{1}[F_i \ge \tau]
+      \left(
+        w_d \hat d_i + w_c \hat c_i
+      \right),
+\]
+where:
+
+\begin{itemize}[leftmargin=*]
+\item $F_i$ is the fidelity of circuit $i$,
+\item $d_i$ is its estimated depth,
+\item $c_i$ is its CNOT count,
+\item $\hat d_i$ and $\hat c_i$ are rollout-batch z-scores,
+\item $\tau$ is the configured fidelity threshold,
+\item $w = (w_F, w_d, w_c)$ is a Dirichlet-sampled weight vector with a hard lower bound on $w_F$.
+\end{itemize}
+
+So the current implementation should be viewed as solving
+\[
+\min_{x,\theta} 1 - F(U_{\mathrm{target}}, U(x,\theta))
+\]
+as the core synthesis objective, while optionally training toward a Pareto front over fidelity, depth, and CNOT count.
+
+\section{Method Overview}
+
+At a high level, the code follows this pipeline:
+
+\begin{enumerate}[leftmargin=*]
+\item Load and validate the experiment configuration.
+\item Build the operator pool that defines the gate vocabulary.
+\item Generate or load the target unitary.
+\item Verify target unitarity and compile the target with Qiskit for reference.
+\item Initialize a GPT-2 style autoregressive policy over gate tokens.
+\item Sample batches of fixed-length gate sequences.
+\item Evaluate sampled circuits with either pure discrete fidelity or hybrid discrete-continuous fidelity.
+\item Store sampled sequences, scalar costs, and behavior log-probabilities in a replay buffer.
+\item Train the policy with a clipped GRPO objective using replay-buffered data.
+\item Maintain an optional Pareto archive of non-dominated circuits.
+\item Optionally run a post-training Pareto gradient-descent refinement pass.
+\item Decode the best circuit, verify it again, rebuild it as a Qiskit circuit, and compare it against the Qiskit reference compilation.
+\end{enumerate}
+
+This is therefore a hybrid search pipeline combining sequence modeling for structure search, matrix-based fidelity evaluation, gradient-based angle refinement, replay-buffered policy optimization, and optional multi-objective Pareto tracking.
+
+\section{Current Default Configuration}
+
+The current \texttt{config.yml} describes the following default experiment:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Component & Current value \\
+\midrule
+Target qubits & \texttt{2} \\
+Target type & \texttt{file} \\
+Target path & \texttt{targets/haar\_random\_q2.npy} \\
+Model size & \texttt{small} \\
+Max generated gates & \texttt{28} \\
+Training epochs & \texttt{200} \\
+Rollout samples per epoch & \texttt{200} \\
+Batch size & \texttt{32} \\
+Learning rate & \texttt{1e-4} \\
+Scheduler & \texttt{fixed} \\
+Initial inverse temperature & \texttt{0.5} \\
+Scheduler delta & \texttt{0.02} \\
+Replay buffer size & \texttt{500} \\
+Replay warmup size & \texttt{100} \\
+Continuous optimization & enabled \\
+Continuous optimizer & \texttt{lbfgs} \\
+Continuous optimizer steps & \texttt{200} \\
+Continuous optimizer restarts & \texttt{3} \\
+\texttt{top\_k} filtering & \texttt{0}, meaning optimize all samples \\
+Pareto archive & enabled \\
+Pareto post-training GD & enabled \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The default run therefore exercises the most complex path in the repository: file-based target loading, continuous angle optimization during rollout scoring, Pareto scalarization during training, and a post-training Pareto refinement pass.
+
+\section{Detailed Methodology}
+
+\subsection{Operator Pool and Search Space}
+
+The operator pool is the discrete search space used by the policy. In the current implementation, the sampling vocabulary contains:
+
+\begin{itemize}[leftmargin=*]
+\item one \texttt{RZ\_q$i$} token for each qubit $i$,
+\item one \texttt{SX\_q$i$} token for each qubit $i$,
+\item one \texttt{CNOT\_q$i$\_q$j$} token for each ordered control-target pair with $i \neq j$.
+\end{itemize}
+
+For $n$ qubits, the current pool size is
+\[
+|V| = n + n + n(n - 1) = n^2 + n.
+\]
+
+Important implementation details:
+
+\begin{itemize}[leftmargin=*]
+\item Although \texttt{continuous\_optimizer.py} knows how to parse \texttt{RX} and \texttt{RY}, the operator pool currently exposes only \texttt{RZ}, \texttt{SX}, and \texttt{CNOT} at generation time.
+\item Rotation gates are stored in the pool with a placeholder angle of $\pi/4$.
+\item The stored matrices are full dense $2^n \times 2^n$ unitaries embedded into the whole system.
+\end{itemize}
+
+For the default $n=2$ case:
+
+\begin{itemize}[leftmargin=*]
+\item $|V| = 6$,
+\item the model vocabulary size is $7$ after adding the BOS token.
+\end{itemize}
+
+\subsection{Target Unitary Preparation}
+
+Target construction is centralized in \texttt{target.py}. The supported modes are:
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{random\_reachable}: compose a random short circuit from the operator pool;
+\item \texttt{haar\_random}: generate a Haar-random unitary using QR decomposition of a complex Gaussian matrix;
+\item \texttt{file}: load a saved unitary from a \texttt{.npy} file and validate its dimension.
+\end{itemize}
+
+With the current configuration, the target path is \texttt{targets/haar\_random\_q2.npy}, so the target is loaded from disk. After loading, \texttt{main.py} verifies numerically that
+\[
+U_{\mathrm{target}} U_{\mathrm{target}}^\dagger \approx I_d.
+\]
+
+\subsection{Reference Compilation with Qiskit}
+
+Before running GQE, the target unitary is compiled by Qiskit using basis gates \texttt{rz}, \texttt{sx}, and \texttt{cx} with \texttt{optimization\_level = 3}. This result is not used for training. It is used only as a reference baseline for depth, total gate count, and two-qubit gate count.
+
+\subsection{Sequence Representation}
+
+The current model uses fixed-length sequences. There is:
+
+\begin{itemize}[leftmargin=*]
+\item one beginning-of-sequence token \texttt{BOS} with id \texttt{0},
+\item a gate-token offset of \texttt{+1},
+\item no end-of-sequence token,
+\item no variable-length decoding in the main policy.
+\end{itemize}
+
+Each candidate circuit is therefore represented as a sequence of length
+\[
+N + 1,
+\]
+where the extra element is the BOS token.
+
+For the current configuration:
+
+\begin{itemize}[leftmargin=*]
+\item $N = 28$,
+\item every sampled candidate has exactly $29$ tokens including BOS,
+\item every sampled candidate contains exactly $28$ generated gate tokens before any later simplification.
+\end{itemize}
+
+\subsection{Policy Model}
+
+The structure-search model is implemented in \texttt{model.py} as a GPT-2 style causal transformer in Flax. It uses learned token embeddings, learned positional embeddings, causal self-attention, pre-layer-normalized transformer blocks, a GELU MLP, and tied output projection.
+
+The supported presets are:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Size & Layers & Heads & Embedding size \\
+\midrule
+\texttt{tiny} & 2 & 2 & 128 \\
+\texttt{small} & 6 & 6 & 384 \\
+\texttt{medium} & 12 & 12 & 768 \\
+\texttt{large} & 24 & 16 & 1024 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The default run uses \texttt{small}, so the current default policy has 6 transformer blocks, 6 attention heads, and embedding dimension 384.
+
+One subtle but important detail is that the code treats the model outputs as energies rather than conventional language-model logits. Sampling and log-probability evaluation use \texttt{softmax(-beta * output)} instead of \texttt{softmax(output)}.
+
+\subsection{Rollout Generation}
+
+Rollouts are generated autoregressively in \texttt{Pipeline.generate()} with a JIT-compiled \texttt{jax.lax.scan}. At each generation step:
+
+\begin{enumerate}[leftmargin=*]
+\item the transformer receives the current token prefix,
+\item the BOS token is masked out so it cannot be sampled again,
+\item the next token is sampled with \texttt{jax.random.categorical} from \texttt{-beta * logits},
+\item the sampled token is appended to the sequence.
+\end{enumerate}
+
+Formally, if $a_t$ is the token chosen at step $t$, the policy used by the code is
+\[
+\pi_\beta(a_t = v \mid a_{<t})
+\propto
+\exp\left(-\beta E_t(v)\right),
+\]
+where $E_t(v)$ is the model output for token $v$ at position $t$.
+
+The sequence log-probability used later by GRPO is
+\[
+\log \pi_\beta(x)
+=
+\sum_{t=1}^{N}
+\log \pi_\beta(x_t \mid x_{<t}).
+\]
+
+\subsection{Fidelity Evaluation}
+
+The fidelity computation is defined in \texttt{cost.py}. Given a composed circuit unitary $U_{\mathrm{circuit}}$, the code evaluates
+\[
+F(U_{\mathrm{target}}, U_{\mathrm{circuit}})
+=
+\frac{\left|\mathrm{Tr}(U_{\mathrm{target}}^\dagger U_{\mathrm{circuit}})\right|^2}{d^2},
+\]
+and converts it into the cost
+\[
+C_F = 1 - F.
+\]
+
+The JAX implementation uses \texttt{jax.lax.scan} to compose gate matrices across positions, \texttt{jax.vmap} to score whole batches, and \texttt{jax.jit} to compile the evaluation path.
+
+\subsection{Discrete and Hybrid Scoring Paths}
+
+\paragraph{Pure discrete mode.}
+If \texttt{continuous\_opt.enabled = false}, the code decodes token ids into operator-pool indices, composes the stored pool matrices, computes process fidelity directly, and returns $1 - F$. In this mode, parameterized rotations are evaluated at the placeholder angle $\pi/4$.
+
+\paragraph{Hybrid discrete-continuous mode.}
+If \texttt{continuous\_opt.enabled = true}, the code evaluates the circuit structure and then refines its continuous parameters before assigning the final fidelity.
+
+Two sub-modes exist:
+
+\begin{itemize}[leftmargin=*]
+\item if \texttt{top\_k = 0}, every sampled circuit is continuously optimized;
+\item if \texttt{top\_k > 0}, the pipeline first computes a cheap discrete score for all circuits, then continuously optimizes only the top $k$ structures.
+\end{itemize}
+
+With the current configuration, \texttt{top\_k = 0}, so every sampled circuit in every rollout is angle-optimized.
+
+\subsection{Continuous Angle Optimization}
+
+The continuous optimizer is implemented in \texttt{continuous\_optimizer.py}. For a fixed structure $x$, it solves
+\[
+\min_\theta 1 - F(U_{\mathrm{target}}, U(x,\theta)).
+\]
+
+The optimizer works by:
+
+\begin{enumerate}[leftmargin=*]
+\item parsing gate names into \texttt{GateSpec} objects,
+\item encoding each circuit into fixed-shape arrays of gate type, qubit index, CNOT pair index, and padded angles,
+\item building the circuit unitary differentiably in JAX,
+\item optimizing the angles with either L-BFGS or Adam,
+\item simplifying the circuit algebraically,
+\item re-optimizing once if simplification produced a shorter parametric circuit.
+\end{enumerate}
+
+The default run uses L-BFGS with 200 steps and 3 restarts. The restart strategy is:
+
+\begin{itemize}[leftmargin=*]
+\item one start from the default initialization,
+\item remaining starts sampled uniformly from $[-\pi,\pi]$ on the active parameter entries.
+\end{itemize}
+
+The simplification rules currently implemented are:
+
+\begin{itemize}[leftmargin=*]
+\item drop near-zero parameterized rotations,
+\item merge consecutive same-axis rotations on the same qubit,
+\item cancel adjacent identical CNOT gates.
+\end{itemize}
+
+Another important implementation detail is precision. The global JAX runtime enables x64, but \texttt{Factory.create\_continuous\_optimizer()} constructs the training-time optimizer with \texttt{fast\_runtime=True}, so the rollout-time continuous optimization uses float32/complex64 internally for speed.
+
+\subsection{Structure Metrics}
+
+The code tracks:
+
+\begin{itemize}[leftmargin=*]
+\item estimated depth,
+\item total gate count,
+\item CNOT count.
+\end{itemize}
+
+Depth is computed by a greedy per-qubit accumulation rule. For each token:
+
+\begin{itemize}[leftmargin=*]
+\item a single-qubit gate increments the depth counter of its qubit,
+\item a two-qubit gate sets both qubit depths to $\max(\mathrm{depth}_{q_0}, \mathrm{depth}_{q_1}) + 1$.
+\end{itemize}
+
+This is an inexpensive structural proxy, not a full scheduling or transpilation pass.
+
+\subsection{Pareto Scalarization and Archive}
+
+If Pareto mode is enabled, the pipeline maintains a non-dominated archive over:
+
+\begin{itemize}[leftmargin=*]
+\item maximize fidelity,
+\item minimize depth,
+\item minimize CNOT count.
+\end{itemize}
+
+A circuit $a$ dominates circuit $b$ if:
+
+\begin{itemize}[leftmargin=*]
+\item $a.\mathrm{fidelity} \ge b.\mathrm{fidelity}$,
+\item $a.\mathrm{depth} \le b.\mathrm{depth}$,
+\item $a.\mathrm{cnot\_count} \le b.\mathrm{cnot\_count}$,
+\item and at least one inequality is strict.
+\end{itemize}
+
+During training:
+
+\begin{itemize}[leftmargin=*]
+\item warmup uses fidelity-only cost,
+\item after warmup, the pipeline samples a weight vector from a Dirichlet distribution,
+\item it enforces a minimum fidelity weight $w_F^{\min}$,
+\item it applies complexity penalties only when fidelity exceeds the threshold $\tau$.
+\end{itemize}
+
+The scalarized cost used for replay-buffer training is
+\[
+C_i =
+w_F (1 - F_i)
+    + \mathbf{1}[F_i \ge \tau]
+      \left(
+        w_d \frac{d_i - \mu_d}{\sigma_d + \varepsilon}
+        +
+        w_c \frac{c_i - \mu_c}{\sigma_c + \varepsilon}
+      \right).
+\]
+
+The archive rejects points below a fidelity floor, removes dominated points, prunes by crowding distance if necessary, and reports a 2-D hypervolume over fidelity and CNOT count. With the current config, the fidelity floor starts at 0.5 and is raised to 0.9 at epoch 100.
+
+\subsection{Replay Buffer and Training Data Reuse}
+
+The policy is not trained purely on the latest rollout. Instead, sampled sequences are inserted into a FIFO replay buffer. Each buffer item stores:
+
+\begin{itemize}[leftmargin=*]
+\item the token sequence,
+\item the scalar cost used for learning,
+\item the sequence log-probability under the behavior policy that produced it.
+\end{itemize}
+
+Warmup is implemented as:
+
+\begin{verbatim}
+while len(buffer) < warmup_size:
+    collect_rollout()
+\end{verbatim}
+
+Given the current configuration, \texttt{num\_samples = 200} and \texttt{warmup\_size = 100}, so one rollout is already enough to fill the warmup requirement. \texttt{BufferDataset} then exposes replay-buffer data for multiple passes per epoch via \texttt{steps\_per\_epoch}.
+
+\subsection{GRPO Training Objective}
+
+The actual policy update is implemented in \texttt{pipeline.py} as a clipped GRPO-style surrogate.
+
+For a mini-batch of replayed trajectories:
+
+\begin{itemize}[leftmargin=*]
+\item let $C_i$ be the stored scalar cost,
+\item let $A_i$ be the normalized advantage,
+\item let $L_i$ be the current sequence log-probability,
+\item let $L_i^{\mathrm{old}}$ be the stored behavior sequence log-probability,
+\item let $r_i = \exp(L_i - L_i^{\mathrm{old}})$.
+\end{itemize}
+
+The code computes
+\[
+A_i =
+\frac{\mathrm{mean}(C) - C_i}{\mathrm{std}(C) + \varepsilon},
+\]
+so lower-than-average cost yields positive advantage.
+
+The clipped surrogate loss is
+\[
+\mathcal{L}_{\mathrm{GRPO}}
+=
+- \frac{1}{B}
+  \sum_{i=1}^{B}
+  \min\left(
+    r_i A_i,\;
+    \mathrm{clip}(r_i, 1-\epsilon, 1+\epsilon) A_i
+  \right),
+\]
+where $\epsilon = \texttt{grpo\_clip\_ratio}$.
+
+The optimizer on policy parameters is global-norm clipping followed by \texttt{optax.adamw}.
+
+\subsection{Scheduler Behavior}
+
+The scheduler provides the inverse temperature $\beta$ used during rollout generation and log-probability evaluation.
+
+The code supports:
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{fixed},
+\item \texttt{cosine}.
+\end{itemize}
+
+The current config selects \texttt{fixed}, but in the current implementation \texttt{DefaultScheduler} still updates
+\[
+\texttt{current\_temperature} \leftarrow \texttt{current\_temperature} + \texttt{delta}
+\]
+after each rollout, followed by clamping to the configured interval.
+
+\subsection{Best-Circuit Tracking and Final Decoding}
+
+During training, the code tracks the best circuit from the most recent rollout batch using fidelity-only costs. After training:
+
+\begin{enumerate}[leftmargin=*]
+\item the best token sequence is decoded back into gate names;
+\item if continuous optimization is enabled, the code re-runs the continuous optimizer on that structure for verification;
+\item the optimized structure is converted into a Qiskit circuit;
+\item the resulting circuit is compared against the Qiskit transpilation baseline.
+\end{enumerate}
+
+This final comparison reports fidelity, depth, total gates, and two-qubit gates.
+
+\subsection{Post-Training Pareto Gradient Descent}
+
+If \texttt{pareto\_gd.enabled = true}, the code performs a post-training pass over all archived Pareto circuits. For each archived circuit below $1 - \texttt{fidelity\_eps}$:
+
+\begin{enumerate}[leftmargin=*]
+\item convert the stored token sequence back to gate names,
+\item run continuous optimization again,
+\item update the archived fidelity if the optimizer improved it,
+\item rebuild the archive from the updated points.
+\end{enumerate}
+
+This is intended to improve the final Pareto front without changing the learned policy itself.
+
+\section{End-to-End Algorithm Summary}
+
+The current implementation can be summarized as:
+
+\begin{verbatim}
+Input:
+    config, target specification, operator pool
+
+Build:
+    U_target
+    Qiskit reference circuit
+    transformer policy
+    replay buffer
+    optional continuous optimizer
+    optional Pareto archive
+
+Warmup:
+    sample rollouts
+    compute fidelity-based costs
+    fill replay buffer
+
+Training epoch:
+    generate num_samples fixed-length circuits
+    compute old sequence log-probabilities
+    evaluate fidelity, depth, and CNOT count
+    if Pareto enabled and not in warmup:
+        sample Pareto weights
+        scalarize fidelity/depth/CNOT cost
+    push sequences and costs to replay buffer
+    train with clipped GRPO on replay-buffer batches
+    update best-so-far statistics
+    update scheduler
+    update Pareto archive
+
+After training:
+    optionally run ParetoGD on archive members
+    decode best structure
+    verify best structure with continuous optimization
+    build final Qiskit circuit
+    compare against Qiskit baseline
+\end{verbatim}
+
+\section{Current Issues, Bugs, and Bottlenecks}
+
+\subsection{Fixed-Length Generation Is a Hard Structural Limitation}
+
+The policy has no EOS token and no variable-length decoding. Every sample contains exactly \texttt{max\_gates\_count} generated gates before any post hoc simplification.
+
+Consequences:
+
+\begin{itemize}[leftmargin=*]
+\item the model cannot directly learn to stop early;
+\item circuit-shortening pressure is only indirect;
+\item the structural search space is larger than necessary;
+\item reported complexity is partly shaped by simplification rather than native generation.
+\end{itemize}
+
+\subsection{\texttt{ParetoGDOptimizer} Does Not Write Back Simplified Structures}
+
+The post-training Pareto GD pass calls \texttt{optimize\_circuit\_with\_params()}, but it only keeps the improved fidelity. It discards the returned optimized gate structure and parameters.
+
+Consequences:
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{token\_sequence}, \texttt{depth}, \texttt{total\_gates}, and \texttt{cnot\_count} in the archive remain unchanged;
+\item if simplification found a shorter equivalent circuit, the archive does not reflect it;
+\item the rebuilt archive can still be structurally stale after Pareto GD.
+\end{itemize}
+
+\subsection{Pareto Weight Sampling Is Not Fully Reproducible}
+
+\texttt{Pipeline.\_sample\_weights()} uses \texttt{np.random.dirichlet(...)} from the global NumPy RNG instead of a seeded generator tied to \texttt{training.seed}.
+
+\subsection{The ``Fixed'' Scheduler Is Not Actually Fixed}
+
+The scheduler named \texttt{fixed} still increments its value by \texttt{delta} after every rollout, so experiment semantics are easy to misread.
+
+\subsection{Dropout Exists in the Model but Is Disabled in Practice}
+
+The transformer defines dropout layers, but the pipeline calls the model with \texttt{deterministic=True} during both generation and optimization, so no dropout regularization is active.
+
+\subsection{Training-Time and Evaluation-Time Precision Differ}
+
+The global runtime enables x64, but the training-time continuous optimizer uses float32/complex64 internally through \texttt{fast\_runtime=True}. The final verifier is not forced into the same low-precision path.
+
+\subsection{Evaluation Cost Scales Poorly}
+
+The current methodology uses full dense $2^n \times 2^n$ matrices for all operator-pool entries, circuit compositions, fidelity evaluations, and continuous optimization passes. With \texttt{top\_k = 0}, every sampled circuit in every rollout is angle-optimized.
+
+\subsection{Depth Is a Proxy, Not a Hardware-Aware Metric}
+
+Depth is estimated by a greedy qubit-depth counter on the raw token sequence. It is not computed from a simplified circuit, a scheduled circuit, or a transpiled hardware circuit.
+
+\subsection{Logging and Naming Become Ambiguous in Pareto Mode}
+
+Even when replay training uses scalarized multi-objective costs, \texttt{best\_cost} and \texttt{epoch\_best\_cost} are still tracked using fidelity-only costs.
+
+\subsection{The Search Vocabulary Is Narrower Than the Optimizer's Capabilities}
+
+The continuous optimizer understands \texttt{RX}, \texttt{RY}, and \texttt{RZ}, but the operator pool currently exposes only \texttt{RZ} as a parameterized single-qubit gate type.
+
+\section{Suggestions for Improvement}
+
+The most impactful next steps are:
+
+\begin{enumerate}[leftmargin=*]
+\item add variable-length generation with EOS and PAD handling;
+\item fix Pareto GD so it updates structure as well as fidelity;
+\item make Pareto runs fully reproducible by removing use of the global RNG;
+\item separate scheduler names from scheduler behavior, or rename the current ``fixed'' schedule;
+\item unify or explicitly manage the precision policy;
+\item reduce the continuous-optimization bottleneck, for example by using \texttt{top\_k > 0} or a two-stage screening process;
+\item compute complexity metrics from simplified or rebuilt circuits rather than raw token sequences;
+\item expand the structural vocabulary, for example by enabling \texttt{RX} and \texttt{RY};
+\item revisit replay-buffer strategy, including recency or Pareto-aware prioritization;
+\item add regression tests around Pareto GD, reproducibility, scheduler semantics, and structure-metric consistency.
+\end{enumerate}
+
+\section{Closing Assessment}
+
+The current codebase implements a coherent and technically interesting hybrid methodology for unitary synthesis:
+
+\begin{itemize}[leftmargin=*]
+\item a transformer proposes circuit structures,
+\item a continuous optimizer repairs the continuous degrees of freedom,
+\item GRPO updates the policy from replayed rollouts,
+\item and Pareto machinery encourages better fidelity-complexity trade-offs.
+\end{itemize}
+
+Its strongest features are clear modular separation between target generation, structure search, and angle refinement; efficient JAX compilation of rollout and fidelity code paths; an explicit bridge to Qiskit for baseline comparison; and an emerging multi-objective training framework rather than fidelity-only search.
+
+Its main current limitations are equally clear: fixed-length generation, expensive dense-matrix scaling, partial inconsistency between Pareto refinement and stored structure, and several experiment-control details that should be tightened for reproducibility and clarity.
+
+That makes the project a strong small-scale research platform for unitary synthesis, with a clear path toward a more rigorous and scalable next version.
+
+\end{document}

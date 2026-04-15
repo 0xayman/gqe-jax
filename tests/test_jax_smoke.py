@@ -78,11 +78,13 @@ def test_discrete_gqe_smoke():
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
-    best_cost, best_indices = gqe(cost_fn, pool, cfg, u_target=u_target)
+    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
 
     assert 0.0 <= best_cost <= 1.0
     assert isinstance(best_indices, list)
     assert len(best_indices) == cfg.model.max_gates_count + 1
+    # Pareto disabled in tiny cfg (default ParetoConfig has enabled=False)
+    assert pareto_archive is None
 
 
 def test_continuous_gqe_smoke():
@@ -91,11 +93,12 @@ def test_continuous_gqe_smoke():
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
-    best_cost, best_indices = gqe(cost_fn, pool, cfg, u_target=u_target)
+    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
 
     assert 0.0 <= best_cost <= 1.0
     assert isinstance(best_indices, list)
     assert len(best_indices) == cfg.model.max_gates_count + 1
+    assert pareto_archive is None
 
 
 def test_continuous_optimizer_smoke():

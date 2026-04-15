@@ -73,7 +73,7 @@ def _update_best_from_latest_rollout(
     return best_cost, best_indices, best_raw_fidelity, best_cnot_count
 
 
-def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
+def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None, pool=None):
     if logger is None:
         logger = _build_logger(cfg)
 
@@ -96,7 +96,23 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
             best_cnot_count,
         )
 
+    # Warmup is fidelity-only. Multi-objective weight sampling begins now.
+    pipeline._warmup_mode = False
+
     for epoch in range(cfg.training.max_epochs):
+        pipeline._current_epoch = epoch
+
+        # Raise the Pareto fidelity floor once training has matured
+        if (
+            pipeline.pareto_archive is not None
+            and epoch == cfg.pareto.floor_ramp_epoch
+        ):
+            pipeline.pareto_archive.set_fidelity_floor(cfg.pareto.fidelity_floor_late)
+            if cfg.logging.verbose:
+                print(
+                    f"  [Pareto] Epoch {epoch + 1}: "
+                    f"fidelity floor raised to {cfg.pareto.fidelity_floor_late}"
+                )
         epoch_start = time.perf_counter()
 
         pipeline.collect_rollout()
@@ -151,7 +167,29 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
                 pipeline.sequence_structure_metrics(np.asarray(best_indices, dtype=np.int32)[1:])
             )
 
+        # ── Pareto metrics for this epoch ───────────────────────────────────
+        pareto_size = 0
+        pareto_hv = 0.0
+        pareto_best_f = float("nan")
+        pareto_min_cnot = -1
+        if pipeline.pareto_archive is not None:
+            archive = pipeline.pareto_archive
+            pareto_size = len(archive)
+            pareto_hv = archive.hypervolume_2d()
+            top = archive.best_by_fidelity()
+            pareto_best_f = top.fidelity if top is not None else float("nan")
+            efficient = archive.best_by_cnot(min_fidelity=0.99)
+            pareto_min_cnot = efficient.cnot_count if efficient is not None else -1
+
         if cfg.logging.verbose:
+            w = pipeline._current_weights
+            pareto_str = (
+                f" | pareto_size={pareto_size}"
+                f" | hv={pareto_hv:.4f}"
+                f" | w=[{w[0]:.2f},{w[1]:.2f},{w[2]:.2f}]"
+                if pipeline.pareto_archive is not None
+                else ""
+            )
             print(
                 f"Epoch {epoch + 1:03d}/{cfg.training.max_epochs:03d}"
                 f" | cost_epoch_best={epoch_best_cost:.6f}"
@@ -164,11 +202,23 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
                 f" | depth_run_best={run_best_depth}"
                 f" | total_gates_run_best={run_best_total_gates}"
                 f" | cnot_run_best={run_best_cnot_count}"
+                f"{pareto_str}"
                 f" | epoch_time={_format_elapsed(epoch_time)}"
                 f" | elapsed={_format_elapsed(elapsed)}"
             )
 
         if logger:
+            pareto_metrics: dict[str, float] = {}
+            if pipeline.pareto_archive is not None:
+                pareto_metrics = {
+                    "pareto_archive_size": float(pareto_size),
+                    "pareto_hypervolume": pareto_hv,
+                    "pareto_best_fidelity": pareto_best_f,
+                    "pareto_min_cnot_at_99": float(pareto_min_cnot),
+                    "w_F": float(pipeline._current_weights[0]),
+                    "w_d": float(pipeline._current_weights[1]),
+                    "w_c": float(pipeline._current_weights[2]),
+                }
             logger.log_metrics(
                 {
                     "loss": epoch_loss,
@@ -185,6 +235,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
                     "inverse_temperature": pipeline.scheduler.get_inverse_temperature(),
                     "epoch_time_sec": epoch_time,
                     "elapsed_time_sec": elapsed,
+                    **pareto_metrics,
                 },
                 step=epoch,
             )
@@ -200,10 +251,59 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None):
     if best_indices is not None:
         best_indices = np.asarray(best_indices, dtype=np.int32).tolist()
 
+    # ── Post-training Pareto GD optimization ────────────────────────────────
+    if (
+        cfg.pareto_gd.enabled
+        and pipeline.pareto_archive is not None
+        and len(pipeline.pareto_archive) > 0
+        and u_target is not None
+        and pool is not None
+    ):
+        from pareto_gd_optimizer import ParetoGDOptimizer
+
+        if cfg.logging.verbose:
+            print(
+                f"\n[ParetoGD] Starting post-training gradient-descent "
+                f"optimization on {len(pipeline.pareto_archive)} Pareto circuits "
+                f"(optimizer={cfg.pareto_gd.optimizer}, "
+                f"steps={cfg.pareto_gd.steps}, "
+                f"restarts={cfg.pareto_gd.num_restarts})..."
+            )
+
+        gd_opt = ParetoGDOptimizer(
+            u_target=u_target,
+            num_qubits=cfg.target.num_qubits,
+            max_gates=cfg.model.max_gates_count,
+            steps=cfg.pareto_gd.steps,
+            lr=cfg.pareto_gd.lr,
+            optimizer_type=cfg.pareto_gd.optimizer,
+            num_restarts=cfg.pareto_gd.num_restarts,
+            fidelity_eps=cfg.pareto_gd.fidelity_eps,
+        )
+        # pool_names_no_bos: gate name strings indexed from 0, BOS excluded
+        pool_names_no_bos = [name for name, _ in pool]
+        pipeline.pareto_archive, pipeline.rng_key = gd_opt.optimize_archive(
+            pipeline.pareto_archive,
+            pool_names_no_bos,
+            pipeline.rng_key,
+            verbose=cfg.logging.verbose,
+        )
+
+        if cfg.logging.verbose:
+            archive = pipeline.pareto_archive
+            top = archive.best_by_fidelity()
+            hv = archive.hypervolume_2d()
+            best_f = top.fidelity if top is not None else float("nan")
+            print(
+                f"[ParetoGD] Done — archive size={len(archive)} | "
+                f"hv={hv:.6f} | "
+                f"best_fidelity={best_f:.6f}"
+            )
+
     pipeline.set_cost(None)
     if logger:
         logger.finalize("success")
-    return best_cost, best_indices
+    return best_cost, best_indices, pipeline.pareto_archive
 
 
 def gqe(cost_fn, pool, cfg: GQEConfig, model=None, u_target=None, logger=None):
@@ -211,4 +311,4 @@ def gqe(cost_fn, pool, cfg: GQEConfig, model=None, u_target=None, logger=None):
     if model is None:
         model = GPT2(cfg.model.size, len(pool) + 1)
     pipeline = Pipeline(cfg, cost_fn, pool, model, factory, u_target=u_target)
-    return _run_training(cfg, pipeline, logger=logger)
+    return _run_training(cfg, pipeline, logger=logger, u_target=u_target, pool=pool)
