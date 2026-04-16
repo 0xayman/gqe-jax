@@ -18,11 +18,19 @@ def _compose_unitary(gate_matrices, d: int) -> np.ndarray:
     return u
 
 
-def _compile_target_with_qiskit(u_target: np.ndarray, num_qubits: int):
+def _basis_gates(rotation_gates: tuple[str, ...] | list[str]) -> list[str]:
+    return [*rotation_gates, "sx", "cx"]
+
+
+def _compile_target_with_qiskit(
+    u_target: np.ndarray,
+    num_qubits: int,
+    rotation_gates: tuple[str, ...] | list[str],
+):
     """Synthesize the target unitary with Qiskit and print the resulting circuit.
 
     Uses Qiskit's transpiler with the same basis gate set as the operator pool
-    (rz, sx, cx) so the decomposition is directly comparable to what GQE learns.
+    so the decomposition is directly comparable to what GQE learns.
 
     Returns the compiled QuantumCircuit for later stats comparison.
     """
@@ -32,15 +40,19 @@ def _compile_target_with_qiskit(u_target: np.ndarray, num_qubits: int):
     qc = QuantumCircuit(num_qubits)
     qc.append(UnitaryGate(u_target), list(range(num_qubits)))
 
+    basis_gates = _basis_gates(rotation_gates)
     compiled = transpile(
         qc,
-        basis_gates=["rz", "sx", "cx"],
+        basis_gates=basis_gates,
         optimization_level=3,
     )
 
     print(f"\n{'=' * 55}")
     print("Target unitary compiled by Qiskit (reference circuit):")
-    print(f"  Basis gates: rz, sx, cx  |  Depth: {compiled.depth()}  |  Gates: {compiled.count_ops()}")
+    print(
+        f"  Basis gates: {', '.join(basis_gates)}"
+        f"  |  Depth: {compiled.depth()}  |  Gates: {compiled.count_ops()}"
+    )
     print(compiled.draw("text", fold=-1))
     return compiled
 
@@ -210,9 +222,13 @@ def main():
     print(f"  JAX devices:          {jax.devices()}")
 
     # ── Build operator pool ─────────────────────────────────────────────────
-    pool = build_operator_pool(num_qubits=cfg.target.num_qubits)
+    pool = build_operator_pool(
+        num_qubits=cfg.target.num_qubits,
+        rotation_gates=cfg.pool.rotation_gates,
+    )
     print(f"  Gate pool size:       {len(pool)}")
     print(f"  Model vocab size:     {len(pool) + 1}")
+    print(f"  Rotation gates:       {', '.join(cfg.pool.rotation_gates)}")
 
     # ── Build target unitary ────────────────────────────────────────────────
     # Delegated entirely to target.py — changing cfg.target.type selects
@@ -230,7 +246,11 @@ def main():
     logger = _build_logger(cfg)
 
     # ── Compile target with Qiskit (reference circuit) ──────────────────────
-    qiskit_compiled = _compile_target_with_qiskit(u_target, cfg.target.num_qubits)
+    qiskit_compiled = _compile_target_with_qiskit(
+        u_target,
+        cfg.target.num_qubits,
+        cfg.pool.rotation_gates,
+    )
     qiskit_depth, qiskit_total, qiskit_two_q = _circuit_stats(qiskit_compiled)
 
     # ── Build cost function ─────────────────────────────────────────────────

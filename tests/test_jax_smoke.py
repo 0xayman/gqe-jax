@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import textwrap
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,13 +17,14 @@ from config import (
     TargetConfig,
     TemperatureConfig,
     TrainingConfig,
+    load_config,
 )
 from continuous_optimizer import ContinuousOptimizer
 from cost import build_cost_fn, process_fidelity
 from data import BufferDataset, ReplayBuffer
 from factory import Factory
 from gqe import gqe
-from main import _build_qiskit_circuit
+from main import _basis_gates, _build_qiskit_circuit
 from model import GPT2
 from operator_pool import build_operator_pool
 from pipeline import Pipeline, _sequence_structure_metrics
@@ -67,7 +69,7 @@ def _tiny_cfg(*, continuous_opt_enabled: bool, batch_size: int = 2) -> GQEConfig
 
 def _build_pipeline(*, continuous_opt_enabled: bool, batch_size: int = 2) -> tuple[Pipeline, list]:
     cfg = _tiny_cfg(continuous_opt_enabled=continuous_opt_enabled, batch_size=batch_size)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
     model = GPT2(cfg.model.size, len(pool) + 1)
@@ -76,7 +78,7 @@ def _build_pipeline(*, continuous_opt_enabled: bool, batch_size: int = 2) -> tup
 
 def test_discrete_gqe_smoke():
     cfg = _tiny_cfg(continuous_opt_enabled=False)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
@@ -91,7 +93,7 @@ def test_discrete_gqe_smoke():
 
 def test_continuous_gqe_smoke():
     cfg = _tiny_cfg(continuous_opt_enabled=True)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
@@ -105,7 +107,7 @@ def test_continuous_gqe_smoke():
 
 def test_continuous_optimizer_smoke():
     cfg = _tiny_cfg(continuous_opt_enabled=True)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     optimizer = ContinuousOptimizer(
         u_target=u_target,
@@ -130,7 +132,7 @@ def test_continuous_optimizer_smoke():
 
 def test_continuous_optimizer_batch_matches_single():
     cfg = _tiny_cfg(continuous_opt_enabled=True)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     optimizer = ContinuousOptimizer(
         u_target=u_target,
@@ -166,7 +168,7 @@ def test_continuous_optimizer_batch_matches_single():
 
 def test_continuous_optimizer_index_batch_matches_name_batch():
     cfg = _tiny_cfg(continuous_opt_enabled=True)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     optimizer = ContinuousOptimizer(
         u_target=u_target,
@@ -189,15 +191,10 @@ def test_continuous_optimizer_index_batch_matches_name_batch():
         dtype=np.int32,
     )
 
-    by_name, _ = optimizer.optimize_batch(
-        circuits,
-        jax.random.PRNGKey(cfg.training.seed),
-        simplify=False,
-    )
+    by_name, _ = optimizer.optimize_batch(circuits, jax.random.PRNGKey(cfg.training.seed))
     by_index, _ = optimizer.optimize_token_index_batch(
         token_ids,
         jax.random.PRNGKey(cfg.training.seed),
-        simplify=False,
     )
 
     np.testing.assert_allclose(
@@ -391,9 +388,9 @@ def test_qiskit_reconstruction_matches_internal_optimizer_unitary():
     assert qc_fidelity > 1.0 - 1e-10
 
 
-def test_continuous_optimizer_simplify_batch_with_remaining_params():
+def test_continuous_optimizer_index_batch_with_remaining_params():
     cfg = _tiny_cfg(continuous_opt_enabled=True)
-    pool = build_operator_pool(cfg.target.num_qubits)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     optimizer = ContinuousOptimizer(
         u_target=u_target,
@@ -422,8 +419,67 @@ def test_continuous_optimizer_simplify_batch_with_remaining_params():
     fidelities, _ = optimizer.optimize_token_index_batch(
         token_ids,
         jax.random.PRNGKey(cfg.training.seed),
-        simplify=True,
     )
 
     assert fidelities.shape == (1,)
     assert 0.0 <= float(fidelities[0]) <= 1.0
+
+
+def test_build_operator_pool_uses_configured_rotation_gate_order():
+    pool = build_operator_pool(num_qubits=1, rotation_gates=("ry", "rx"))
+
+    assert [name for name, _ in pool] == ["RY_q0", "RX_q0", "SX_q0"]
+
+
+def test_basis_gates_include_configured_rotations():
+    assert _basis_gates(("ry", "rz")) == ["ry", "rz", "sx", "cx"]
+
+
+def test_load_config_reads_pool_rotation_gates(tmp_path):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            target:
+              num_qubits: 1
+              type: "haar_random"
+
+            pool:
+              rotation_gates: ["ry", "rx"]
+
+            model:
+              size: "tiny"
+              max_gates_count: 4
+
+            training:
+              max_epochs: 1
+              num_samples: 2
+              batch_size: 1
+              lr: 1.0e-4
+              grad_norm_clip: 1.0
+              seed: 0
+              grpo_clip_ratio: 0.2
+              early_stop: false
+
+            temperature:
+              scheduler: "fixed"
+              initial_value: 0.5
+              delta: 0.01
+              min_value: 0.1
+              max_value: 1.0
+
+            buffer:
+              max_size: 4
+              warmup_size: 2
+              steps_per_epoch: 1
+
+            logging:
+              verbose: false
+              wandb: false
+            """
+        )
+    )
+
+    cfg = load_config(str(config_path))
+
+    assert cfg.pool.rotation_gates == ("ry", "rx")

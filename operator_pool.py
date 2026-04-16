@@ -1,5 +1,5 @@
 from itertools import permutations
-from typing import List, Tuple
+from typing import Iterable, List, Tuple
 
 import numpy as np
 from qiskit.circuit.library import CXGate, RXGate, RYGate, RZGate, SXGate
@@ -82,10 +82,38 @@ def _embed_two_qubit(
     return full
 
 
-ROTATION_AXIS = ("RZ",)
+_VALID_ROTATION_AXES = {"RX", "RY", "RZ"}
 
 
-def build_operator_pool(num_qubits: int) -> List[Tuple[str, np.ndarray]]:
+def _normalize_rotation_axes(rotation_gates: Iterable[str] | None) -> tuple[str, ...]:
+    """Normalize configured rotation-gate names to uppercase pool token prefixes."""
+    if rotation_gates is None:
+        return ("RZ",)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for gate in rotation_gates:
+        if not isinstance(gate, str):
+            raise ValueError("rotation_gates entries must be strings")
+        axis = gate.strip().upper()
+        if axis not in _VALID_ROTATION_AXES:
+            raise ValueError(
+                f"Invalid rotation gate {gate!r}. Allowed values: {sorted(_VALID_ROTATION_AXES)}"
+            )
+        if axis in seen:
+            raise ValueError(f"Duplicate rotation gate: {axis!r}")
+        seen.add(axis)
+        normalized.append(axis)
+
+    if not normalized:
+        raise ValueError("rotation_gates must contain at least one gate")
+    return tuple(normalized)
+
+
+def build_operator_pool(
+    num_qubits: int,
+    rotation_gates: Iterable[str] | None = None,
+) -> List[Tuple[str, np.ndarray]]:
     """Build the compilation operator pool.
 
     Each rotation gate type (RX/RY/RZ) appears once per qubit. The stored
@@ -93,20 +121,22 @@ def build_operator_pool(num_qubits: int) -> List[Tuple[str, np.ndarray]]:
     is enabled, L-BFGS will find the optimal angle during training.
 
     Returns a list of (name, matrix) tuples ordered as:
-      1. RZ/RY/RX for each qubit (one token per axis/qubit)
+      1. Configured rotation gates for each qubit (one token per axis/qubit)
       2. SX for each qubit
       3. CNOT for each ordered (control, target) qubit pair
 
     Args:
         num_qubits: Number of qubits in the system (determines matrix dimension 2^n).
+        rotation_gates: Rotation gates to include in the pool, e.g. ("rz", "ry").
 
     Returns:
         List of (name, 2^n × 2^n complex128 unitary matrix) tuples.
     """
+    rotation_axes = _normalize_rotation_axes(rotation_gates)
     pool: List[Tuple[str, np.ndarray]] = []
 
     for qubit in range(num_qubits):
-        for axis in ROTATION_AXIS:
+        for axis in rotation_axes:
             base = get_rotation_matrix(axis, _DEFAULT_ANGLE)
             full = _embed_single_qubit(base, qubit, num_qubits)
             pool.append((f"{axis}_q{qubit}", full))

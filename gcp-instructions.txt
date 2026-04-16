@@ -1,46 +1,146 @@
-This file contains how to setup a GPU on GCP and run this codebase in it
-------------------------------------------------------
+# Google Cloud A100 40GB VM Setup Guide
 
+## VM Connection
 
-gcloud compute instances create gpu-l4-vm \
-  --project=aymantarig-project \
-  --zone=us-central1-a \
-  --machine-type=g2-standard-8 \
-  --accelerator=type=nvidia-l4,count=1 \
-  --image-family=common-cu128-ubuntu-2404-nvidia-570 \
-  --image-project=deeplearning-platform-release \
-  --boot-disk-size=100GB \
-  --boot-disk-type=pd-ssd \
-  --network=aymantarig-vpc \
-  --maintenance-policy=TERMINATE \
-  --restart-on-failure \
-  --metadata="install-nvidia-driver=True"
+```bash
+gcloud compute ssh --zone "us-central1-f" "instance-20260416-150256" --project "aymantarig-project"
+```
 
-gcloud compute ssh gpu-l4-vm --zone=us-central1-a --project=aymantarig-project
+---
 
+## 1. Connect to the VM
 
+```bash
+gcloud compute ssh --zone "us-central1-f" "instance-20260416-150256" --project "aymantarig-project"
+```
 
+## 2. Verify GPU is Working
+
+```bash
+nvidia-smi
+```
+
+## 3. Install Base Tooling
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv git rsync build-essential
+```
+
+## 4. Create Project Directory
+
+```bash
+mkdir -p ~/work/gqe-torch
+```
+
+## 5. Configure SSH for rsync (One-Time, Local Machine)
+
+```bash
+gcloud compute config-ssh --project "aymantarig-project"
+```
+
+## 6. Sync Project from Local → VM
+
+```bash
+cd ~/Downloads/Quantum/project/gqe-torch
+
+rsync -avz --delete \
+  --exclude='.venv' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.git' \
+  ./ aymantarig_aims_ac_za@instance-20260416-150256.us-central1-f.aymantarig-project:~/work/gqe-torch/
+```
+
+## 7. Create Python Virtual Environment
+
+```bash
+cd ~/work/gqe-torch
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+## 8. Upgrade pip / setuptools
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
+```
+
+## 9. Install Project Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+## 10. Install CUDA-Enabled PyTorch
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
+
+## 11. Install GPU-Enabled JAX (Optional)
+
+```bash
+pip install --upgrade "jax[cuda13]"
+```
+
+## 12. Verify PyTorch GPU
+
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
+PY
+```
+
+## 13. Verify JAX GPU
+
+```bash
+python - <<'PY'
+import jax
+print("backend:", jax.default_backend())
+print("devices:", jax.devices())
+PY
+```
+
+## 14. Run Your Code
+
+```bash
+cd ~/work/gqe-torch
+source .venv/bin/activate
 python main.py
+```
 
-=======================================
+## Daily Workflow
 
+```bash
+cd ~/Downloads/Quantum/project/gqe-torch
 
-gcloud compute instances create gpu-a100-vm \
-  --project=aymantarig-project \
-  --zone=us-central1-b \
-  --machine-type=a2-highgpu-1g \
-  --accelerator=type=nvidia-tesla-a100,count=1 \
-  --image-family=common-cu128-ubuntu-2404-nvidia-570 \
-  --image-project=deeplearning-platform-release \
-  --boot-disk-size=100GB \
-  --boot-disk-type=pd-ssd \
-  --network=aymantarig-vpc \
-  --maintenance-policy=TERMINATE \
-  --restart-on-failure \
-  --metadata="install-nvidia-driver=True"
+rsync -avz --delete \
+  --exclude='.venv' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='.git' \
+  ./ aymantarig_aims_ac_za@instance-20260416-150256.us-central1-f.aymantarig-project:~/work/gqe-torch/
+```
 
+```bash
+gcloud compute ssh --zone "us-central1-f" "instance-20260416-150256" --project "aymantarig-project"
+cd ~/work/gqe-torch
+source .venv/bin/activate
+python main.py
+```
 
-gcloud compute ssh gpu-a100-vm --zone=us-central1-b --project=aymantarig-project
+## Optional Sync Alias
 
+```bash
+alias syncvm="rsync -avz --delete --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' ./ aymantarig_aims_ac_za@instance-20260416-150256.us-central1-f.aymantarig-project:~/work/gqe-torch/"
+```
 
-git clone https://0xayman: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@github.com/0xayman/GQE-Compiler.git
+## Freeze Environment Snapshot
+
+```bash
+pip freeze > requirements-lock.txt
+```

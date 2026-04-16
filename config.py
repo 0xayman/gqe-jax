@@ -17,6 +17,11 @@ class TargetConfig:
 
 
 @dataclass(frozen=True)
+class PoolConfig:
+    rotation_gates: tuple[str, ...] = ("rz",)
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     size: str
     max_gates_count: int
@@ -150,6 +155,7 @@ class GQEConfig:
     temperature: TemperatureConfig
     buffer: BufferConfig
     logging: LoggingConfig
+    pool: PoolConfig = field(default_factory=PoolConfig)
     continuous_opt: ContinuousOptConfig = field(default_factory=ContinuousOptConfig)
     pareto: ParetoConfig = field(default_factory=ParetoConfig)
     pareto_gd: ParetoGDConfig = field(default_factory=ParetoGDConfig)
@@ -158,6 +164,39 @@ class GQEConfig:
 VALID_TARGET_TYPES = {"random", "random_reachable", "haar_random", "file"}
 VALID_MODEL_SIZES = {"tiny", "small", "medium", "large"}
 VALID_SCHEDULERS = {"fixed", "linear", "cosine"}
+VALID_ROTATION_GATES = {"rz", "rx", "ry"}
+
+
+def normalize_rotation_gates(value) -> tuple[str, ...]:
+    """Normalize configured rotation gates to a lowercase, duplicate-free tuple."""
+    if value is None:
+        return PoolConfig().rotation_gates
+    if isinstance(value, str):
+        candidates = [value]
+    elif isinstance(value, (list, tuple)):
+        candidates = list(value)
+    else:
+        raise ValueError("pool.rotation_gates must be a string or a list of strings")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for gate in candidates:
+        if not isinstance(gate, str):
+            raise ValueError("pool.rotation_gates entries must be strings")
+        gate_name = gate.strip().lower()
+        if gate_name not in VALID_ROTATION_GATES:
+            raise ValueError(
+                f"Invalid rotation gate: {gate!r}. "
+                f"Allowed values: {sorted(VALID_ROTATION_GATES)}"
+            )
+        if gate_name in seen:
+            raise ValueError(f"Duplicate rotation gate in pool.rotation_gates: {gate_name!r}")
+        seen.add(gate_name)
+        normalized.append(gate_name)
+
+    if not normalized:
+        raise ValueError("pool.rotation_gates must contain at least one gate")
+    return tuple(normalized)
 
 
 def validate_config(raw: dict) -> None:
@@ -173,6 +212,8 @@ def validate_config(raw: dict) -> None:
         raise ValueError(f"Invalid model size: {raw['model']['size']}")
     if raw["model"]["max_gates_count"] <= 0:
         raise ValueError("max_gates_count must be positive")
+
+    normalize_rotation_gates(raw.get("pool", {}).get("rotation_gates"))
 
     t = raw["training"]
     if t["max_epochs"] <= 0:
@@ -282,11 +323,15 @@ def load_config(path: str) -> GQEConfig:
         raw = yaml.safe_load(f)
 
     validate_config(raw)
+    pool_raw = raw.get("pool", {})
     co_raw = raw.get("continuous_opt", {})
     pareto_raw = raw.get("pareto", {})
     pareto_gd_raw = raw.get("pareto_gd", {})
     return GQEConfig(
         target=TargetConfig(**raw["target"]),
+        pool=PoolConfig(
+            rotation_gates=normalize_rotation_gates(pool_raw.get("rotation_gates")),
+        ),
         model=ModelConfig(**raw["model"]),
         training=TrainingConfig(**raw["training"]),
         temperature=TemperatureConfig(**raw["temperature"]),

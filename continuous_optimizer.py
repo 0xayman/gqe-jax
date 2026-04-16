@@ -8,7 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-_TWO_PI = 2 * np.pi
 _DEFAULT_ANGLE = np.pi / 4
 
 _GATE_TYPE_TO_ID = {
@@ -19,10 +18,6 @@ _GATE_TYPE_TO_ID = {
     "CNOT": 4,
     "NOOP": 5,
 }
-
-
-def _normalize_angle(theta: float) -> float:
-    return ((theta + np.pi) % _TWO_PI) - np.pi
 
 
 @dataclass(frozen=True)
@@ -152,74 +147,6 @@ def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array
     return (jnp.abs(overlap) ** 2) / (d**2)
 
 
-def simplify_gate_sequence(
-    gate_specs: list,
-    params: jax.Array,
-    threshold: float = 1e-3,
-) -> tuple[list, jax.Array]:
-    param_list = np.asarray(params, dtype=np.float64).tolist()
-    pidx = 0
-    pairs: list[tuple] = []
-    for spec in gate_specs:
-        if spec.is_parametric:
-            pairs.append((spec, param_list[pidx]))
-            pidx += 1
-        else:
-            pairs.append((spec, None))
-
-    changed = True
-    while changed:
-        changed = False
-        out: list[tuple] = []
-        i = 0
-        while i < len(pairs):
-            spec, angle = pairs[i]
-            if spec.is_parametric:
-                norm = _normalize_angle(angle)
-                if abs(norm) < threshold:
-                    changed = True
-                    i += 1
-                    continue
-                if (
-                    out
-                    and out[-1][0].is_parametric
-                    and out[-1][0].gate_type == spec.gate_type
-                    and out[-1][0].qubits == spec.qubits
-                ):
-                    prev_spec, prev_angle = out.pop()
-                    merged = _normalize_angle(prev_angle + norm)
-                    changed = True
-                    if abs(merged) < threshold:
-                        i += 1
-                        continue
-                    out.append((prev_spec, merged))
-                    i += 1
-                    continue
-                out.append((spec, norm))
-            else:
-                if (
-                    spec.gate_type == "CNOT"
-                    and out
-                    and out[-1][0].gate_type == "CNOT"
-                    and out[-1][0].qubits == spec.qubits
-                ):
-                    out.pop()
-                    changed = True
-                    i += 1
-                    continue
-                out.append((spec, None))
-            i += 1
-        pairs = out
-
-    new_specs = [pair[0] for pair in pairs]
-    new_angles = [pair[1] for pair in pairs if pair[0].is_parametric]
-    if new_angles:
-        new_params = jnp.asarray(new_angles, dtype=jnp.float64)
-    else:
-        new_params = jnp.zeros((0,), dtype=jnp.float64)
-    return new_specs, new_params
-
-
 class ContinuousOptimizer:
     def __init__(
         self,
@@ -283,7 +210,6 @@ class ContinuousOptimizer:
             [_embed_single(self._pauli_z, qubit, num_qubits) for qubit in range(num_qubits)],
             axis=0,
         ).astype(self._complex_dtype)
-        self._pool_gate_specs: tuple[GateSpec, ...] | None = None
         self._pool_gate_type_ids: jax.Array | None = None
         self._pool_qubit0: jax.Array | None = None
         self._pool_cnot_pair: jax.Array | None = None
@@ -376,7 +302,6 @@ class ContinuousOptimizer:
             if spec.gate_type == "CNOT":
                 cnot_pair[idx] = self._cnot_pair_to_idx[spec.qubits]
 
-        self._pool_gate_specs = gate_specs
         self._pool_gate_type_ids = jnp.asarray(gate_type_ids, dtype=jnp.int32)
         self._pool_qubit0 = jnp.asarray(qubit0, dtype=jnp.int32)
         self._pool_cnot_pair = jnp.asarray(cnot_pair, dtype=jnp.int32)
@@ -667,14 +592,11 @@ class ContinuousOptimizer:
 
     def _optimize_encoded_batch(
         self,
-        gate_specs_batch: list[list[GateSpec]] | None,
         initial_angles_batch: jax.Array,
         gate_type_ids_batch: jax.Array,
         qubit0_batch: jax.Array,
         cnot_pair_batch: jax.Array,
         rng_key: jax.Array,
-        *,
-        simplify: bool,
     ) -> tuple[np.ndarray, jax.Array]:
         has_params = np.asarray(
             np.any(np.asarray(gate_type_ids_batch) < _GATE_TYPE_TO_ID["SX"], axis=1),
@@ -708,60 +630,6 @@ class ContinuousOptimizer:
         )
         fidelities[param_indices] = np.asarray(opt_fidelities, dtype=np.float64)
 
-        if not simplify:
-            return fidelities, rng_key
-        if gate_specs_batch is None:
-            raise ValueError("gate_specs_batch is required when simplify=True")
-
-        full_params_np = np.asarray(full_params_batch, dtype=np.float64)
-        simplified_specs_batch: list[list[GateSpec]] = []
-        simplified_full_init_batch: list[np.ndarray] = []
-        simplified_global_indices: list[int] = []
-        for local_idx, global_idx in enumerate(param_indices.tolist()):
-            gate_specs = gate_specs_batch[global_idx]
-            compact_params = self._compact_param_angles(gate_specs, full_params_np[local_idx])
-            simp_specs, simp_params = simplify_gate_sequence(gate_specs, compact_params)
-            if len(simp_specs) == len(gate_specs):
-                continue
-
-            simp_full_init = self._build_full_angle_vector(simp_specs, simp_params)
-            if int(simp_params.size) > 0:
-                simplified_specs_batch.append(simp_specs)
-                simplified_full_init_batch.append(np.asarray(simp_full_init, dtype=np.float64))
-                simplified_global_indices.append(global_idx)
-                continue
-
-            gate_type_ids, qubit0, cnot_pair = self._encode_gate_specs(simp_specs)
-            simp_fidelity = float(
-                self._fidelity_fn(simp_full_init, gate_type_ids, qubit0, cnot_pair).astype(
-                    jnp.float64
-                )
-            )
-            if simp_fidelity >= fidelities[global_idx] - 1e-6:
-                fidelities[global_idx] = simp_fidelity
-
-        if simplified_specs_batch:
-            simp_initial_angles = jnp.asarray(
-                np.stack(simplified_full_init_batch, axis=0),
-                dtype=jnp.float64,
-            )
-            simp_gate_type_ids, simp_qubit0, simp_cnot_pair = self._encode_gate_specs_batch(
-                simplified_specs_batch
-            )
-            simp_fidelities, _, rng_key = self._optimize_angles_batch(
-                simp_initial_angles,
-                simp_gate_type_ids,
-                simp_qubit0,
-                simp_cnot_pair,
-                rng_key,
-                num_restarts=1,
-            )
-            simp_fidelities_np = np.asarray(simp_fidelities, dtype=np.float64)
-            for local_idx, global_idx in enumerate(simplified_global_indices):
-                simp_fidelity = float(simp_fidelities_np[local_idx])
-                if simp_fidelity >= fidelities[global_idx] - 1e-6:
-                    fidelities[global_idx] = simp_fidelity
-
         return fidelities, rng_key
 
     def optimize_circuit(self, token_names: list[str], rng_key: jax.Array) -> tuple[float, jax.Array]:
@@ -772,8 +640,6 @@ class ContinuousOptimizer:
         self,
         token_names_batch: list[list[str]],
         rng_key: jax.Array,
-        *,
-        simplify: bool = True,
     ) -> tuple[np.ndarray, jax.Array]:
         if not token_names_batch:
             return np.zeros((0,), dtype=np.float64), rng_key
@@ -786,23 +652,24 @@ class ContinuousOptimizer:
             gate_specs_batch
         )
         return self._optimize_encoded_batch(
-            gate_specs_batch,
             initial_angles_batch,
             gate_type_ids_batch,
             qubit0_batch,
             cnot_pair_batch,
             rng_key,
-            simplify=simplify,
         )
 
     def optimize_token_index_batch(
         self,
         token_ids_batch: np.ndarray | jax.Array,
         rng_key: jax.Array,
-        *,
-        simplify: bool = True,
     ) -> tuple[np.ndarray, jax.Array]:
-        if self._pool_gate_specs is None:
+        if (
+            self._pool_gate_type_ids is None
+            or self._pool_qubit0 is None
+            or self._pool_cnot_pair is None
+            or self._pool_initial_angles is None
+        ):
             raise ValueError("optimize_token_index_batch requires pool_token_names at construction")
 
         token_ids_batch = np.asarray(token_ids_batch, dtype=np.int32)
@@ -814,19 +681,12 @@ class ContinuousOptimizer:
         gate_type_ids_batch = jnp.take(self._pool_gate_type_ids, token_ids_batch_jax, axis=0)
         qubit0_batch = jnp.take(self._pool_qubit0, token_ids_batch_jax, axis=0)
         cnot_pair_batch = jnp.take(self._pool_cnot_pair, token_ids_batch_jax, axis=0)
-        gate_specs_batch = None
-        if simplify:
-            gate_specs_batch = [
-                [self._pool_gate_specs[idx] for idx in row.tolist()] for row in token_ids_batch
-            ]
         return self._optimize_encoded_batch(
-            gate_specs_batch,
             initial_angles_batch,
             gate_type_ids_batch,
             qubit0_batch,
             cnot_pair_batch,
             rng_key,
-            simplify=simplify,
         )
 
     def optimize_circuit_with_params(
@@ -853,28 +713,4 @@ class ContinuousOptimizer:
             num_restarts=self.num_restarts,
         )
         compact_params = self._compact_param_angles(gate_specs, full_params)
-
-        simp_specs, simp_params = simplify_gate_sequence(gate_specs, compact_params)
-        if len(simp_specs) == len(gate_specs):
-            return fidelity, gate_specs, compact_params, rng_key
-
-        simp_full_init = self._build_full_angle_vector(simp_specs, simp_params)
-        if simp_params.size > 0:
-            simp_fidelity, simp_full_params, rng_key = self._optimize_angles(
-                simp_specs,
-                simp_full_init,
-                rng_key,
-                num_restarts=1,
-            )
-            simp_params = self._compact_param_angles(simp_specs, simp_full_params)
-        else:
-            gate_type_ids, qubit0, cnot_pair = self._encode_gate_specs(simp_specs)
-            simp_fidelity = float(
-                self._fidelity_fn(simp_full_init, gate_type_ids, qubit0, cnot_pair).astype(
-                    jnp.float64
-                )
-            )
-
-        if simp_fidelity >= fidelity - 1e-6:
-            return simp_fidelity, simp_specs, simp_params, rng_key
         return fidelity, gate_specs, compact_params, rng_key

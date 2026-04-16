@@ -429,7 +429,6 @@ class Pipeline:
             optimized_fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
                 selected_idx,
                 self.rng_key,
-                simplify=False,
             )
             for sample_idx, fidelity in zip(top_indices.tolist(), optimized_fidelities.tolist()):
                 fidelities[sample_idx] = fidelity
@@ -438,7 +437,6 @@ class Pipeline:
             fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
                 pool_idx_output,
                 self.rng_key,
-                simplify=False,
             )
             fidelities = np.asarray(fidelities, dtype=np.float64)
             results = 1.0 - fidelities

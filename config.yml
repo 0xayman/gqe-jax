@@ -5,6 +5,9 @@ target:
   type: "file" # Load a saved target unitary from disk
   path: "targets/haar_random_q3.npy"
 
+pool:
+  rotation_gates: ["rz"] # choose from rz | rx | ry; order is preserved in the pool/Qiskit basis
+
 model:
   size: "small" # tiny | small | medium | large
   max_gates_count: 125 # Sequence length N
