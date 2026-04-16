@@ -13,6 +13,19 @@ import numpy as np
 from cost import _unbiased_std
 
 
+def reduce_sequence_log_probs(token_log_probs: jax.Array) -> jax.Array:
+    """Return a length-normalized sequence score from per-token log-probabilities.
+
+    Using a mean instead of a sum keeps GRPO importance ratios comparable across
+    different circuit lengths. This is critical once `max_gates_count` scales up,
+    because otherwise a small per-token policy shift compounds exponentially with
+    sequence length and clips away most of the gradient signal.
+    """
+    if token_log_probs.ndim <= 1:
+        return token_log_probs
+    return jnp.mean(token_log_probs, axis=-1)
+
+
 class Loss(ABC):
     @abstractmethod
     def compute(
@@ -49,7 +62,7 @@ class GRPOLoss(Loss):
         costs_std = _unbiased_std(costs)
         identical_costs = bool(np.asarray(costs_std == 0))
         advantages = jax.lax.stop_gradient(self.calc_advantage(costs))
-        current_sequence_log_probs = jnp.sum(current_log_probs, axis=-1)
+        current_sequence_log_probs = reduce_sequence_log_probs(current_log_probs)
 
         if "reference_gate_logits" in kwargs:
             old_log_probs = self.log_prob(
@@ -66,7 +79,9 @@ class GRPOLoss(Loss):
             )
 
         old_sequence_log_probs = (
-            old_log_probs if old_log_probs.ndim == 1 else jnp.sum(old_log_probs, axis=-1)
+            old_log_probs
+            if old_log_probs.ndim == 1
+            else reduce_sequence_log_probs(old_log_probs)
         )
         ratio = jnp.exp(current_sequence_log_probs - old_sequence_log_probs)
         clipped_ratio = jnp.clip(

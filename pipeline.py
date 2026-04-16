@@ -11,6 +11,7 @@ from flax.training import train_state
 
 from cost import _unbiased_std, compilation_cost_batch_jax, process_fidelity
 from data import BufferDataset, ReplayBuffer
+from loss import reduce_sequence_log_probs
 from pareto import ParetoArchive, ParetoPoint
 
 
@@ -167,7 +168,7 @@ class Pipeline:
             return jnp.take_along_axis(log_probs, gate_indices[..., None], axis=-1).squeeze(-1)
 
         def sequence_log_probs(logits, gate_indices, beta):
-            return jnp.sum(selected_log_probs(logits, gate_indices, beta), axis=-1)
+            return reduce_sequence_log_probs(selected_log_probs(logits, gate_indices, beta))
 
         def calc_advantage(costs):
             return (jnp.mean(costs) - costs) / (_unbiased_std(costs) + 1e-8)

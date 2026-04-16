@@ -2,7 +2,7 @@
 
 from continuous_optimizer import ContinuousOptimizer
 from loss import GRPOLoss
-from scheduler import CosineScheduler, DefaultScheduler
+from scheduler import CosineScheduler, FixedScheduler, LinearScheduler
 
 
 class Factory:
@@ -12,7 +12,10 @@ class Factory:
     def create_temperature_scheduler(self, cfg):
         scheduler_type = cfg.temperature.scheduler
         scheduler_builders = {
-            "fixed": lambda: DefaultScheduler(
+            "fixed": lambda: FixedScheduler(
+                value=cfg.temperature.initial_value,
+            ),
+            "linear": lambda: LinearScheduler(
                 start=cfg.temperature.initial_value,
                 delta=cfg.temperature.delta,
                 minimum=cfg.temperature.min_value,

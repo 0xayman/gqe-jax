@@ -157,7 +157,7 @@ class GQEConfig:
 
 VALID_TARGET_TYPES = {"random", "random_reachable", "haar_random", "file"}
 VALID_MODEL_SIZES = {"tiny", "small", "medium", "large"}
-VALID_SCHEDULERS = {"fixed", "cosine"}
+VALID_SCHEDULERS = {"fixed", "linear", "cosine"}
 
 
 def validate_config(raw: dict) -> None:

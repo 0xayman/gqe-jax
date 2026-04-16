@@ -18,7 +18,18 @@ class TemperatureScheduler(ABC):
         """Update the scheduler state after each rollout."""
 
 
-class DefaultScheduler(TemperatureScheduler):
+class FixedScheduler(TemperatureScheduler):
+    def __init__(self, value: float):
+        self.current_temperature = value
+
+    def get_inverse_temperature(self) -> float:
+        return self.current_temperature
+
+    def update(self, **kwargs) -> None:
+        del kwargs
+
+
+class LinearScheduler(TemperatureScheduler):
     def __init__(self, start: float, delta: float, minimum=None, maximum=None):
         self.start = start
         self.delta = delta
@@ -37,6 +48,10 @@ class DefaultScheduler(TemperatureScheduler):
             self.current_temperature = min(self.maximum, self.current_temperature)
 
 
+# Backwards-compatible alias for older imports.
+DefaultScheduler = FixedScheduler
+
+
 class CosineScheduler(TemperatureScheduler):
     def __init__(self, minimum: float, maximum: float, frequency: int):
         self.minimum = minimum
@@ -53,5 +68,4 @@ class CosineScheduler(TemperatureScheduler):
         self.current_temperature = (self.maximum + self.minimum) / 2 - (
             self.maximum - self.minimum
         ) / 2 * math.cos(2 * math.pi * self.current_iter / self.frequency)
-
 

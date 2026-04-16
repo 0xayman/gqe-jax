@@ -26,6 +26,8 @@ from main import _build_qiskit_circuit
 from model import GPT2
 from operator_pool import build_operator_pool
 from pipeline import Pipeline, _sequence_structure_metrics
+from loss import reduce_sequence_log_probs
+from scheduler import FixedScheduler, LinearScheduler
 from target import build_target
 
 
@@ -286,6 +288,33 @@ def test_grpo_loss_is_zero_when_batch_costs_are_identical():
     )
 
     assert float(np.asarray(loss)) == 0.0
+
+
+def test_reduce_sequence_log_probs_is_length_invariant_for_repeated_tokens():
+    short = jnp.asarray([[-0.2, -0.4, -0.6, -0.8]], dtype=jnp.float32)
+    long = jnp.tile(short, (1, 4))
+
+    short_score = reduce_sequence_log_probs(short)
+    long_score = reduce_sequence_log_probs(long)
+
+    np.testing.assert_allclose(short_score, long_score, rtol=0.0, atol=1e-7)
+
+
+def test_fixed_scheduler_keeps_inverse_temperature_constant():
+    scheduler = FixedScheduler(0.5)
+
+    scheduler.update(costs=np.asarray([0.1, 0.2], dtype=np.float32))
+
+    assert scheduler.get_inverse_temperature() == 0.5
+
+
+def test_linear_scheduler_matches_previous_annealing_behavior():
+    scheduler = LinearScheduler(start=0.5, delta=0.2, minimum=0.1, maximum=0.8)
+
+    scheduler.update()
+    scheduler.update()
+
+    assert scheduler.get_inverse_temperature() == 0.8
 
 
 def test_train_batch_updates_params_with_behavior_log_probs():
