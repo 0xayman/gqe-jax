@@ -126,11 +126,22 @@ class Pipeline:
             )
         else:
             self.pareto_archive = None
-        # Weight vector for the current rollout epoch.
-        # During warmup this stays at (1, 0, 0) — fidelity only.
         self._warmup_mode: bool = True
         self._current_epoch: int = 0
-        self._current_weights: np.ndarray = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        lambda_sum = self.cfg.pareto.lambda_depth + self.cfg.pareto.lambda_cnot
+        if lambda_sum > 0:
+            self._reward_lambdas = np.asarray(
+                [
+                    self.cfg.pareto.lambda_depth / lambda_sum,
+                    self.cfg.pareto.lambda_cnot / lambda_sum,
+                ],
+                dtype=np.float32,
+            )
+        else:
+            self._reward_lambdas = np.asarray([0.5, 0.5], dtype=np.float32)
+        self._reward_ref_depth: float | None = None
+        self._reward_ref_cnot: float | None = None
+        self._reward_ref_fidelity: float = float("-inf")
 
         self._compile_functions()
 
@@ -267,11 +278,11 @@ class Pipeline:
         fidelity_costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
 
         # When Pareto is active, compute structure metrics and build the
-        # scalarized cost that goes into the replay buffer.
+        # QASER-style stationary cost that goes into the replay buffer.
         if self.pareto_archive is not None:
             depths, total_gates = self._batch_compute_structure(idx_output[:, 1:])
+            self._update_reward_references(fidelities, depths, cnot_counts)
             if not self._warmup_mode:
-                self._current_weights = self._sample_weights()
                 buffer_costs = self._scalarize(fidelities, depths, cnot_counts)
             else:
                 buffer_costs = fidelity_costs
@@ -336,18 +347,131 @@ class Pipeline:
             total_gates[i] = t
         return depths, total_gates
 
-    def _sample_weights(self) -> np.ndarray:
-        """Sample a weight vector (w_F, w_d, w_c) from the configured Dirichlet.
+    def _select_reward_reference_index(
+        self,
+        fidelities: np.ndarray,
+        depths: np.ndarray,
+        cnot_counts: np.ndarray,
+    ) -> int:
+        order = np.lexsort(
+            (
+                np.asarray(depths, dtype=np.int32),
+                np.asarray(cnot_counts, dtype=np.int32),
+                -np.asarray(fidelities, dtype=np.float64),
+            )
+        )
+        return int(order[0])
 
-        Enforces a hard minimum on w_F so fidelity is never fully ignored,
-        then re-normalises so the weights sum to 1.
-        """
+    @staticmethod
+    def _is_better_structure(
+        cand_depth: float,
+        cand_cnot: float,
+        ref_depth: float,
+        ref_cnot: float,
+    ) -> bool:
+        return cand_cnot < ref_cnot or (
+            cand_cnot == ref_cnot and cand_depth < ref_depth
+        )
+
+    def structure_scale_for_fidelity(self, fidelities) -> np.ndarray:
+        """Return the fidelity-ramped structure pressure for each fidelity value."""
         p = self.cfg.pareto
-        w = np.random.dirichlet([p.alpha_F, p.alpha_d, p.alpha_c]).astype(np.float32)
-        if w[0] < p.w_F_min:
-            w[0] = p.w_F_min
-            w = w / w.sum()
-        return w
+        fidelities_f = np.asarray(fidelities, dtype=np.float32)
+        threshold = np.float32(max(float(p.fidelity_threshold), float(p.fidelity_log_eps)))
+        start = np.float32(min(float(p.structure_ramp_start), float(p.fidelity_threshold)))
+        denom = np.maximum(threshold - start, np.float32(p.fidelity_log_eps))
+        progress = np.clip((fidelities_f - start) / denom, 0.0, 1.0)
+        min_w = np.float32(p.structure_weight_min)
+        max_w = np.float32(p.structure_weight_max)
+        ramp_power = np.float32(p.structure_ramp_power)
+        scale = min_w + (max_w - min_w) * np.power(progress, ramp_power)
+        return np.asarray(scale, dtype=np.float32)
+
+    def _update_reward_references(
+        self,
+        fidelities: np.ndarray,
+        depths: np.ndarray,
+        cnot_counts: np.ndarray,
+    ) -> None:
+        if len(fidelities) == 0:
+            return
+
+        idx = self._select_reward_reference_index(fidelities, depths, cnot_counts)
+        cand_fidelity = float(np.asarray(fidelities[idx], dtype=np.float64))
+        cand_depth = float(np.asarray(depths[idx], dtype=np.float64))
+        cand_cnot = float(np.asarray(cnot_counts[idx], dtype=np.float64))
+        tol = 1e-6
+        same_fidelity = abs(cand_fidelity - self._reward_ref_fidelity) <= tol if np.isfinite(
+            self._reward_ref_fidelity
+        ) else False
+        better_structure = False
+        if self._reward_ref_depth is not None and self._reward_ref_cnot is not None:
+            better_structure = self._is_better_structure(
+                cand_depth,
+                cand_cnot,
+                self._reward_ref_depth,
+                self._reward_ref_cnot,
+            )
+
+        if self._reward_ref_depth is None or self._reward_ref_cnot is None:
+            self._reward_ref_depth = cand_depth
+            self._reward_ref_cnot = cand_cnot
+            self._reward_ref_fidelity = cand_fidelity
+            return
+
+        if self._warmup_mode:
+            if cand_fidelity > self._reward_ref_fidelity + tol or (
+                same_fidelity and better_structure
+            ):
+                self._reward_ref_depth = cand_depth
+                self._reward_ref_cnot = cand_cnot
+                self._reward_ref_fidelity = cand_fidelity
+            return
+
+        if same_fidelity and better_structure:
+            self._reward_ref_depth = cand_depth
+            self._reward_ref_cnot = cand_cnot
+            self._reward_ref_fidelity = max(self._reward_ref_fidelity, cand_fidelity)
+            return
+
+        ema = float(self.cfg.pareto.reference_ema)
+        if cand_fidelity <= self._reward_ref_fidelity + tol:
+            return
+
+        if ema <= 0.0:
+            self._reward_ref_depth = cand_depth
+            self._reward_ref_cnot = cand_cnot
+            self._reward_ref_fidelity = cand_fidelity
+            return
+
+        self._reward_ref_depth = (1.0 - ema) * self._reward_ref_depth + ema * cand_depth
+        self._reward_ref_cnot = (1.0 - ema) * self._reward_ref_cnot + ema * cand_cnot
+        self._reward_ref_fidelity = cand_fidelity
+
+    def _rescore_replay_buffer_with_stationary_reward(self) -> None:
+        if self.pareto_archive is None or len(self.buffer) == 0:
+            return
+        if self._reward_ref_depth is None or self._reward_ref_cnot is None:
+            return
+
+        raw = list(self.buffer.buf)
+        idx_batch = np.stack([item[0] for item in raw], axis=0).astype(np.int32)
+        old_log_probs = [
+            item[2] if len(item) == 3 else np.float32(np.nan)
+            for item in raw
+        ]
+        token_batch = idx_batch[:, 1:]
+        _, fidelities, cnot_counts = self.computeCost(token_batch, self.pool)
+        depths, _ = self._batch_compute_structure(token_batch)
+        scalar_costs = self._scalarize(fidelities, depths, cnot_counts)
+
+        rebuilt = ReplayBuffer(size=self.buffer.size)
+        for seq, cost_val, old_log_prob in zip(idx_batch, scalar_costs, old_log_probs):
+            if np.isnan(np.asarray(old_log_prob, dtype=np.float32)):
+                rebuilt.push(seq, cost_val)
+            else:
+                rebuilt.push(seq, cost_val, float(np.asarray(old_log_prob, dtype=np.float32)))
+        self.buffer = rebuilt
 
     def _scalarize(
         self,
@@ -355,42 +479,31 @@ class Pipeline:
         depths: np.ndarray,
         cnot_counts: np.ndarray,
     ) -> np.ndarray:
-        """Compute the scalarized cost with fidelity-threshold gating.
-
-        cost_i = w_F × (1 − F_i)
-               + gate_i × [ w_d × (d_i − μ_d) / (σ_d + ε)
-                           + w_c × (c_i − μ_c) / (σ_c + ε) ]
-
-        where gate_i = 1 if F_i >= fidelity_threshold, else 0.
-
-        The gate prevents mode collapse: circuits below the fidelity threshold
-        receive pure fidelity cost with no complexity bonus or penalty.  This
-        means the model cannot improve its reward by generating trivially short
-        but low-fidelity circuits (e.g. 0-CNOT, F≈0.39 for an entangled
-        2-qubit target).
-
-        The z-score is computed over the full batch for stability but is only
-        applied to circuits that have already earned the right to trade off
-        fidelity for shorter circuits.
-        """
-        w_F, w_d, w_c = self._current_weights
-        eps = 1e-8
-        threshold = self.cfg.pareto.fidelity_threshold
+        """Compute the stationary QASER-style compilation cost."""
 
         fidelities_f = np.asarray(fidelities, dtype=np.float32)
         depths_f = np.asarray(depths, dtype=np.float32)
         cnots_f = np.asarray(cnot_counts, dtype=np.float32)
+        if self._reward_ref_depth is None or self._reward_ref_cnot is None:
+            return (1.0 - fidelities_f).astype(np.float32)
 
-        # Gate: 1 for circuits above threshold, 0 below it.
-        gate = (fidelities_f >= threshold).astype(np.float32)
+        p = self.cfg.pareto
+        lambda_depth, lambda_cnot = self._reward_lambdas
+        eps = np.float32(p.fidelity_log_eps)
+        phi = -np.log(np.maximum(1.0 - fidelities_f + eps, eps))
+        phi = np.clip(phi, 0.0, p.fidelity_log_cap)
+        structure_scale = self.structure_scale_for_fidelity(fidelities_f)
 
-        d_norm = (depths_f - depths_f.mean()) / (depths_f.std() + eps)
-        c_norm = (cnots_f - cnots_f.mean()) / (cnots_f.std() + eps)
+        depth_ratio = (np.float32(self._reward_ref_depth) + 1.0) / (depths_f + 1.0)
+        cnot_ratio = (np.float32(self._reward_ref_cnot) + 1.0) / (cnots_f + 1.0)
+        structure_bonus = lambda_depth * depth_ratio + lambda_cnot * cnot_ratio
+        structure_bonus = np.maximum(structure_bonus, eps)
+        structure_margin = structure_bonus - np.float32(1.0)
+        structure_term = np.float32(p.structure_score_offset) + structure_scale * structure_margin
+        structure_term = np.maximum(structure_term, eps)
+        score = phi * structure_term
 
-        return (
-            w_F * (1.0 - fidelities_f)
-            + gate * (w_d * d_norm + w_c * c_norm)
-        ).astype(np.float32)
+        return (-score).astype(np.float32)
 
     def _compute_discrete_metrics(
         self,

@@ -1,0 +1,877 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{verbatim}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{Current Methodology for Unitary Synthesis in \texttt{gqe-torch}}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Purpose and Scope}
+
+This document describes the methodology that is \emph{currently implemented} in this repository for quantum unitary synthesis. It is not a design proposal. It is a code-faithful description of the active path defined by the current versions of:
+\texttt{main.py},
+\texttt{gqe.py},
+\texttt{pipeline.py},
+\texttt{model.py},
+\texttt{cost.py},
+\texttt{continuous\_optimizer.py},
+\texttt{pareto.py},
+\texttt{pareto\_gd\_optimizer.py},
+\texttt{operator\_pool.py},
+\texttt{target.py},
+\texttt{scheduler.py},
+\texttt{data.py},
+and \texttt{config.yml}.
+
+The code solves unitary synthesis as a hybrid discrete--continuous optimization problem:
+
+\begin{itemize}[leftmargin=*]
+\item the discrete search variable is a fixed-length sequence of gate tokens;
+\item the continuous search variable is the set of rotation angles attached to parameterized gates in that sequence;
+\item the quality signal is always based on process fidelity, and when Pareto mode is enabled the replay buffer stores a QASER-style stationary scalar reward that also favors lower depth and fewer CNOT gates;
+\item the policy is trained with a clipped GRPO-style surrogate using replayed trajectories and stored behavior log-probabilities.
+\end{itemize}
+
+\section{Formal Problem Definition}
+
+\subsection{Target and Search Space}
+
+Let:
+\begin{itemize}[leftmargin=*]
+\item $n$ be the number of qubits;
+\item $d = 2^n$ be the Hilbert-space dimension;
+\item $U_{\mathrm{target}} \in U(d)$ be the target unitary;
+\item $\mathcal{V}$ be the operator-pool vocabulary of discrete gate tokens;
+\item $N = \texttt{max\_gates\_count}$ be the fixed number of generated gate tokens per circuit.
+\end{itemize}
+
+The current generator is \emph{fixed length}. There is one beginning-of-sequence token $\texttt{BOS}$ and no end-of-sequence token. A sampled circuit structure is therefore represented as
+\[
+z = (z_0,z_1,\dots,z_N),
+\]
+where $z_0 = \texttt{BOS}$ and $z_t \in \{1,\dots,|\mathcal{V}|\}$ for $t \ge 1$.
+
+After removing the BOS token and shifting the ids by the gate-token offset, the sequence corresponds to an ordered list of gates
+\[
+x = (x_1,\dots,x_N), \qquad x_t \in \mathcal{V}.
+\]
+
+\subsection{Circuit Unitary}
+
+Each token $x_t$ maps to either:
+\begin{itemize}[leftmargin=*]
+\item a fixed unitary gate, such as \texttt{SX} or \texttt{CNOT}, or
+\item a parameterized one-qubit rotation, such as \texttt{RZ} in the current default configuration.
+\end{itemize}
+
+Let $\theta \in \mathbb{R}^m$ denote the subset of continuous parameters associated with the parameterized gates in the sampled structure. The synthesized unitary is
+\[
+U(x,\theta) = G_N(\theta)\cdots G_2(\theta)G_1(\theta),
+\]
+where gates are applied left-to-right in the stored sequence and composed by left multiplication in the code.
+
+\subsection{Primary Objective}
+
+The primary compilation metric is process fidelity:
+\[
+F\!\left(U_{\mathrm{target}},U(x,\theta)\right)
+=
+\frac{\left|\mathrm{Tr}\!\left(U_{\mathrm{target}}^\dagger U(x,\theta)\right)\right|^2}{d^2}.
+\]
+
+The base fidelity cost is
+\[
+C_F(x,\theta) = 1 - F\!\left(U_{\mathrm{target}},U(x,\theta)\right).
+\]
+
+Without Pareto reward shaping, the training objective is to search for structures and angles that minimize $C_F$.
+
+\subsection{Auxiliary Structural Objectives}
+
+When Pareto mode is enabled, the code also tracks the following structure metrics for each sampled circuit:
+\begin{itemize}[leftmargin=*]
+\item estimated depth $D(x)$;
+\item total gate count $T(x)$;
+\item CNOT count $C(x)$.
+\end{itemize}
+
+The active Pareto archive is defined over:
+\begin{itemize}[leftmargin=*]
+\item maximize fidelity $F$;
+\item minimize depth $D$;
+\item minimize CNOT count $C$.
+\end{itemize}
+
+The replay buffer is then trained against a stationary scalarized cost derived from fidelity, depth, and CNOT count. This scalarized cost affects policy learning, but the code still tracks \emph{best circuit} using raw fidelity cost $1-F$.
+
+\section{Methodology Overview}
+
+At a high level, the implemented pipeline is:
+
+\begin{enumerate}[leftmargin=*]
+\item load and validate the experiment configuration;
+\item build the operator pool and the model vocabulary;
+\item generate or load the target unitary;
+\item compile the target with Qiskit in the same native basis for reference only;
+\item initialize a GPT-2 style autoregressive policy over gate tokens;
+\item warm up a replay buffer by sampling complete fixed-length circuits;
+\item evaluate each sampled circuit by dense-matrix fidelity, optionally after continuous angle optimization;
+\item convert fidelity and structure metrics into either a fidelity-only cost or a QASER-style stationary cost;
+\item store the sampled token sequence, its scalar cost, and its behavior sequence log-probability in the replay buffer;
+\item train the policy with a clipped GRPO-style ratio update over replay-buffer minibatches;
+\item maintain a Pareto archive of non-dominated circuits when Pareto mode is enabled;
+\item optionally run a post-training gradient-descent refinement pass over the archived circuits;
+\item decode the best raw-fidelity sequence, re-optimize its continuous parameters for verification, rebuild it as a Qiskit circuit, and compare it against the Qiskit reference.
+\end{enumerate}
+
+\section{Current Default Experiment}
+
+The current \texttt{config.yml} instantiates the following default run:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.34\linewidth} >{\raggedright\arraybackslash}p{0.52\linewidth}}
+\toprule
+Setting & Current value \\
+\midrule
+\texttt{target.num\_qubits} & $2$ \\
+\texttt{target.type} & \texttt{file} \\
+\texttt{target.path} & \texttt{targets/haar\_random\_q2.npy} \\
+\texttt{pool.rotation\_gates} & \texttt{["rz"]} \\
+\texttt{model.size} & \texttt{small} \\
+\texttt{model.max\_gates\_count} & $28$ \\
+\texttt{training.max\_epochs} & $50$ \\
+\texttt{training.num\_samples} & $200$ circuits per rollout \\
+\texttt{training.batch\_size} & $32$ \\
+\texttt{training.lr} & $10^{-4}$ \\
+\texttt{training.grad\_norm\_clip} & $1.0$ \\
+\texttt{training.grpo\_clip\_ratio} & $0.2$ \\
+\texttt{temperature.scheduler} & \texttt{fixed} \\
+\texttt{temperature.initial\_value} & $0.5$ \\
+\texttt{buffer.max\_size} & $500$ \\
+\texttt{buffer.warmup\_size} & $100$ \\
+\texttt{buffer.steps\_per\_epoch} & $4$ \\
+\texttt{continuous\_opt.enabled} & true \\
+\texttt{continuous\_opt.optimizer} & \texttt{lbfgs} \\
+\texttt{continuous\_opt.steps} & $200$ \\
+\texttt{continuous\_opt.top\_k} & $0$ (optimize all rollout samples) \\
+\texttt{continuous\_opt.num\_restarts} & $3$ \\
+\texttt{pareto.enabled} & true \\
+\texttt{pareto.lambda\_depth} & $0.35$ \\
+\texttt{pareto.lambda\_cnot} & $0.65$ \\
+\texttt{pareto.reference\_ema} & $0.0$ \\
+\texttt{pareto\_gd.enabled} & true \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Some immediate consequences of the current default are:
+
+\begin{itemize}[leftmargin=*]
+\item the operator pool contains only \texttt{RZ}, \texttt{SX}, and \texttt{CNOT} gates;
+\item every rollout contains $200$ circuits of exactly $28$ gate tokens each;
+\item because \texttt{warmup\_size = 100 < num\_samples = 200}, a single rollout is enough to finish warmup;
+\item because \texttt{buffer.max\_size = 500}, the replay buffer becomes a sliding window over the most recent few rollouts;
+\item because \texttt{pareto.floor\_ramp\_epoch = 100 > training.max\_epochs = 50}, the configured late fidelity floor is never activated in the default run.
+\end{itemize}
+
+\section{Detailed Methodology}
+
+\subsection{Configuration Validation}
+
+The run starts by loading \texttt{config.yml} through \texttt{load\_config()} in \texttt{config.py}. The configuration layer validates:
+\begin{itemize}[leftmargin=*]
+\item target type and shape assumptions;
+\item model size and sequence length;
+\item optimizer hyperparameters;
+\item temperature-scheduler bounds;
+\item replay-buffer sizes;
+\item Pareto and continuous-optimization parameters.
+\end{itemize}
+
+The configuration object is then frozen into nested dataclasses, so the training pipeline treats the experiment definition as immutable.
+
+\subsection{Operator Pool and Tokenization}
+
+\paragraph{Pool construction.}
+The operator pool is built by \texttt{build\_operator\_pool()} in \texttt{operator\_pool.py}. For $n$ qubits and a configured rotation set $\mathcal{R}$, the pool contains:
+\begin{itemize}[leftmargin=*]
+\item one token \texttt{AXIS\_q$i$} for each axis in $\mathcal{R}$ and each qubit $i$;
+\item one token \texttt{SX\_q$i$} for each qubit $i$;
+\item one token \texttt{CNOT\_q$i$\_q$j$} for every ordered pair $(i,j)$ with $i \ne j$.
+\end{itemize}
+
+For the current default with $n=2$ and $\mathcal{R}=\{\texttt{RZ}\}$, the pool is:
+\[
+\{\texttt{RZ\_q0}, \texttt{SX\_q0}, \texttt{RZ\_q1}, \texttt{SX\_q1}, \texttt{CNOT\_q0\_q1}, \texttt{CNOT\_q1\_q0}\},
+\]
+so the pool size is $6$ and the model vocabulary size is $7$ after adding BOS.
+
+\paragraph{Stored matrices.}
+Each pool entry stores a full dense $2^n \times 2^n$ embedded unitary matrix.
+Parameterized rotations are stored with a placeholder angle of $\pi/4$.
+That placeholder is used only for the pure discrete evaluation path and for angle initialization; it is not the final angle when continuous optimization is enabled.
+
+\paragraph{Token ids.}
+The active token scheme is:
+\begin{itemize}[leftmargin=*]
+\item BOS token id $0$;
+\item gate token ids $1,\dots,|\mathcal{V}|$;
+\item gate-token offset $=1$.
+\end{itemize}
+
+There is no EOS token, no PAD token, and no variable-length sampling logic in the current policy.
+
+\subsection{Target Unitary Preparation}
+
+The target unitary is prepared by \texttt{build\_target()} in \texttt{target.py}. The supported target modes are:
+\begin{itemize}[leftmargin=*]
+\item \texttt{random\_reachable}: sample a short random circuit from the pool and compose it;
+\item \texttt{haar\_random}: draw a Haar-random unitary by QR factorization of a complex Gaussian matrix;
+\item \texttt{file}: load a saved \texttt{.npy} unitary and validate its shape against \texttt{target.num\_qubits}.
+\end{itemize}
+
+In the current default run, the code loads a $4\times 4$ unitary from \texttt{targets/haar\_random\_q2.npy}. After loading, \texttt{main.py} verifies numerically that the matrix is unitary.
+
+\subsection{Reference Compilation with Qiskit}
+
+Before training begins, the target is compiled once with Qiskit using basis gates that match the operator pool:
+\[
+\texttt{basis\_gates} = [\texttt{rz}, \texttt{sx}, \texttt{cx}]
+\]
+for the current default configuration.
+
+This Qiskit circuit is \emph{not} used as supervision. It is a reference baseline used only for final comparison of:
+\begin{itemize}[leftmargin=*]
+\item depth;
+\item total gate count;
+\item two-qubit gate count.
+\end{itemize}
+
+\subsection{Policy Model}
+
+The structure-search model is a GPT-2 style causal transformer implemented in \texttt{model.py}. The architecture includes:
+\begin{itemize}[leftmargin=*]
+\item learned token embeddings;
+\item learned positional embeddings;
+\item pre-layer-normalized transformer blocks;
+\item causal self-attention;
+\item a GELU MLP;
+\item tied output projection through the token embedding matrix.
+\end{itemize}
+
+The supported presets are:
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Model size & Layers & Heads & Embedding dimension \\
+\midrule
+\texttt{tiny} & 2 & 2 & 128 \\
+\texttt{small} & 6 & 6 & 384 \\
+\texttt{medium} & 12 & 12 & 768 \\
+\texttt{large} & 24 & 16 & 1024 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The current default run uses \texttt{small}.
+
+\paragraph{Important modeling convention.}
+The model outputs are used as \emph{energies}, not as standard language-model logits. Both sampling and log-probability evaluation are based on
+\[
+\pi_\beta(a_t=v \mid a_{<t})
+\propto
+\exp(-\beta E_t(v)),
+\]
+where $E_t(v)$ is the transformer output for token $v$ at position $t$, and $\beta$ is the inverse temperature returned by the scheduler.
+
+\paragraph{Dropout.}
+The model defines dropout layers, but the training and rollout code calls the network with \texttt{deterministic=True}. Therefore dropout is disabled in the active training path.
+
+\subsection{Rollout Generation}
+
+Rollouts are generated in \texttt{Pipeline.generate()} using a JIT-compiled \texttt{jax.lax.scan}. The generation state contains:
+\begin{itemize}[leftmargin=*]
+\item a token matrix initialized with BOS in column $0$;
+\item an attention mask that marks which positions are already active;
+\item a JAX PRNG key.
+\end{itemize}
+
+At each step $t \in \{0,\dots,N-1\}$:
+\begin{enumerate}[leftmargin=*]
+\item the current prefix is passed through the transformer;
+\item the BOS token is masked out by assigning it infinite energy so it cannot be resampled;
+\item the next gate token is sampled from \texttt{categorical} over $-\beta E_t$;
+\item the sampled token is appended to position $t+1$ and marked active in the attention mask.
+\end{enumerate}
+
+Because there is no EOS token, the generator always produces exactly $N$ gate tokens.
+
+\subsection{Sequence Log-Probabilities}
+
+The active rollout stores one behavior-policy score per sampled circuit. This score is computed immediately after generation using the same current policy and the same inverse temperature.
+
+For a sampled sequence $x=(x_1,\dots,x_N)$, the code first computes token-level log-probabilities
+\[
+\log \pi_\beta(x_t \mid x_{<t}),
+\]
+then reduces them to a single sequence score by \emph{taking the mean over positions}:
+\[
+\ell(x)
+=
+\frac{1}{N}\sum_{t=1}^N \log \pi_\beta(x_t \mid x_{<t}).
+\]
+
+This mean reduction is deliberate. It makes the importance ratio less sensitive to sequence length than a summed log-probability would be. In the current code the sequence length is fixed, but the mean reduction is still the implemented definition.
+
+\subsection{Fidelity Evaluation}
+
+The active scoring path is batched and JAX-native. Although \texttt{main.py} still constructs a Python \texttt{cost\_fn}, the actual rollout evaluation in \texttt{pipeline.py} uses:
+\begin{itemize}[leftmargin=*]
+\item the target matrix already converted to JAX;
+\item the stacked operator-pool matrices;
+\item JIT-compiled dense-matrix composition and fidelity kernels from \texttt{cost.py}.
+\end{itemize}
+
+Given a batch of gate matrices, the code composes each circuit unitary by scanning
+\[
+U \leftarrow G_t U,
+\]
+starting from the identity, then computes process fidelity and the fidelity cost
+\[
+C_F = 1 - F.
+\]
+
+\subsection{Structure Metrics}
+
+For every sampled circuit, the pipeline also computes structural descriptors from the token sequence:
+\begin{itemize}[leftmargin=*]
+\item total gate count;
+\item CNOT count;
+\item depth.
+\end{itemize}
+
+\paragraph{CNOT count.}
+The CNOT count is the number of sampled tokens whose token metadata marks them as two-qubit gates.
+
+\paragraph{Depth proxy.}
+Depth is computed by a greedy qubit-depth counter:
+\begin{itemize}[leftmargin=*]
+\item a one-qubit gate on qubit $q$ increments the depth counter of $q$ by one;
+\item a two-qubit gate on $(q_0,q_1)$ sets both counters to
+\[
+\max\{d_{q_0}, d_{q_1}\} + 1.
+\]
+\end{itemize}
+
+This is a structural proxy computed directly on the sampled token sequence. It is not a hardware-transpiled depth.
+
+\paragraph{Current implication.}
+Because the generator is fixed length and there is no simplification during rollouts, the total gate count $T(x)$ is effectively constant and equal to $N$ for every rollout sample in the default training path. Depth and CNOT count are the structure metrics that actually vary.
+
+\subsection{Continuous Angle Optimization}
+
+When \texttt{continuous\_opt.enabled = true}, the rollout scorer does not stop at the discrete placeholder angles. Instead, for each sampled circuit structure it refines the angles of the parameterized gates to improve fidelity against the fixed target.
+
+\paragraph{Gate encoding.}
+The continuous optimizer parses token names into gate specifications, then encodes the circuit into fixed-shape arrays of:
+\begin{itemize}[leftmargin=*]
+\item gate type id;
+\item primary qubit index;
+\item CNOT pair index;
+\item angle vector padded to length \texttt{max\_gates}.
+\end{itemize}
+
+The internal gate types are:
+\[
+\texttt{RX}, \texttt{RY}, \texttt{RZ}, \texttt{SX}, \texttt{CNOT}, \texttt{NOOP}.
+\]
+Even though the optimizer can represent \texttt{RX} and \texttt{RY}, the current default operator pool exposes only \texttt{RZ} as a parameterized gate type.
+
+\paragraph{Optimization objective.}
+For a fixed discrete structure $x$, the optimizer solves
+\[
+\min_{\theta} \; 1 - F\!\left(U_{\mathrm{target}}, U(x,\theta)\right).
+\]
+
+\paragraph{Optimizers.}
+The implemented continuous optimizers are:
+\begin{itemize}[leftmargin=*]
+\item L-BFGS via \texttt{optax.lbfgs};
+\item Adam via \texttt{optax.adam}.
+\end{itemize}
+
+The current default uses L-BFGS.
+
+\paragraph{Multi-start policy.}
+If a circuit contains parameterized gates, the optimizer uses:
+\begin{itemize}[leftmargin=*]
+\item one deterministic start from the default angles stored in the operator pool, and
+\item additional random restarts sampled uniformly from $[-\pi,\pi]$ on the parametric positions only.
+\end{itemize}
+
+All restarts are optimized independently and the best final fidelity is kept.
+
+\paragraph{Non-parameterized circuits.}
+If a circuit has no parameterized gates, the optimizer skips gradient descent and evaluates the fidelity directly.
+
+\paragraph{Top-$k$ option.}
+If \texttt{continuous\_opt.top\_k > 0}, the pipeline first scores all circuits with discrete placeholder angles, then only refines the best $k$ structures.
+If \texttt{top\_k = 0}, every rollout sample is refined.
+The current default uses \texttt{top\_k = 0}, so every sampled circuit is angle-optimized before its rollout fidelity is finalized.
+
+\paragraph{Precision policy.}
+The repository globally enables JAX x64, but the \emph{training-time} continuous optimizer is constructed with \texttt{fast\_runtime=True}, so its internal angle optimization uses lower-precision float32/complex64 arithmetic for speed.
+Later verification passes in \texttt{main.py} and \texttt{pareto\_gd\_optimizer.py} instantiate the optimizer without \texttt{fast\_runtime=True}, so they use higher precision.
+
+\subsection{Cost and Reward Definitions}
+
+\subsubsection{Fidelity-only cost}
+
+During all runs, the pipeline always computes the fidelity-only rollout quantities:
+\[
+C_F = 1-F, \qquad F = \text{process fidelity}.
+\]
+
+These fidelity-only costs are used for:
+\begin{itemize}[leftmargin=*]
+\item raw-fidelity best-circuit tracking;
+\item scheduler updates;
+\item rollout diagnostics and logging;
+\item warmup scoring before Pareto reward shaping becomes active.
+\end{itemize}
+
+\subsubsection{Warmup and reward-reference initialization}
+
+If Pareto mode is enabled, warmup is still \emph{fidelity only}. During warmup, the pipeline scans the current rollout to initialize two reward-reference values:
+\begin{itemize}[leftmargin=*]
+\item $D_{\mathrm{ref}}$, the reference depth;
+\item $C_{\mathrm{ref}}$, the reference CNOT count.
+\end{itemize}
+
+The candidate used to update the references is selected by lexicographic priority:
+\begin{enumerate}[leftmargin=*]
+\item highest fidelity first;
+\item if fidelities tie, lower CNOT count first;
+\item if both still tie, lower depth first.
+\end{enumerate}
+
+During warmup, the references are updated whenever a rollout candidate has either:
+\begin{itemize}[leftmargin=*]
+\item strictly higher fidelity than the current reference candidate, or
+\item the same fidelity and better structure under the tie-breaking rule above.
+\end{itemize}
+
+\subsubsection{QASER-style stationary scalarization}
+
+After warmup ends, the replay buffer is rescored once with a stationary QASER-style reward. The active scalarization in \texttt{Pipeline.\_scalarize()} is:
+
+\[
+\phi(F)
+=
+\mathrm{clip}\!\left(
+-\log\!\left(\max(1-F+\varepsilon,\varepsilon)\right),
+0,\phi_{\max}
+\right),
+\]
+
+\[
+B(D,C)
+=
+\lambda_D \frac{D_{\mathrm{ref}}+1}{D+1}
+\;+\;
+\lambda_C \frac{C_{\mathrm{ref}}+1}{C+1},
+\qquad
+\lambda_D + \lambda_C = 1,
+\]
+
+\[
+\mathrm{score}(F,D,C)
+=
+\phi(F)\left(\beta_0 + \log(\max(B(D,C),\varepsilon))\right),
+\]
+
+\[
+C_{\mathrm{QASER}}(F,D,C)
+=
+-\mathrm{score}(F,D,C).
+\]
+
+Here:
+\begin{itemize}[leftmargin=*]
+\item $\varepsilon = \texttt{pareto.fidelity\_log\_eps}$;
+\item $\phi_{\max} = \texttt{pareto.fidelity\_log\_cap}$;
+\item $\beta_0 = \texttt{pareto.structure\_score\_offset}$;
+\item $(\lambda_D,\lambda_C)$ are the normalized depth and CNOT weights from the config.
+\end{itemize}
+
+For the current default, the normalized weights are exactly
+\[
+\lambda_D = 0.35, \qquad \lambda_C = 0.65.
+\]
+
+\paragraph{Interpretation.}
+This reward increases sharply as fidelity approaches $1$, because the fidelity shaping term uses $-\log(1-F+\varepsilon)$, and it then modulates that fidelity gain by a structure bonus that rewards circuits shallower than $D_{\mathrm{ref}}$ or with fewer CNOTs than $C_{\mathrm{ref}}$.
+
+\subsubsection{Post-warmup reference updates}
+
+Once warmup is over:
+\begin{itemize}[leftmargin=*]
+\item if \texttt{reference\_ema = 0}, the reward references are frozen permanently;
+\item if \texttt{reference\_ema} is positive, the references are updated only when a new rollout produces strictly higher fidelity than the current reference-fidelity record, and the update is an exponential moving average.
+\end{itemize}
+
+The current default uses \texttt{reference\_ema = 0.0}, so the reference depth and reference CNOT count are frozen immediately after warmup.
+
+\subsubsection{Replay-buffer rescoring after warmup}
+
+The replay buffer accumulated during warmup initially contains fidelity-only costs.
+Immediately after warmup, if Pareto mode is active, the code rescans every buffered sequence, recomputes its fidelity, depth, and CNOT count, converts those metrics to the stationary QASER-style cost above, and rebuilds the replay buffer with the same sequences and the same stored behavior log-probabilities.
+
+This is an important methodological detail: once training proper starts, replay is trained against a stationary reward, not against a mixture of warmup and post-warmup cost definitions.
+
+\subsection{Pareto Archive}
+
+When Pareto mode is enabled, the code also maintains a Pareto archive across rollout samples.
+
+\paragraph{Dominance rule.}
+A point $a$ dominates a point $b$ if:
+\[
+F_a \ge F_b, \qquad D_a \le D_b, \qquad C_a \le C_b,
+\]
+and at least one of the inequalities is strict.
+
+\paragraph{Archive update.}
+Each new point is:
+\begin{itemize}[leftmargin=*]
+\item rejected if its fidelity is below the configured fidelity floor;
+\item rejected if it is dominated by any existing archive member;
+\item inserted otherwise, after removing any archive members that it dominates.
+\end{itemize}
+
+\paragraph{Pruning.}
+If the archive exceeds its maximum size, it is pruned by crowding distance over fidelity, depth, and CNOT count.
+
+\paragraph{Metrics.}
+The archive reports:
+\begin{itemize}[leftmargin=*]
+\item best-fidelity point;
+\item best CNOT point above a requested fidelity threshold;
+\item best depth point above a requested fidelity threshold;
+\item a two-dimensional hypervolume in fidelity--CNOT space.
+\end{itemize}
+
+\paragraph{Floor ramp.}
+The archive has a late-stage fidelity-floor ramp:
+\begin{itemize}[leftmargin=*]
+\item start from \texttt{pareto.fidelity\_floor};
+\item at epoch \texttt{pareto.floor\_ramp\_epoch}, raise the floor to \texttt{pareto.fidelity\_floor\_late} and evict archived entries below that new floor.
+\end{itemize}
+
+In the current default run this ramp is configured but inactive, because the training run stops before the ramp epoch is reached.
+
+\subsection{Replay Buffer}
+
+The replay buffer is a FIFO queue implemented in \texttt{data.py}. Each stored item contains:
+\begin{itemize}[leftmargin=*]
+\item the full token sequence including BOS;
+\item the scalar cost used for learning;
+\item the stored behavior sequence log-probability.
+\end{itemize}
+
+The buffer has fixed capacity and silently drops the oldest items when full.
+
+\paragraph{Current default consequence.}
+With \texttt{num\_samples = 200} and \texttt{buffer.max\_size = 500}, the default run quickly becomes a short-horizon replay process that mixes only the most recent few rollouts.
+
+\subsection{Replay Dataloader}
+
+The replay dataset is exposed through \texttt{BufferDataset}. It does not create new samples. Instead, it repeats the current buffer contents \texttt{steps\_per\_epoch} times and optionally shuffles the repeated indices.
+
+If the replay buffer currently holds $M$ items and \texttt{steps\_per\_epoch} is $R$, then one training epoch sees a logical dataset of size
+\[
+MR.
+\]
+The minibatches used for policy optimization are drawn from this repeated replay view.
+
+\subsection{GRPO Training Objective}
+
+The policy update is implemented in JIT-compiled form inside \texttt{Pipeline.\_compile\_functions()}.
+
+\paragraph{Inputs to one training minibatch.}
+For each replayed item $i$ in a minibatch, the code uses:
+\begin{itemize}[leftmargin=*]
+\item the stored token sequence $z_i$;
+\item the stored scalar cost $c_i$;
+\item the stored behavior sequence log-probability $\ell_i^{\mathrm{old}}$;
+\item the current policy sequence log-probability $\ell_i$ evaluated at the current parameters.
+\end{itemize}
+
+\paragraph{Advantage definition.}
+The advantage is computed from the minibatch costs by
+\[
+A_i
+=
+\frac{\bar c - c_i}{s_c + 10^{-8}},
+\]
+where
+\[
+\bar c = \frac{1}{B}\sum_{j=1}^B c_j,
+\qquad
+s_c = \text{unbiased sample standard deviation of } \{c_j\}_{j=1}^B.
+\]
+
+Because lower cost is better, a below-average cost gives positive advantage.
+
+\paragraph{Importance ratio.}
+The current-to-behavior importance ratio is
+\[
+r_i = \exp(\ell_i - \ell_i^{\mathrm{old}}).
+\]
+
+\paragraph{Clipped surrogate.}
+With clip ratio $\epsilon = \texttt{training.grpo\_clip\_ratio}$, the loss is
+\[
+\mathcal{L}_{\mathrm{GRPO}}
+=
+-\frac{1}{B}\sum_{i=1}^{B}
+\min\!\left(
+r_i A_i,\;
+\mathrm{clip}(r_i,1-\epsilon,1+\epsilon)A_i
+\right).
+\]
+
+\paragraph{Important implementation detail.}
+The active GRPO update is implemented directly in \texttt{pipeline.py}. The \texttt{GRPOLoss} class still exists in \texttt{loss.py}, but in the current pipeline it is used mainly as a container for the clip ratio, while the actual JAX update path is hard-coded in the pipeline.
+
+\paragraph{What constitutes the ``group'' in GRPO.}
+In this implementation, the relevant group for cost normalization is the current replay minibatch, not the original rollout batch. Therefore the advantage normalization is applied on replayed data that may mix trajectories from different rollouts.
+
+\subsection{Parameter Optimization Rules}
+
+The policy-network parameters are updated with:
+\begin{enumerate}[leftmargin=*]
+\item global-norm gradient clipping via \texttt{optax.clip\_by\_global\_norm};
+\item AdamW via \texttt{optax.adamw};
+\item learning rate \texttt{training.lr};
+\item weight decay fixed at $0.01$ in the code.
+\end{enumerate}
+
+No separate value network is used.
+No entropy bonus is used.
+No KL penalty is added beyond the clipped-ratio mechanism.
+
+\subsection{Temperature Scheduling}
+
+The scheduler API exposes an inverse temperature $\beta$ through \texttt{get\_inverse\_temperature()}.
+Three schedulers are implemented:
+\begin{itemize}[leftmargin=*]
+\item \texttt{FixedScheduler};
+\item \texttt{LinearScheduler};
+\item \texttt{CosineScheduler}.
+\end{itemize}
+
+The current default uses \texttt{FixedScheduler(0.5)}, so:
+\begin{itemize}[leftmargin=*]
+\item the inverse temperature remains constant at $\beta = 0.5$;
+\item the scheduler update call is a no-op;
+\item rollout exploration pressure is therefore stationary across epochs in the default configuration.
+\end{itemize}
+
+Even when Pareto mode is active, the scheduler is always updated using fidelity-only rollout costs rather than the scalarized replay cost. Under the current fixed scheduler this distinction has no effect, but the code path is defined that way.
+
+\section{Full Training Pipeline}
+
+\subsection{Warmup}
+
+The training loop in \texttt{gqe.py} starts by filling the replay buffer:
+\begin{verbatim}
+while len(buffer) < warmup_size:
+    collect_rollout()
+\end{verbatim}
+
+One call to \texttt{collect\_rollout()} performs:
+\begin{enumerate}[leftmargin=*]
+\item generate one rollout of \texttt{num\_samples} fixed-length sequences;
+\item compute and store their behavior sequence log-probabilities;
+\item evaluate fidelity, CNOT count, and depth;
+\item choose the replay cost:
+  \begin{itemize}[leftmargin=*]
+  \item fidelity-only during warmup,
+  \item QASER-style scalarized cost after warmup if Pareto mode is enabled,
+  \item fidelity-only always if Pareto mode is disabled;
+  \end{itemize}
+\item push sequences, costs, and old log-probabilities into the replay buffer;
+\item update raw rollout diagnostics from the fidelity-only costs;
+\item update the Pareto archive with the rollout points when Pareto mode is enabled.
+\end{enumerate}
+
+Because the current default rollout size is larger than the warmup size, warmup finishes after exactly one rollout.
+
+\subsection{Transition from Warmup to Training}
+
+After warmup:
+\begin{enumerate}[leftmargin=*]
+\item \texttt{\_warmup\_mode} is set to false;
+\item if Pareto mode is enabled, the replay buffer is rescored with the stationary reward.
+\end{enumerate}
+
+At that point the actual policy-learning phase begins.
+
+\subsection{Epoch Loop}
+
+For each epoch:
+\begin{enumerate}[leftmargin=*]
+\item record the epoch index in the pipeline;
+\item optionally raise the Pareto archive fidelity floor if the configured ramp epoch has been reached;
+\item collect one fresh rollout and append it to replay;
+\item update the best raw-fidelity circuit seen so far from the latest rollout;
+\item build a replay dataloader from the current buffer;
+\item iterate over shuffled minibatches of \texttt{(idx, cost, old\_log\_prob)};
+\item run one clipped-GRPO parameter update per minibatch;
+\item aggregate the mean minibatch loss for logging;
+\item emit epoch-level metrics, including fidelity, depth, CNOT count, and Pareto metrics.
+\end{enumerate}
+
+Early stopping is available if \texttt{training.early\_stop = true} and raw fidelity reaches $1 - 10^{-8}$, but the current default leaves early stopping disabled.
+
+\subsection{Best-Circuit Tracking}
+
+The code keeps two notions separate:
+\begin{itemize}[leftmargin=*]
+\item the \emph{learning cost} stored in replay, which may be the Pareto scalarized QASER-style cost;
+\item the \emph{best circuit} tracked for final reporting, which is always selected using raw fidelity cost $1-F$ from the most recent rollout.
+\end{itemize}
+
+This means the final reported best circuit is the highest raw-fidelity circuit encountered, not necessarily the circuit that optimized the replay scalarization most strongly.
+
+\subsection{Post-training Pareto Gradient Descent}
+
+If \texttt{pareto\_gd.enabled = true} and the Pareto archive is non-empty, the code performs an additional post-training pass over all archived points.
+
+For each archived circuit whose fidelity is below $1-\texttt{fidelity\_eps}$:
+\begin{enumerate}[leftmargin=*]
+\item decode the stored token sequence back into gate names;
+\item run the continuous optimizer again with the configured Pareto-GD settings;
+\item if fidelity improves, replace the stored fidelity by the improved value;
+\item rebuild the archive from the updated points so dominance is re-evaluated.
+\end{enumerate}
+
+The current implementation keeps the original stored structure fields \texttt{depth}, \texttt{total\_gates}, \texttt{cnot\_count}, and \texttt{token\_sequence}. The post-training Pareto-GD pass therefore updates archive fidelity but does not rewrite the archived structure.
+
+\subsection{Final Verification and Reporting}
+
+After training:
+\begin{enumerate}[leftmargin=*]
+\item the best token sequence is decoded back into gate names;
+\item if continuous optimization is enabled, the code instantiates a fresh verifier optimizer and re-optimizes that fixed structure at higher precision;
+\item the verified structure and angles are converted into a Qiskit circuit;
+\item fidelity is recomputed from the Qiskit circuit matrix;
+\item the resulting circuit is compared side-by-side with the Qiskit reference circuit.
+\end{enumerate}
+
+This final stage is therefore not merely replaying the rollout score; it explicitly re-verifies the reported best structure.
+
+\section{Algorithmic Summary}
+
+The implemented training pipeline can be summarized as:
+
+\begin{verbatim}
+Input:
+    config
+    operator pool
+    target unitary
+
+Build:
+    GPT-2 policy over gate tokens
+    replay buffer
+    optional continuous optimizer
+    optional Pareto archive
+    scheduler over inverse temperature
+
+Warmup:
+    while replay buffer smaller than warmup size:
+        sample num_samples fixed-length circuits
+        compute behavior sequence log-probabilities
+        evaluate fidelity and structure
+        store fidelity-only costs in replay
+        update reward references if Pareto enabled
+        update Pareto archive if enabled
+
+After warmup:
+    freeze or EMA-update reward references
+    if Pareto enabled:
+        rescore replay buffer with stationary QASER-style reward
+
+For each epoch:
+    sample one fresh rollout
+    compute old log-probs for that rollout
+    evaluate circuits by:
+        discrete fidelity only, or
+        discrete structure + continuous angle refinement
+    convert rollout metrics to replay costs
+    push rollout into replay
+    update best raw-fidelity circuit
+    update Pareto archive
+    iterate over replay minibatches:
+        compute current sequence log-probs
+        compute minibatch-normalized advantages from replay costs
+        apply clipped GRPO update with AdamW
+
+After training:
+    optionally run Pareto-GD over archive members
+    decode best raw-fidelity sequence
+    re-optimize its angles for verification
+    reconstruct the final Qiskit circuit
+    compare against the Qiskit reference compilation
+\end{verbatim}
+
+\section{Current Methodological Characteristics and Caveats}
+
+The current implementation has several properties that matter when interpreting results:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Fixed-length generation.} Every sampled circuit has exactly \texttt{max\_gates\_count} gate tokens. There is no EOS-based stopping behavior.
+\item \textbf{Dense-matrix simulation.} Both discrete and continuous evaluation use full dense unitary matrices, so the methodology is aimed at small-$n$ synthesis experiments.
+\item \textbf{Best-circuit selection is fidelity-based.} Even in Pareto mode, the final reported best sequence is chosen by raw fidelity, not by the replay scalarization.
+\item \textbf{Replay is off-policy in practice.} Stored behavior log-probabilities make the clipped ratio well-defined, but training batches mix old and new trajectories from the FIFO replay window.
+\item \textbf{Total gate count is structurally uninformative during training.} With fixed-length generation and no rollout simplification, total gates do not vary across rollout samples.
+\item \textbf{Training-time versus verification-time precision differ.} Rollout-time continuous optimization uses the fast-runtime low-precision path, while final verification uses higher precision.
+\item \textbf{Pareto-GD refines fidelity only.} The archive is rebuilt with improved fidelities, but stored structure metadata are not rewritten after that refinement pass.
+\end{itemize}
+
+\section{Conclusion}
+
+The current codebase implements a hybrid methodology for unitary synthesis in which:
+\begin{itemize}[leftmargin=*]
+\item a causal transformer proposes fixed-length discrete gate sequences;
+\item a dense-matrix fidelity kernel evaluates those sequences against a target unitary;
+\item an optional continuous optimizer refines parametric rotation angles for each sampled structure;
+\item a replay buffer stores both scalar costs and behavior sequence log-probabilities;
+\item the policy is updated with a clipped GRPO-style objective;
+\item a Pareto archive and QASER-style stationary reward bias learning toward circuits with better fidelity--depth--CNOT trade-offs;
+\item a final verification pass rebuilds and checks the best learned circuit against a Qiskit baseline.
+\end{itemize}
+
+That is the methodology currently followed by the code.
+
+\end{document}

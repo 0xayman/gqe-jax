@@ -112,27 +112,38 @@ class ParetoGDConfig:
 
 @dataclass(frozen=True)
 class ParetoConfig:
-    """Configuration for Pareto-front multi-objective training.
+    """Configuration for Pareto-front tracking plus QASER-style reward shaping.
 
-    Objectives optimized jointly:
+    When enabled, the training pipeline still maintains a Pareto archive over:
       - fidelity (maximize)
       - depth (minimize)
       - cnot_count (minimize)
 
-    Weight vectors are sampled from Dirichlet(alpha_F, alpha_d, alpha_c)
-    each rollout epoch so that training covers the full Pareto front.
+    Replay training, however, uses a stationary QASER-inspired scalar cost:
 
-    Depth and CNOT count are normalized by z-scoring within each rollout
-    batch, so no external reference values are needed.  The scalarized
-    cost is therefore fully self-referential and works for any qubit count
-    without any Qiskit baseline or manual tuning.
+      phi(F) = clip(-log(1 - F + eps), 0, phi_max)
+      B(D, C) = lambda_depth * (D_ref + 1) / (D + 1)
+              + lambda_cnot  * (C_ref + 1) / (C + 1)
+      p(F) = clip(
+               (F - structure_ramp_start)
+               / max(fidelity_threshold - structure_ramp_start, eps),
+               0, 1
+             )
+      s(F) = structure_weight_min
+           + (structure_weight_max - structure_weight_min) * p(F) ** structure_ramp_power
+      score = phi(F) * max(structure_score_offset + s(F) * (B - 1), eps)
+      cost = -score
 
-    The complexity penalty is gated by fidelity_threshold: a circuit only
-    receives a depth/CNOT penalty when its fidelity is at or above the
-    threshold.  Below the threshold the circuit sees pure fidelity cost.
-    This prevents the policy from collapsing to trivially short but useless
-    circuits (0-CNOT, F≈0.4) by ensuring that short circuits are only
-    rewarded once they are also high-fidelity.
+    The structure references (D_ref, C_ref) are initialized during the
+    fidelity-only warmup from the best warmup circuit by fidelity, then kept
+    fixed or updated slowly via an EMA when higher-fidelity circuits appear.
+    Equal-fidelity but structurally better circuits are allowed to refresh the
+    references after warmup so the reward does not freeze once fidelity saturates.
+
+    Legacy Pareto scalarization fields are retained for config compatibility.
+    The fidelity threshold is also used as the point where structure pressure
+    reaches full strength, in addition to Pareto summary tags plus
+    depth-focused final-circuit selection.
     """
 
     enabled: bool = False          # set to true in config.yml to activate
@@ -140,11 +151,21 @@ class ParetoConfig:
     fidelity_floor_late: float = 0.9  # floor raised to this after floor_ramp_epoch
     floor_ramp_epoch: int = 100    # epoch at which the floor is raised
     max_archive_size: int = 500    # cap on archive size (pruned by crowding distance)
-    alpha_F: float = 3.0           # Dirichlet concentration for fidelity weight
-    alpha_d: float = 1.0           # Dirichlet concentration for depth weight
-    alpha_c: float = 1.0           # Dirichlet concentration for CNOT weight
-    w_F_min: float = 0.6           # hard minimum for the fidelity weight after sampling
-    fidelity_threshold: float = 0.90  # complexity penalty only activates above this fidelity
+    lambda_depth: float = 0.35     # structure bonus weight for depth
+    lambda_cnot: float = 0.65      # structure bonus weight for CNOT count
+    structure_score_offset: float = 1.0  # additive offset inside phi(F) * (...)
+    fidelity_log_eps: float = 1.0e-8  # numerical epsilon in -log(1 - F + eps)
+    fidelity_log_cap: float = 12.0  # upper clip for the fidelity shaping term
+    reference_ema: float = 0.0     # 0 = freeze refs after warmup; >0 updates slowly
+    structure_weight_min: float = 0.15  # nonzero structure pressure even at low fidelity
+    structure_weight_max: float = 2.0   # full structure pressure once fidelity is high
+    structure_ramp_start: float = 0.90  # keep structure pressure near-min below this fidelity
+    structure_ramp_power: float = 4.0   # higher = stay fidelity-first for longer
+    alpha_F: float = 3.0           # legacy/unused by reward; kept for compatibility
+    alpha_d: float = 1.0           # legacy/unused by reward; kept for compatibility
+    alpha_c: float = 1.0           # legacy/unused by reward; kept for compatibility
+    w_F_min: float = 0.6           # legacy/unused by reward; kept for compatibility
+    fidelity_threshold: float = 0.99  # full structure pressure + Pareto depth/CNOT threshold
 
 
 @dataclass(frozen=True)
@@ -294,6 +315,34 @@ def validate_config(raw: dict) -> None:
             raise ValueError("pareto.floor_ramp_epoch must be >= 0")
         if p.get("max_archive_size", 500) <= 0:
             raise ValueError("pareto.max_archive_size must be positive")
+        if p.get("lambda_depth", 0.35) < 0.0:
+            raise ValueError("pareto.lambda_depth must be >= 0")
+        if p.get("lambda_cnot", 0.65) < 0.0:
+            raise ValueError("pareto.lambda_cnot must be >= 0")
+        if p.get("lambda_depth", 0.35) + p.get("lambda_cnot", 0.65) <= 0.0:
+            raise ValueError("pareto.lambda_depth + pareto.lambda_cnot must be > 0")
+        if p.get("structure_score_offset", 1.0) <= 0.0:
+            raise ValueError("pareto.structure_score_offset must be positive")
+        if p.get("fidelity_log_eps", 1e-8) <= 0.0:
+            raise ValueError("pareto.fidelity_log_eps must be positive")
+        if p.get("fidelity_log_cap", 12.0) <= 0.0:
+            raise ValueError("pareto.fidelity_log_cap must be positive")
+        if not (0.0 <= p.get("reference_ema", 0.0) <= 1.0):
+            raise ValueError("pareto.reference_ema must be in [0, 1]")
+        if p.get("structure_weight_min", 0.15) < 0.0:
+            raise ValueError("pareto.structure_weight_min must be >= 0")
+        if p.get("structure_weight_max", 2.0) <= 0.0:
+            raise ValueError("pareto.structure_weight_max must be positive")
+        if p.get("structure_weight_max", 2.0) < p.get("structure_weight_min", 0.15):
+            raise ValueError(
+                "pareto.structure_weight_max must be >= pareto.structure_weight_min"
+            )
+        if not (0.0 <= p.get("structure_ramp_start", 0.90) < p.get("fidelity_threshold", 0.99)):
+            raise ValueError(
+                "pareto.structure_ramp_start must be in [0, pareto.fidelity_threshold)"
+            )
+        if p.get("structure_ramp_power", 4.0) <= 0.0:
+            raise ValueError("pareto.structure_ramp_power must be positive")
         if p.get("alpha_F", 3.0) <= 0:
             raise ValueError("pareto.alpha_F must be positive")
         if p.get("alpha_d", 1.0) <= 0:
@@ -302,7 +351,7 @@ def validate_config(raw: dict) -> None:
             raise ValueError("pareto.alpha_c must be positive")
         if not (0.0 <= p.get("w_F_min", 0.6) < 1.0):
             raise ValueError("pareto.w_F_min must be in [0, 1)")
-        if not (0.0 < p.get("fidelity_threshold", 0.90) <= 1.0):
+        if not (0.0 < p.get("fidelity_threshold", 0.99) <= 1.0):
             raise ValueError("pareto.fidelity_threshold must be in (0, 1]")
 
 

@@ -96,8 +96,11 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
             best_cnot_count,
         )
 
-    # Warmup is fidelity-only. Multi-objective weight sampling begins now.
+    # Warmup is fidelity-only. After it ends, replay is rescored with the
+    # stationary QASER-style reward using the frozen warmup references.
     pipeline._warmup_mode = False
+    if pipeline.pareto_archive is not None:
+        pipeline._rescore_replay_buffer_with_stationary_reward()
 
     for epoch in range(cfg.training.max_epochs):
         pipeline._current_epoch = epoch
@@ -172,21 +175,56 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
         pareto_hv = 0.0
         pareto_best_f = float("nan")
         pareto_min_cnot = -1
+        pareto_min_depth = -1
+        pareto_threshold = float(cfg.pareto.fidelity_threshold)
+        epoch_structure_scale = (
+            float(
+                pipeline.structure_scale_for_fidelity(
+                    np.asarray([epoch_best_fidelity], dtype=np.float32)
+                )[0]
+            )
+            if pipeline.pareto_archive is not None
+            else float("nan")
+        )
+        run_structure_scale = (
+            float(
+                pipeline.structure_scale_for_fidelity(
+                    np.asarray([run_best_fidelity], dtype=np.float32)
+                )[0]
+            )
+            if pipeline.pareto_archive is not None and np.isfinite(run_best_fidelity)
+            else float("nan")
+        )
         if pipeline.pareto_archive is not None:
             archive = pipeline.pareto_archive
             pareto_size = len(archive)
             pareto_hv = archive.hypervolume_2d()
             top = archive.best_by_fidelity()
             pareto_best_f = top.fidelity if top is not None else float("nan")
-            efficient = archive.best_by_cnot(min_fidelity=0.99)
+            efficient = archive.best_by_cnot(min_fidelity=pareto_threshold)
             pareto_min_cnot = efficient.cnot_count if efficient is not None else -1
+            shallow = archive.best_by_depth(min_fidelity=pareto_threshold)
+            pareto_min_depth = shallow.depth if shallow is not None else -1
 
         if cfg.logging.verbose:
-            w = pipeline._current_weights
+            ref_depth = (
+                float(pipeline._reward_ref_depth)
+                if pipeline._reward_ref_depth is not None
+                else float("nan")
+            )
+            ref_cnot = (
+                float(pipeline._reward_ref_cnot)
+                if pipeline._reward_ref_cnot is not None
+                else float("nan")
+            )
+            ref_fidelity = float(pipeline._reward_ref_fidelity)
+            lambda_depth, lambda_cnot = pipeline._reward_lambdas
             pareto_str = (
                 f" | pareto_size={pareto_size}"
                 f" | hv={pareto_hv:.4f}"
-                f" | w=[{w[0]:.2f},{w[1]:.2f},{w[2]:.2f}]"
+                f" | lambda=[{lambda_depth:.2f},{lambda_cnot:.2f}]"
+                f" | scale=[{epoch_structure_scale:.2f},{run_structure_scale:.2f}]"
+                f" | ref=[{ref_depth:.2f},{ref_cnot:.2f},{ref_fidelity:.6f}]"
                 if pipeline.pareto_archive is not None
                 else ""
             )
@@ -214,10 +252,24 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
                     "pareto_archive_size": float(pareto_size),
                     "pareto_hypervolume": pareto_hv,
                     "pareto_best_fidelity": pareto_best_f,
-                    "pareto_min_cnot_at_99": float(pareto_min_cnot),
-                    "w_F": float(pipeline._current_weights[0]),
-                    "w_d": float(pipeline._current_weights[1]),
-                    "w_c": float(pipeline._current_weights[2]),
+                    "pareto_fidelity_threshold": pareto_threshold,
+                    "pareto_min_cnot_at_threshold": float(pareto_min_cnot),
+                    "pareto_min_depth_at_threshold": float(pareto_min_depth),
+                    "reward_lambda_depth": float(pipeline._reward_lambdas[0]),
+                    "reward_lambda_cnot": float(pipeline._reward_lambdas[1]),
+                    "reward_structure_scale_epoch_best": epoch_structure_scale,
+                    "reward_structure_scale_run_best": run_structure_scale,
+                    "reward_ref_depth": (
+                        float(pipeline._reward_ref_depth)
+                        if pipeline._reward_ref_depth is not None
+                        else float("nan")
+                    ),
+                    "reward_ref_cnot": (
+                        float(pipeline._reward_ref_cnot)
+                        if pipeline._reward_ref_cnot is not None
+                        else float("nan")
+                    ),
+                    "reward_ref_fidelity": float(pipeline._reward_ref_fidelity),
                 }
             logger.log_metrics(
                 {

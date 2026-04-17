@@ -13,7 +13,7 @@ model:
   max_gates_count: 125 # Sequence length N
 
 training:
-  max_epochs: 200
+  max_epochs: 50
   num_samples: 200 # Circuits generated per epoch (rollout size)
   batch_size: 32 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
@@ -31,7 +31,7 @@ temperature:
 
 buffer:
   max_size: 500
-  warmup_size: 100
+  warmup_size: 400 # keep warmup > num_samples so structure refs are not set by one rollout
   steps_per_epoch: 4
 
 logging:
@@ -60,10 +60,14 @@ pareto:
   fidelity_floor_late: 0.9 # floor raised to this after floor_ramp_epoch
   floor_ramp_epoch: 100 # epoch at which the floor is raised
   max_archive_size: 500
-  alpha_F: 3.0 # Dirichlet param — higher = more weight on fidelity
-  alpha_d: 1.0 # Dirichlet param for depth weight
-  alpha_c: 1.0 # Dirichlet param for CNOT weight
-  w_F_min: 0.6 # hard minimum for fidelity weight after sampling
-  fidelity_threshold: 0.90 # complexity penalty only activates at or above this fidelity
-  # Depth and CNOT count are z-scored within each rollout batch — no reference
-  # values needed. The scalarization is fully self-referential.
+  lambda_depth: 0.4 # 3q run: depth still matters, but the larger gap is in CNOT count
+  lambda_cnot: 0.6 # push harder on two-qubit gates once fidelity is already strong
+  structure_score_offset: 1.0 # additive offset inside phi(F) * (...)
+  fidelity_log_eps: 1.0e-8 # epsilon in -log(1 - F + eps)
+  fidelity_log_cap: 12.0 # clip cap for the fidelity shaping term
+  reference_ema: 0.05 # small positive EMA keeps structure refs adaptive after warmup
+  structure_weight_min: 0.05 # nonzero, but low enough that early training stays fidelity-first
+  structure_weight_max: 2.0 # once fidelity is high, structure pressure is much stronger
+  structure_ramp_start: 0.90 # below this fidelity, keep structure pressure close to its minimum
+  structure_ramp_power: 6.0 # ramp structure pressure late and sharply in the near-threshold regime
+  fidelity_threshold: 0.99 # full structure pressure + Pareto depth/CNOT selection threshold

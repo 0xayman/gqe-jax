@@ -14,6 +14,7 @@ from config import (
     GQEConfig,
     LoggingConfig,
     ModelConfig,
+    ParetoConfig,
     TargetConfig,
     TemperatureConfig,
     TrainingConfig,
@@ -24,16 +25,22 @@ from cost import build_cost_fn, process_fidelity
 from data import BufferDataset, ReplayBuffer
 from factory import Factory
 from gqe import gqe
-from main import _basis_gates, _build_qiskit_circuit
+from main import _basis_gates, _build_qiskit_circuit, _select_report_token_sequence
 from model import GPT2
 from operator_pool import build_operator_pool
+from pareto import ParetoArchive, ParetoPoint
 from pipeline import Pipeline, _sequence_structure_metrics
 from loss import reduce_sequence_log_probs
 from scheduler import FixedScheduler, LinearScheduler
 from target import build_target
 
 
-def _tiny_cfg(*, continuous_opt_enabled: bool, batch_size: int = 2) -> GQEConfig:
+def _tiny_cfg(
+    *,
+    continuous_opt_enabled: bool,
+    batch_size: int = 2,
+    pareto_enabled: bool = False,
+) -> GQEConfig:
     return GQEConfig(
         target=TargetConfig(num_qubits=2, type="random_reachable", path=None),
         model=ModelConfig(size="tiny", max_gates_count=4),
@@ -64,11 +71,38 @@ def _tiny_cfg(*, continuous_opt_enabled: bool, batch_size: int = 2) -> GQEConfig
             top_k=1,
             num_restarts=2,
         ),
+        pareto=ParetoConfig(
+            enabled=pareto_enabled,
+            fidelity_floor=0.0,
+            fidelity_floor_late=0.0,
+            floor_ramp_epoch=10,
+            max_archive_size=16,
+            lambda_depth=0.35,
+            lambda_cnot=0.65,
+            structure_score_offset=1.0,
+            fidelity_log_eps=1.0e-8,
+            fidelity_log_cap=12.0,
+            reference_ema=0.0,
+            structure_weight_min=0.15,
+            structure_weight_max=2.0,
+            structure_ramp_start=0.90,
+            structure_ramp_power=4.0,
+            fidelity_threshold=0.99,
+        ),
     )
 
 
-def _build_pipeline(*, continuous_opt_enabled: bool, batch_size: int = 2) -> tuple[Pipeline, list]:
-    cfg = _tiny_cfg(continuous_opt_enabled=continuous_opt_enabled, batch_size=batch_size)
+def _build_pipeline(
+    *,
+    continuous_opt_enabled: bool,
+    batch_size: int = 2,
+    pareto_enabled: bool = False,
+) -> tuple[Pipeline, list]:
+    cfg = _tiny_cfg(
+        continuous_opt_enabled=continuous_opt_enabled,
+        batch_size=batch_size,
+        pareto_enabled=pareto_enabled,
+    )
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
@@ -103,6 +137,55 @@ def test_continuous_gqe_smoke():
     assert isinstance(best_indices, list)
     assert len(best_indices) == cfg.model.max_gates_count + 1
     assert pareto_archive is None
+
+
+def test_pareto_qaser_gqe_smoke():
+    cfg = _tiny_cfg(continuous_opt_enabled=False, pareto_enabled=True)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
+    u_target, _ = build_target(pool, cfg)
+    cost_fn = build_cost_fn(u_target)
+
+    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
+
+    assert 0.0 <= best_cost <= 1.0
+    assert isinstance(best_indices, list)
+    assert len(best_indices) == cfg.model.max_gates_count + 1
+    assert pareto_archive is not None
+
+
+def test_report_selection_prefers_pareto_depth_threshold():
+    raw_best = np.asarray([0, 1, 1, 1], dtype=np.int32)
+    shallower = np.asarray([0, 2, 2, 2], dtype=np.int32)
+    archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
+    archive.update(
+        ParetoPoint(
+            fidelity=1.0,
+            depth=18,
+            total_gates=3,
+            cnot_count=3,
+            token_sequence=raw_best,
+            epoch=0,
+        )
+    )
+    archive.update(
+        ParetoPoint(
+            fidelity=0.995,
+            depth=16,
+            total_gates=3,
+            cnot_count=3,
+            token_sequence=shallower,
+            epoch=1,
+        )
+    )
+
+    selected, source = _select_report_token_sequence(
+        raw_best,
+        archive,
+        min_fidelity=0.99,
+    )
+
+    np.testing.assert_array_equal(selected, shallower)
+    assert source == "Pareto best depth (F≥0.990)"
 
 
 def test_continuous_optimizer_smoke():
@@ -348,6 +431,133 @@ def test_train_batch_updates_params_with_behavior_log_probs():
             jax.tree_util.tree_leaves(params_after_batch),
         )
     )
+
+
+def test_qaser_reward_references_initialize_from_best_fidelity_candidate():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+
+    pipeline._update_reward_references(
+        np.asarray([0.70, 0.92, 0.81], dtype=np.float32),
+        np.asarray([3, 7, 2], dtype=np.int32),
+        np.asarray([2, 4, 1], dtype=np.int32),
+    )
+
+    assert pipeline._reward_ref_depth == 7.0
+    assert pipeline._reward_ref_cnot == 4.0
+    assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
+
+
+def test_qaser_reward_references_break_fidelity_ties_by_structure_during_warmup():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+
+    pipeline._update_reward_references(
+        np.asarray([0.92], dtype=np.float32),
+        np.asarray([9], dtype=np.int32),
+        np.asarray([5], dtype=np.int32),
+    )
+    pipeline._update_reward_references(
+        np.asarray([0.92], dtype=np.float32),
+        np.asarray([7], dtype=np.int32),
+        np.asarray([4], dtype=np.int32),
+    )
+
+    assert pipeline._reward_ref_depth == 7.0
+    assert pipeline._reward_ref_cnot == 4.0
+    assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
+
+
+def test_qaser_reward_references_break_fidelity_ties_by_structure_after_warmup():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+    pipeline._warmup_mode = False
+    pipeline._reward_ref_depth = 9.0
+    pipeline._reward_ref_cnot = 5.0
+    pipeline._reward_ref_fidelity = 0.92
+
+    pipeline._update_reward_references(
+        np.asarray([0.92], dtype=np.float32),
+        np.asarray([7], dtype=np.int32),
+        np.asarray([4], dtype=np.int32),
+    )
+
+    assert pipeline._reward_ref_depth == 7.0
+    assert pipeline._reward_ref_cnot == 4.0
+    assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
+
+
+def test_structure_scale_is_nonzero_and_increases_with_fidelity():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+
+    scales = pipeline.structure_scale_for_fidelity(
+        np.asarray([0.10, 0.95, 0.99], dtype=np.float32)
+    )
+
+    assert scales[0] > 0.0
+    assert scales[0] < scales[1] < scales[2]
+
+
+def test_structure_scale_stays_near_min_before_ramp_start():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+
+    scales = pipeline.structure_scale_for_fidelity(
+        np.asarray([0.10, 0.50, 0.89], dtype=np.float32)
+    )
+
+    np.testing.assert_allclose(
+        scales,
+        np.full_like(scales, pipeline.cfg.pareto.structure_weight_min),
+        atol=1e-7,
+    )
+
+
+def test_qaser_scalarization_prefers_higher_fidelity_at_same_structure():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+    pipeline._reward_ref_depth = 10.0
+    pipeline._reward_ref_cnot = 5.0
+
+    costs = pipeline._scalarize(
+        np.asarray([0.95, 0.99], dtype=np.float32),
+        np.asarray([10, 10], dtype=np.int32),
+        np.asarray([5, 5], dtype=np.int32),
+    )
+
+    assert costs[1] < costs[0]
+
+
+def test_qaser_structure_gap_matters_more_at_high_fidelity():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+    pipeline._reward_ref_depth = 10.0
+    pipeline._reward_ref_cnot = 5.0
+
+    low_costs = pipeline._scalarize(
+        np.asarray([0.50, 0.50], dtype=np.float32),
+        np.asarray([12, 8], dtype=np.int32),
+        np.asarray([6, 4], dtype=np.int32),
+    )
+    high_costs = pipeline._scalarize(
+        np.asarray([0.99, 0.99], dtype=np.float32),
+        np.asarray([12, 8], dtype=np.int32),
+        np.asarray([6, 4], dtype=np.int32),
+    )
+
+    low_gap = float(low_costs[0] - low_costs[1])
+    high_gap = float(high_costs[0] - high_costs[1])
+
+    assert low_gap > 0.0
+    assert high_gap > low_gap
+
+
+def test_qaser_scalarization_prefers_better_structure_at_same_fidelity():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+    pipeline._reward_ref_depth = 10.0
+    pipeline._reward_ref_cnot = 5.0
+
+    costs = pipeline._scalarize(
+        np.asarray([0.99, 0.99], dtype=np.float32),
+        np.asarray([12, 8], dtype=np.int32),
+        np.asarray([6, 4], dtype=np.int32),
+    )
+
+    assert costs[1] < costs[0]
 
 
 def test_qiskit_reconstruction_matches_internal_optimizer_unitary():

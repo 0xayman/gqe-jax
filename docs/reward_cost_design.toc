@@ -1,0 +1,22 @@
+\contentsline {section}{\numberline {1}Purpose}{1}{section.1}%
+\contentsline {section}{\numberline {2}Project Constraints}{2}{section.2}%
+\contentsline {section}{\numberline {3}Why the Naive Exponential Proposal Is Risky}{2}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Singularity at $F=1$}{2}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Exploding or Vanishing Reward}{2}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Bad Behavior When $D^*=1$ or $C^*=1$}{3}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Poisoned References}{3}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Conclusion}{3}{subsection.3.5}%
+\contentsline {section}{\numberline {4}Proposed Design}{3}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Notation}{3}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Reference Depth and CNOT Counts}{3}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Fidelity Shaping}{4}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Structure Ratios}{4}{subsection.4.4}%
+\contentsline {subsection}{\numberline {4.5}Bounded Fidelity-Dependent Exponent}{5}{subsection.4.5}%
+\contentsline {subsection}{\numberline {4.6}Absolute Training Score}{5}{subsection.4.6}%
+\contentsline {subsection}{\numberline {4.7}Training Cost}{5}{subsection.4.7}%
+\contentsline {subsection}{\numberline {4.8}Optional Signed Diagnostic Reward}{5}{subsection.4.8}%
+\contentsline {section}{\numberline {5}Recommended Interpretation}{6}{section.5}%
+\contentsline {section}{\numberline {6}Edge-Case Analysis}{6}{section.6}%
+\contentsline {section}{\numberline {7}Why This Design Fits the Project}{7}{section.7}%
+\contentsline {section}{\numberline {8}Recommended Hyperparameter Ranges}{7}{section.8}%
+\contentsline {section}{\numberline {9}Final Recommendation}{8}{section.9}%
