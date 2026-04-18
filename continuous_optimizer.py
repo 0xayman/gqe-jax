@@ -49,36 +49,35 @@ def _rz(theta: jax.Array) -> jax.Array:
     h = theta / 2
     top = jnp.exp(-1j * h)
     bot = jnp.exp(1j * h)
-    return jnp.asarray([[top, 0.0j], [0.0j, bot]], dtype=jnp.complex128)
+    return jnp.asarray([[top, 0.0j], [0.0j, bot]])
 
 
 def _rx(theta: jax.Array) -> jax.Array:
     h = theta / 2
     c = jnp.cos(h)
     s = -1j * jnp.sin(h)
-    return jnp.asarray([[c, s], [s, c]], dtype=jnp.complex128)
+    return jnp.asarray([[c, s], [s, c]])
 
 
 def _ry(theta: jax.Array) -> jax.Array:
     h = theta / 2
     c = jnp.cos(h)
     s = jnp.sin(h)
-    return jnp.asarray([[c, -s], [s, c]], dtype=jnp.complex128)
+    return jnp.asarray([[c, -s], [s, c]])
 
 
 _ROTATION_BUILDERS = {"RX": _rx, "RY": _ry, "RZ": _rz}
 _SX = jnp.asarray(
     [[0.5 + 0.5j, 0.5 - 0.5j], [0.5 - 0.5j, 0.5 + 0.5j]],
-    dtype=jnp.complex128,
 )
 _CNOT = jnp.asarray(
     [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
-    dtype=jnp.complex128,
 )
 
 
 def _embed_single(gate_2x2: jax.Array, qubit: int, num_qubits: int) -> jax.Array:
-    eye = jnp.eye(2, dtype=jnp.complex128)
+    target_dtype = jnp.complex64 if not jax.config.jax_enable_x64 else jnp.complex128
+    eye = jnp.eye(2, dtype=target_dtype)
     factors = [gate_2x2 if q == qubit else eye for q in range(num_qubits)]
     result = factors[0]
     for factor in factors[1:]:
@@ -88,17 +87,18 @@ def _embed_single(gate_2x2: jax.Array, qubit: int, num_qubits: int) -> jax.Array
 
 def _embed_cnot(ctrl: int, tgt: int, num_qubits: int) -> jax.Array:
     d = 2**num_qubits
-    cnot = np.asarray(_CNOT)
+    target_dtype = jnp.complex64 if not jax.config.jax_enable_x64 else jnp.complex128
+    cnot = np.asarray(_CNOT).astype(target_dtype)
     if num_qubits == 2 and ctrl == 0 and tgt == 1:
-        return _CNOT
+        return _CNOT.astype(target_dtype)
     if num_qubits == 2 and ctrl == 1 and tgt == 0:
         swap = jnp.asarray(
             [[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
-            dtype=jnp.complex128,
+            dtype=target_dtype,
         )
-        return swap @ _CNOT @ swap
+        return swap @ _CNOT.astype(target_dtype) @ swap
 
-    full = np.zeros((d, d), dtype=np.complex128)
+    full = np.zeros((d, d), dtype=np.complex64 if not jax.config.jax_enable_x64 else np.complex128)
     for col in range(d):
         bits = [(col >> (num_qubits - 1 - q)) & 1 for q in range(num_qubits)]
         two_q_in = (bits[ctrl] << 1) | bits[tgt]
@@ -111,7 +111,7 @@ def _embed_cnot(ctrl: int, tgt: int, num_qubits: int) -> jax.Array:
             new_bits[tgt] = two_q_out & 1
             row = sum(new_bits[q] << (num_qubits - 1 - q) for q in range(num_qubits))
             full[row, col] += amp
-    return jnp.asarray(full, dtype=jnp.complex128)
+    return jnp.asarray(full, dtype=target_dtype)
 
 
 def build_circuit_unitary(
@@ -120,7 +120,8 @@ def build_circuit_unitary(
     num_qubits: int,
 ) -> jax.Array:
     d = 2**num_qubits
-    u = jnp.eye(d, dtype=jnp.complex128)
+    target_dtype = jnp.complex64 if not jax.config.jax_enable_x64 else jnp.complex128
+    u = jnp.eye(d, dtype=target_dtype)
     param_idx = 0
     for spec in gate_specs:
         if spec.is_parametric:
@@ -175,18 +176,20 @@ class ContinuousOptimizer:
         elif fast_runtime is None:
             fast_runtime = False
         self.fast_runtime = fast_runtime
-        self._real_dtype = jnp.float32 if fast_runtime else jnp.float64
-        self._complex_dtype = jnp.complex64 if fast_runtime else jnp.complex128
-        self._np_real_dtype = np.float32 if fast_runtime else np.float64
-        self._np_complex_dtype = np.complex64 if fast_runtime else np.complex128
+
+        x64_available = jax.config.jax_enable_x64
+        self._real_dtype = jnp.float32 if (fast_runtime or not x64_available) else jnp.float64
+        self._complex_dtype = jnp.complex64 if (fast_runtime or not x64_available) else jnp.complex128
+        self._np_real_dtype = np.float32 if (fast_runtime or not x64_available) else np.float64
+        self._np_complex_dtype = np.complex64 if (fast_runtime or not x64_available) else np.complex128
         self._imag_unit = jnp.asarray(1.0j, dtype=self._complex_dtype)
         u_target_arr = np.asarray(u_target)
         self.u_target_jax = jnp.asarray(u_target_arr, dtype=self._complex_dtype)
 
         self._identity = jnp.eye(2**num_qubits, dtype=self._complex_dtype)
-        self._pauli_x = jnp.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=self._complex_dtype).astype(self._complex_dtype)
-        self._pauli_y = jnp.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=self._complex_dtype).astype(self._complex_dtype)
-        self._pauli_z = jnp.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=self._complex_dtype).astype(self._complex_dtype)
+        self._pauli_x = jnp.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=self._complex_dtype)
+        self._pauli_y = jnp.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=self._complex_dtype)
+        self._pauli_z = jnp.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=self._complex_dtype)
         self._cnot_pairs = [
             (ctrl, tgt)
             for ctrl in range(num_qubits)
@@ -583,7 +586,7 @@ class ContinuousOptimizer:
             flat_gate_type_ids,
             flat_qubit0,
             flat_cnot_pair,
-        ).astype(jnp.float64)
+        )
 
         fidelity_runs = flat_fidelities.reshape((total_restarts, batch_size))
         param_runs = flat_params.reshape((total_restarts, batch_size, self.max_gates))
@@ -707,11 +710,9 @@ class ContinuousOptimizer:
         if not any(spec.is_parametric for spec in gate_specs):
             gate_type_ids, qubit0, cnot_pair = self._encode_gate_specs(gate_specs)
             fidelity = float(
-                self._fidelity_fn(initial_angles, gate_type_ids, qubit0, cnot_pair).astype(
-                    jnp.float64
-                )
+                self._fidelity_fn(initial_angles, gate_type_ids, qubit0, cnot_pair)
             )
-            return fidelity, gate_specs, jnp.zeros((0,), dtype=jnp.float64), rng_key
+            return fidelity, gate_specs, jnp.zeros((0,), dtype=self._real_dtype), rng_key
 
         fidelity, full_params, rng_key = self._optimize_angles(
             gate_specs,
