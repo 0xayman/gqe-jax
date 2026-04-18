@@ -54,20 +54,36 @@ pareto_gd:
   num_restarts: 3 # Random angle restarts — best result is kept
   fidelity_eps: 1.0e-6 # Circuits with fidelity >= 1-eps are skipped (already perfect)
 
-pareto:
+reward:
   enabled: true
-  fidelity_floor: 0.5 # circuits below this fidelity are not archived
-  fidelity_floor_late: 0.9 # floor raised to this after floor_ramp_epoch
-  floor_ramp_epoch: 100 # epoch at which the floor is raised
+  # ── Pareto archive ───────────────────────────────────────────────────────
+  fidelity_floor: 0.5          # circuits below this fidelity are not archived
+  fidelity_floor_late: 0.9     # floor raised to this after floor_ramp_epoch
+  floor_ramp_epoch: 100        # epoch at which the fidelity floor is raised
   max_archive_size: 500
-  lambda_depth: 0.4 # 3q run: depth still matters, but the larger gap is in CNOT count
-  lambda_cnot: 0.6 # push harder on two-qubit gates once fidelity is already strong
-  structure_score_offset: 1.0 # additive offset inside phi(F) * (...)
-  fidelity_log_eps: 1.0e-8 # epsilon in -log(1 - F + eps)
-  fidelity_log_cap: 12.0 # clip cap for the fidelity shaping term
-  reference_ema: 0.05 # small positive EMA keeps structure refs adaptive after warmup
-  structure_weight_min: 0.05 # nonzero, but low enough that early training stays fidelity-first
-  structure_weight_max: 2.0 # once fidelity is high, structure pressure is much stronger
-  structure_ramp_start: 0.90 # below this fidelity, keep structure pressure close to its minimum
-  structure_ramp_power: 6.0 # ramp structure pressure late and sharply in the near-threshold regime
-  fidelity_threshold: 0.99 # full structure pressure + Pareto depth/CNOT selection threshold
+  fidelity_threshold: 0.99     # archive query threshold for depth/CNOT reporting
+  # ── Log-infidelity utility ───────────────────────────────────────────────
+  eps_phi: 1.0e-8              # ε_φ in Φ(F) = -log(1 - F + ε_φ)
+  # ── Soft fidelity gate ───────────────────────────────────────────────────
+  f_gate: 0.90                 # F_gate: sigmoid centre; structure matters above this
+  tau: 0.05                    # τ: gate temperature (smaller = sharper transition)
+  # ── Bad-drop threshold ───────────────────────────────────────────────────
+  delta_bad: 0.5               # δ_bad in log-infidelity units; separates mild from bad drops
+  # ── Penalty / reward scales and steepnesses ─────────────────────────────
+  alpha_bad: 2.0               # α_bad: scale of severe fidelity-drop penalty
+  kappa_bad: 1.0               # κ_bad: steepness of severe penalty
+  alpha_soft: 0.5              # α_soft: scale of mild fidelity-drop penalty
+  kappa_soft: 1.0              # κ_soft: steepness of mild penalty
+  alpha_good: 1.0              # α_good: scale of fidelity-improvement reward
+  kappa_good: 1.0              # κ_good: steepness of fidelity reward
+  # ── Structure terms ──────────────────────────────────────────────────────
+  lambda_d: 0.4                # λ_D: depth-improvement bonus weight
+  lambda_c: 0.6                # λ_C: CNOT-improvement bonus weight (CNOT more costly on HW)
+  mu_d: 0.1                    # μ_D: depth-regression penalty (set 0 to disable)
+  mu_c: 0.2                    # μ_C: CNOT-regression penalty (set 0 to disable)
+  eta: 0.3                     # η ∈ [0,1]: structure-reward fraction in mild-drop regime
+  # ── Pareto proxy bonus ───────────────────────────────────────────────────
+  beta_1: 0.5                  # β_1: bonus for entering the non-dominated front
+  beta_2: 0.05                 # β_2: extra bonus per archive point dominated
+  # ── Reference update ─────────────────────────────────────────────────────
+  reference_ema: 0.05          # EMA blend for structure refs; 0 = hard update

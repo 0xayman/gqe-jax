@@ -28,7 +28,7 @@ def _sequence_structure_metrics(
     qubit_depths = np.zeros((num_qubits,), dtype=np.int32)
     total_gates = 0
     cnot_count = 0
-    for token_id in token_ids.tolist():
+    for token_id in token_ids:
         q0 = int(token_qubit0[token_id])
         q1 = int(token_qubit1[token_id])
         total_gates += 1
@@ -83,9 +83,12 @@ class Pipeline:
                 self.token_qubit1[idx] = int(parts[2][1:])
                 self.two_qubit_token_mask[idx] = True
         self.pool_matrices = np.stack([matrix for _, matrix in pool], axis=0)
-        self.pool_matrices_jax = jnp.asarray(self.pool_matrices, dtype=jnp.complex128)
+        backend = jax.default_backend()
+        is_gpu = backend in ('gpu', 'cuda')
+        target_dtype = jnp.complex64 if is_gpu else jnp.complex128
+        self.pool_matrices_jax = jnp.asarray(self.pool_matrices, dtype=target_dtype)
         self.u_target_jax = (
-            jnp.asarray(u_target, dtype=jnp.complex128) if u_target is not None else None
+            jnp.asarray(u_target, dtype=target_dtype) if u_target is not None else None
         )
 
         self.rng_key = jax.random.PRNGKey(cfg.training.seed)
@@ -118,27 +121,16 @@ class Pipeline:
         )
 
         # ── Pareto archive ──────────────────────────────────────────────────
-        pareto_cfg = cfg.pareto
-        if pareto_cfg.enabled:
+        reward_cfg = cfg.reward
+        if reward_cfg.enabled:
             self.pareto_archive: ParetoArchive | None = ParetoArchive(
-                max_size=pareto_cfg.max_archive_size,
-                fidelity_floor=pareto_cfg.fidelity_floor,
+                max_size=reward_cfg.max_archive_size,
+                fidelity_floor=reward_cfg.fidelity_floor,
             )
         else:
             self.pareto_archive = None
         self._warmup_mode: bool = True
         self._current_epoch: int = 0
-        lambda_sum = self.cfg.pareto.lambda_depth + self.cfg.pareto.lambda_cnot
-        if lambda_sum > 0:
-            self._reward_lambdas = np.asarray(
-                [
-                    self.cfg.pareto.lambda_depth / lambda_sum,
-                    self.cfg.pareto.lambda_cnot / lambda_sum,
-                ],
-                dtype=np.float32,
-            )
-        else:
-            self._reward_lambdas = np.asarray([0.5, 0.5], dtype=np.float32)
         self._reward_ref_depth: float | None = None
         self._reward_ref_cnot: float | None = None
         self._reward_ref_fidelity: float = float("-inf")
@@ -277,13 +269,13 @@ class Pipeline:
         # and temperature scheduling — always fidelity-only regardless of Pareto mode.
         fidelity_costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
 
-        # When Pareto is active, compute structure metrics and build the
-        # QASER-style stationary cost that goes into the replay buffer.
+        # When the reward archive is active, compute structure metrics and
+        # build the full reward cost that goes into the replay buffer.
         if self.pareto_archive is not None:
             depths, total_gates = self._batch_compute_structure(idx_output[:, 1:])
             self._update_reward_references(fidelities, depths, cnot_counts)
             if not self._warmup_mode:
-                buffer_costs = self._scalarize(fidelities, depths, cnot_counts)
+                buffer_costs = self._compute_reward(fidelities, depths, cnot_counts)
             else:
                 buffer_costs = fidelity_costs
         else:
@@ -341,6 +333,7 @@ class Pipeline:
         n = len(token_ids)
         depths = np.zeros(n, dtype=np.int32)
         total_gates = np.zeros(n, dtype=np.int32)
+
         for i, row in enumerate(token_ids):
             d, t, _ = self.sequence_structure_metrics(row)
             depths[i] = d
@@ -373,19 +366,19 @@ class Pipeline:
             cand_cnot == ref_cnot and cand_depth < ref_depth
         )
 
-    def structure_scale_for_fidelity(self, fidelities) -> np.ndarray:
-        """Return the fidelity-ramped structure pressure for each fidelity value."""
-        p = self.cfg.pareto
-        fidelities_f = np.asarray(fidelities, dtype=np.float32)
-        threshold = np.float32(max(float(p.fidelity_threshold), float(p.fidelity_log_eps)))
-        start = np.float32(min(float(p.structure_ramp_start), float(p.fidelity_threshold)))
-        denom = np.maximum(threshold - start, np.float32(p.fidelity_log_eps))
-        progress = np.clip((fidelities_f - start) / denom, 0.0, 1.0)
-        min_w = np.float32(p.structure_weight_min)
-        max_w = np.float32(p.structure_weight_max)
-        ramp_power = np.float32(p.structure_ramp_power)
-        scale = min_w + (max_w - min_w) * np.power(progress, ramp_power)
-        return np.asarray(scale, dtype=np.float32)
+    def _phi(self, F: np.ndarray) -> np.ndarray:
+        """Log-infidelity utility Φ(F) = -log(1 - F + ε_φ)."""
+        eps = np.float32(self.cfg.reward.eps_phi)
+        F_f = np.asarray(F, dtype=np.float32)
+        return -np.log(np.maximum(1.0 - F_f + eps, eps))
+
+    def fidelity_gate(self, fidelities) -> np.ndarray:
+        """Soft fidelity gate w(F) = σ((F - F_gate) / τ)."""
+        F_f = np.asarray(fidelities, dtype=np.float32)
+        f_gate = np.float32(self.cfg.reward.f_gate)
+        tau = np.float32(self.cfg.reward.tau)
+        z = (F_f - f_gate) / tau
+        return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
 
     def _update_reward_references(
         self,
@@ -434,7 +427,7 @@ class Pipeline:
             self._reward_ref_fidelity = max(self._reward_ref_fidelity, cand_fidelity)
             return
 
-        ema = float(self.cfg.pareto.reference_ema)
+        ema = float(self.cfg.reward.reference_ema)
         if cand_fidelity <= self._reward_ref_fidelity + tol:
             return
 
@@ -448,7 +441,8 @@ class Pipeline:
         self._reward_ref_cnot = (1.0 - ema) * self._reward_ref_cnot + ema * cand_cnot
         self._reward_ref_fidelity = cand_fidelity
 
-    def _rescore_replay_buffer_with_stationary_reward(self) -> None:
+    def _rescore_replay_buffer(self) -> None:
+        """Rescore all buffer entries with the full reward after warmup ends."""
         if self.pareto_archive is None or len(self.buffer) == 0:
             return
         if self._reward_ref_depth is None or self._reward_ref_cnot is None:
@@ -463,7 +457,7 @@ class Pipeline:
         token_batch = idx_batch[:, 1:]
         _, fidelities, cnot_counts = self.computeCost(token_batch, self.pool)
         depths, _ = self._batch_compute_structure(token_batch)
-        scalar_costs = self._scalarize(fidelities, depths, cnot_counts)
+        scalar_costs = self._compute_reward(fidelities, depths, cnot_counts)
 
         rebuilt = ReplayBuffer(size=self.buffer.size)
         for seq, cost_val, old_log_prob in zip(idx_batch, scalar_costs, old_log_probs):
@@ -473,37 +467,123 @@ class Pipeline:
                 rebuilt.push(seq, cost_val, float(np.asarray(old_log_prob, dtype=np.float32)))
         self.buffer = rebuilt
 
-    def _scalarize(
+    def _compute_pareto_bonus(
         self,
         fidelities: np.ndarray,
         depths: np.ndarray,
         cnot_counts: np.ndarray,
     ) -> np.ndarray:
-        """Compute the stationary QASER-style compilation cost."""
+        """Pareto proxy bonus: β_1 * [non-dominated] + β_2 * N_dom."""
+        r = self.cfg.reward
+        beta_1 = np.float32(r.beta_1)
+        beta_2 = np.float32(r.beta_2)
+        archive = self.pareto_archive
+        n = len(fidelities)
+        bonus = np.zeros(n, dtype=np.float32)
 
-        fidelities_f = np.asarray(fidelities, dtype=np.float32)
-        depths_f = np.asarray(depths, dtype=np.float32)
-        cnots_f = np.asarray(cnot_counts, dtype=np.float32)
+        for i in range(n):
+            pt = ParetoPoint(
+                fidelity=float(fidelities[i]),
+                depth=int(depths[i]),
+                total_gates=0,
+                cnot_count=int(cnot_counts[i]),
+                token_sequence=np.zeros(1, dtype=np.int32),
+                epoch=self._current_epoch,
+            )
+            if any(archive.dominates(e, pt) for e in archive._archive):
+                continue
+            bonus[i] += beta_1
+            bonus[i] += beta_2 * sum(
+                1 for e in archive._archive if archive.dominates(pt, e)
+            )
+
+        return bonus
+
+    def _compute_reward(
+        self,
+        fidelities: np.ndarray,
+        depths: np.ndarray,
+        cnot_counts: np.ndarray,
+    ) -> np.ndarray:
+        """Compute cost = -R_total for each circuit (gqe_reward_design.tex).
+
+        Falls back to 1-F cost when no reference circuit has been set yet.
+        """
         if self._reward_ref_depth is None or self._reward_ref_cnot is None:
-            return (1.0 - fidelities_f).astype(np.float32)
+            return (1.0 - np.asarray(fidelities, dtype=np.float32))
 
-        p = self.cfg.pareto
-        lambda_depth, lambda_cnot = self._reward_lambdas
-        eps = np.float32(p.fidelity_log_eps)
-        phi = -np.log(np.maximum(1.0 - fidelities_f + eps, eps))
-        phi = np.clip(phi, 0.0, p.fidelity_log_cap)
-        structure_scale = self.structure_scale_for_fidelity(fidelities_f)
+        r = self.cfg.reward
+        F = np.asarray(fidelities, dtype=np.float32)
+        D = np.asarray(depths, dtype=np.float32)
+        C = np.asarray(cnot_counts, dtype=np.float32)
 
-        depth_ratio = (np.float32(self._reward_ref_depth) + 1.0) / (depths_f + 1.0)
-        cnot_ratio = (np.float32(self._reward_ref_cnot) + 1.0) / (cnots_f + 1.0)
-        structure_bonus = lambda_depth * depth_ratio + lambda_cnot * cnot_ratio
-        structure_bonus = np.maximum(structure_bonus, eps)
-        structure_margin = structure_bonus - np.float32(1.0)
-        structure_term = np.float32(p.structure_score_offset) + structure_scale * structure_margin
-        structure_term = np.maximum(structure_term, eps)
-        score = phi * structure_term
+        F_ref = np.float32(self._reward_ref_fidelity)
+        D_ref = np.float32(self._reward_ref_depth)
+        C_ref = np.float32(self._reward_ref_cnot)
 
-        return (-score).astype(np.float32)
+        # Log-infidelity difference ΔΦ = Φ(F) - Φ(F_ref)
+        phi_F = self._phi(F)
+        phi_F_ref = float(self._phi(np.array([F_ref], dtype=np.float32))[0])
+        delta_phi = phi_F - np.float32(phi_F_ref)
+
+        # Positive structure gains: G_X = [log((X_ref+1)/(X+1))]+
+        G_D = np.maximum(np.float32(0.0), np.log((D_ref + 1.0) / (D + 1.0)))
+        G_C = np.maximum(np.float32(0.0), np.log((C_ref + 1.0) / (C + 1.0)))
+
+        # Structure regression penalties: P_X = [log((X+1)/(X_ref+1))]+
+        P_D = np.maximum(np.float32(0.0), np.log((D + 1.0) / (D_ref + 1.0)))
+        P_C = np.maximum(np.float32(0.0), np.log((C + 1.0) / (C_ref + 1.0)))
+
+        # Soft fidelity gates
+        w_F = self.fidelity_gate(F)
+        w_F_ref = float(self.fidelity_gate(np.array([F_ref], dtype=np.float32))[0])
+
+        # Exponential structure coupling (shared across regimes 2 & 3)
+        _MAX_EXP = np.float32(30.0)
+        lam_d = np.float32(r.lambda_d)
+        lam_c = np.float32(r.lambda_c)
+        struct_arg = np.clip(lam_d * G_D + lam_c * G_C, np.float32(0.0), _MAX_EXP)
+        struct_bonus = np.exp(struct_arg) - np.float32(1.0)
+
+        delta_bad = np.float32(r.delta_bad)
+
+        # Regime 1: clearly bad fidelity drop (ΔΦ < -δ_bad)
+        excess = np.clip(-delta_phi - delta_bad, np.float32(0.0), _MAX_EXP)
+        r_bad = -np.float32(r.alpha_bad) * (
+            np.exp(np.float32(r.kappa_bad) * excess) - np.float32(1.0)
+        )
+
+        # Regime 2: small fidelity drop (-δ_bad ≤ ΔΦ < 0)
+        neg_dp = np.clip(-delta_phi, np.float32(0.0), _MAX_EXP)
+        r_soft = (
+            -np.float32(r.alpha_soft) * (
+                np.exp(np.float32(r.kappa_soft) * neg_dp) - np.float32(1.0)
+            )
+            + np.float32(r.eta) * np.float32(w_F_ref) * struct_bonus
+        )
+
+        # Regime 3: non-worse fidelity (ΔΦ ≥ 0)
+        pos_dp = np.clip(delta_phi, np.float32(0.0), _MAX_EXP)
+        r_good = (
+            np.float32(r.alpha_good) * (
+                np.exp(np.float32(r.kappa_good) * pos_dp) - np.float32(1.0)
+            )
+            + w_F * struct_bonus
+            - w_F * (np.float32(r.mu_d) * P_D + np.float32(r.mu_c) * P_C)
+        )
+
+        # Select regime
+        reward = np.where(
+            delta_phi < -delta_bad,
+            r_bad,
+            np.where(delta_phi < np.float32(0.0), r_soft, r_good),
+        ).astype(np.float32)
+
+        # Add Pareto proxy bonus
+        if self.pareto_archive is not None and (r.beta_1 > 0.0 or r.beta_2 > 0.0):
+            reward = reward + self._compute_pareto_bonus(fidelities, depths, cnot_counts)
+
+        return (-reward).astype(np.float32)
 
     def _compute_discrete_metrics(
         self,

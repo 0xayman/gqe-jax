@@ -1,0 +1,640 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools}
+\usepackage{booktabs,array}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+\title{GQE Reward Design}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+We consider quantum unitary synthesis as a multi-objective optimization problem with three competing goals:
+\begin{enumerate}[label=(\roman*)]
+    \item maximize process fidelity,
+    \item minimize circuit depth,
+    \item minimize CNOT count.
+\end{enumerate}
+
+The central challenge is that these objectives should \emph{not} be collapsed too aggressively into a naive weighted sum. In particular:
+\begin{itemize}
+    \item fidelity is the primary objective,
+    \item structural simplification should matter more once fidelity is already good,
+    \item small temporary degradations in fidelity may occasionally be useful for exploring new regions of the Pareto front,
+    \item the reward should encourage the discovery of \emph{new non-dominated tradeoffs}, not only improvements relative to a single incumbent.
+\end{itemize}
+
+This document proposes a reward with two parts:
+\begin{enumerate}[label=(\arabic*)]
+    \item a \textbf{local comparison reward}, which compares a candidate circuit against a reference circuit and provides a dense learning signal, and
+    \item a \textbf{Pareto-front bonus}, which rewards expansion of the global non-dominated archive.
+\end{enumerate}
+
+The full reward is therefore both \emph{locally shaped} and \emph{globally Pareto-aware}.
+
+\section{Notation}
+
+Let the candidate circuit be denoted by $x$, and let the reference circuit be denoted by $x_{\mathrm{ref}}$.
+For each circuit we define:
+\begin{align}
+    F &\in [0,1] &&\text{candidate process fidelity,} \\
+    D &\in \{0,1,2,\dots\} &&\text{candidate circuit depth,} \\
+    C &\in \{0,1,2,\dots\} &&\text{candidate CNOT count,}
+\end{align}
+and similarly
+\begin{align}
+    F_{\mathrm{ref}},\quad D_{\mathrm{ref}},\quad C_{\mathrm{ref}}
+\end{align}
+for the reference circuit.
+
+We assume that the optimization direction is:
+\begin{itemize}
+    \item maximize $F$,
+    \item minimize $D$,
+    \item minimize $C$.
+\end{itemize}
+
+We also introduce the following small positive constants:
+\begin{align}
+    \varepsilon_{\phi} &> 0 &&\text{stabilizer for log-infidelity,} \\
+    \delta_{\mathrm{bad}} &\ge 0 &&\text{tolerance defining a clearly bad fidelity drop,} \\
+    \tau &> 0 &&\text{temperature of the soft fidelity gate.}
+\end{align}
+
+\section{Why Raw Fidelity Differences Are Not Enough}
+
+Using the raw fidelity difference $F-F_{\mathrm{ref}}$ is often too crude for unitary synthesis.
+For example, improving fidelity from $0.99$ to $0.999$ is usually much more valuable than improving from $0.50$ to $0.509$, even though both changes have similar absolute magnitude.
+
+To reflect this, we work with \emph{log-infidelity utility}.
+Define
+\begin{equation}
+    \Phi(F) = -\log(1-F+\varepsilon_{\phi}).
+\end{equation}
+
+This function has the following properties:
+\begin{enumerate}[label=(\alph*)]
+    \item it is increasing in $F$,
+    \item it grows rapidly as $F \to 1$,
+    \item it transforms improvements near perfect fidelity into larger reward increments.
+\end{enumerate}
+
+We then define the fidelity improvement relative to the reference as
+\begin{equation}
+    \Delta_{\Phi}(x\mid x_{\mathrm{ref}})
+    = \Phi(F) - \Phi(F_{\mathrm{ref}}).
+\end{equation}
+
+Interpretation:
+\begin{itemize}
+    \item $\Delta_{\Phi} > 0$: the candidate improves fidelity relative to the reference,
+    \item $\Delta_{\Phi} = 0$: the candidate matches the reference in transformed fidelity,
+    \item $\Delta_{\Phi} < 0$: the candidate is worse in fidelity.
+\end{itemize}
+
+\section{Structure Improvement Terms}
+
+We want structural improvements to be measured in a scale-aware way. A reduction from depth $100$ to $90$ should not be treated exactly the same as a reduction from $10$ to $0$.
+A natural choice is to use log-ratios.
+
+\subsection{Positive structure gains}
+
+Define the positive depth and CNOT improvements by
+\begin{align}
+    G_D(x\mid x_{\mathrm{ref}})
+    &= \left[\log\frac{D_{\mathrm{ref}}+1}{D+1}\right]_+, \\
+    G_C(x\mid x_{\mathrm{ref}})
+    &= \left[\log\frac{C_{\mathrm{ref}}+1}{C+1}\right]_+,
+\end{align}
+where
+\begin{equation}
+    [z]_+ = \max(z,0).
+\end{equation}
+
+Thus:
+\begin{itemize}
+    \item $G_D > 0$ only if $D < D_{\mathrm{ref}}$,
+    \item $G_C > 0$ only if $C < C_{\mathrm{ref}}$,
+    \item both gains are zero when the corresponding structure metric does not improve.
+\end{itemize}
+
+\subsection{Optional structure regression penalties}
+
+It is often useful to also penalize unnecessary structural regressions whenever fidelity is not worse.
+Define
+\begin{align}
+    P_D(x\mid x_{\mathrm{ref}})
+    &= \left[\log\frac{D+1}{D_{\mathrm{ref}}+1}\right]_+, \\
+    P_C(x\mid x_{\mathrm{ref}})
+    &= \left[\log\frac{C+1}{C_{\mathrm{ref}}+1}\right]_+.
+\end{align}
+
+Thus:
+\begin{itemize}
+    \item $P_D > 0$ only if $D > D_{\mathrm{ref}}$,
+    \item $P_C > 0$ only if $C > C_{\mathrm{ref}}$.
+\end{itemize}
+
+These terms are optional. If one wants a softer fidelity-first reward, they can be disabled by setting the corresponding coefficients to zero.
+
+\section{Soft Fidelity Gate}
+
+We do not want structure to matter equally in all regimes.
+If the candidate has very low fidelity, rewarding depth or CNOT reduction too strongly may push the search toward shallow but useless circuits.
+On the other hand, once fidelity is already good, structural simplification becomes much more meaningful.
+
+To model this smoothly, define the fidelity gate
+\begin{equation}
+    w(F) = \sigma\!\left(\frac{F-F_{\mathrm{gate}}}{\tau}\right),
+\end{equation}
+where
+\begin{equation}
+    \sigma(z)=\frac{1}{1+e^{-z}}
+\end{equation}
+is the logistic sigmoid, $F_{\mathrm{gate}}\in(0,1)$ is a chosen fidelity threshold, and $\tau>0$ controls the sharpness.
+
+Interpretation:
+\begin{itemize}
+    \item if $F \ll F_{\mathrm{gate}}$, then $w(F)\approx 0$ and structure bonuses are strongly suppressed,
+    \item if $F \gg F_{\mathrm{gate}}$, then $w(F)\approx 1$ and structure bonuses are almost fully active,
+    \item for intermediate fidelities, structure pressure turns on gradually rather than abruptly.
+\end{itemize}
+
+This is preferable to a hard threshold because it avoids discontinuous reward jumps.
+
+\section{Local Comparison Reward}
+
+The local reward compares the candidate $x$ to a reference $x_{\mathrm{ref}}$.
+It is piecewise defined so that:
+\begin{enumerate}[label=(\roman*)]
+    \item large fidelity drops are penalized strongly,
+    \item small fidelity drops are still discouraged, but not so harshly that exploration dies,
+    \item non-worse fidelity activates stronger structure optimization.
+\end{enumerate}
+
+\subsection{Definition}
+
+Let
+\begin{align}
+    \alpha_{\mathrm{bad}},\alpha_{\mathrm{soft}},\alpha_{\mathrm{good}} &> 0, \\
+    \kappa_{\mathrm{bad}},\kappa_{\mathrm{soft}},\kappa_{\mathrm{good}} &> 0, \\
+    \lambda_D,\lambda_C &\ge 0, \\
+    \mu_D,\mu_C &\ge 0, \\
+    \eta &\in [0,1].
+\end{align}
+
+Then define
+\begin{equation}
+R_{\mathrm{local}}(x\mid x_{\mathrm{ref}})=
+\begin{cases}
+-\alpha_{\mathrm{bad}}
+\left(
+    e^{\kappa_{\mathrm{bad}}(-\Delta_{\Phi}-\delta_{\mathrm{bad}})}-1
+\right),
+& \Delta_{\Phi}< -\delta_{\mathrm{bad}}, \\
+-\alpha_{\mathrm{soft}}
+\left(
+    e^{\kappa_{\mathrm{soft}}(-\Delta_{\Phi})}-1
+\right)
++
+\eta\,w(F_{\mathrm{ref}})
+\left(
+    e^{\lambda_D G_D + \lambda_C G_C}-1
+\right),
+& -\delta_{\mathrm{bad}}\le \Delta_{\Phi}<0, \\
+\alpha_{\mathrm{good}}
+\left(
+    e^{\kappa_{\mathrm{good}}\Delta_{\Phi}}-1
+\right)
++
+ w(F)
+\left(
+    e^{\lambda_D G_D + \lambda_C G_C}-1
+\right)
+-
+ w(F)(\mu_D P_D + \mu_C P_C),
+& \Delta_{\Phi}\ge 0.
+\end{cases}
+\label{eq:Rlocal}
+\end{equation}
+
+\subsection{Meaning of every term}
+
+We now explain every term in \eqref{eq:Rlocal}.
+
+\paragraph{Regime 1: clearly bad fidelity drop.}
+If
+\begin{equation}
+    \Delta_{\Phi}< -\delta_{\mathrm{bad}},
+\end{equation}
+then the reward is
+\begin{equation}
+    -\alpha_{\mathrm{bad}}\Bigl(e^{\kappa_{\mathrm{bad}}(-\Delta_{\Phi}-\delta_{\mathrm{bad}})}-1\Bigr).
+\end{equation}
+Here:
+\begin{itemize}
+    \item $-\Delta_{\Phi}-\delta_{\mathrm{bad}}>0$ measures how far below the tolerated fidelity region the candidate falls,
+    \item $\kappa_{\mathrm{bad}}$ controls how sharply the penalty grows,
+    \item $\alpha_{\mathrm{bad}}$ sets the overall magnitude of this penalty.
+\end{itemize}
+This branch gives a \emph{strictly negative} reward and ignores structure entirely.
+
+\paragraph{Regime 2: small fidelity drop.}
+If
+\begin{equation}
+    -\delta_{\mathrm{bad}}\le \Delta_{\Phi}<0,
+\end{equation}
+then the reward is the sum of:
+\begin{enumerate}[label=(\alph*)]
+    \item a soft penalty
+    \begin{equation}
+        -\alpha_{\mathrm{soft}}\Bigl(e^{\kappa_{\mathrm{soft}}(-\Delta_{\Phi})}-1\Bigr),
+    \end{equation}
+    which discourages any fidelity loss, and
+    \item a reduced structure bonus
+    \begin{equation}
+        \eta\,w(F_{\mathrm{ref}})\Bigl(e^{\lambda_D G_D+\lambda_C G_C}-1\Bigr),
+    \end{equation}
+    where $\eta\in[0,1]$ attenuates structure reward in this exploratory regime.
+\end{enumerate}
+
+This branch captures the idea that slight fidelity degradation may sometimes be tolerated for exploration, but it should remain costly overall unless the structural gain is genuinely promising.
+
+\paragraph{Regime 3: non-worse fidelity.}
+If
+\begin{equation}
+    \Delta_{\Phi}\ge 0,
+\end{equation}
+then the reward has three components.
+
+First, the fidelity-improvement reward:
+\begin{equation}
+    \alpha_{\mathrm{good}}\Bigl(e^{\kappa_{\mathrm{good}}\Delta_{\Phi}}-1\Bigr).
+\end{equation}
+This is zero when fidelity is unchanged and positive when fidelity improves. Its exponential form makes high-end fidelity gains increasingly valuable.
+
+Second, the structure-improvement bonus:
+\begin{equation}
+    w(F)\Bigl(e^{\lambda_D G_D+\lambda_C G_C}-1\Bigr).
+\end{equation}
+This is gated by current fidelity through $w(F)$, so structure matters more once the candidate is already in a high-fidelity regime.
+
+Third, the optional structure-regression penalty:
+\begin{equation}
+    -w(F)(\mu_D P_D + \mu_C P_C).
+\end{equation}
+This discourages unnecessary depth or CNOT increases when fidelity is not worse.
+
+\section{Why Exponential Coupling Is Useful}
+
+The term
+\begin{equation}
+    e^{\lambda_D G_D+\lambda_C G_C}-1
+\end{equation}
+implements a nonlinear coupling between structural improvements.
+It has several useful properties:
+\begin{enumerate}[label=(\arabic*)]
+    \item it is zero when there is no structural improvement,
+    \item it is increasing in both $G_D$ and $G_C$,
+    \item simultaneous improvements in depth and CNOT receive more reward than either alone,
+    \item small improvements remain gentle, while stronger improvements receive superlinear emphasis.
+\end{enumerate}
+
+This is in the same spirit as nonlinear scalarizations used in architecture search, where one does not want a simple linear sum to flatten the tradeoff geometry too aggressively.
+
+\section{Pareto-Front Bonus}
+
+The local reward alone still compares the candidate only to a single reference circuit.
+However, true multi-objective optimization should also reward \emph{global frontier expansion}.
+
+Let $A_t$ denote the archive of non-dominated circuits before adding the current candidate.
+We define a Pareto-front bonus by
+\begin{equation}
+    R_{\mathrm{pareto}}(x;A_t)=\beta_{\mathrm{HV}}\,\Delta HV(x;A_t),
+\label{eq:RparetoHV}
+\end{equation}
+where $\beta_{\mathrm{HV}}\ge 0$ is a scaling coefficient and $\Delta HV(x;A_t)$ is the increase in 3-dimensional hypervolume obtained by adding $x$ to the archive.
+
+The three objectives are:
+\begin{itemize}
+    \item maximize fidelity,
+    \item minimize depth,
+    \item minimize CNOT count.
+\end{itemize}
+
+Thus:
+\begin{itemize}
+    \item if $x$ is dominated by the archive, then typically $\Delta HV(x;A_t)=0$,
+    \item if $x$ is a new useful tradeoff point, then $\Delta HV(x;A_t)>0$,
+    \item the more the candidate expands the frontier, the larger the bonus.
+\end{itemize}
+
+\subsection{Cheaper Pareto proxy}
+
+If exact 3-dimensional hypervolume is inconvenient to compute at every step, one can use a simpler proxy:
+\begin{equation}
+    R_{\mathrm{pareto\text{-}proxy}}(x;A_t)
+    =
+    \beta_1\,\mathbf{1}[x\text{ is non-dominated w.r.t. }A_t]
+    +
+    \beta_2\,N_{\mathrm{dom}}(x;A_t),
+\label{eq:RparetoProxy}
+\end{equation}
+where:
+\begin{itemize}
+    \item $\beta_1\ge 0$ rewards the candidate for entering the frontier,
+    \item $\beta_2\ge 0$ rewards the candidate for dominating existing archive points,
+    \item $N_{\mathrm{dom}}(x;A_t)$ is the number of archive points dominated by $x$.
+\end{itemize}
+
+This proxy is cruder than hypervolume improvement, but it is easy to implement and often works well in practice.
+
+\section{Total Reward and Cost}
+
+The full reward is
+\begin{equation}
+    R_{\mathrm{total}}(x)
+    =
+    R_{\mathrm{local}}(x\mid x_{\mathrm{ref}})
+    +
+    R_{\mathrm{pareto}}(x;A_t),
+\label{eq:Rtotal}
+\end{equation}
+or, if using the cheaper archive proxy,
+\begin{equation}
+    R_{\mathrm{total}}(x)
+    =
+    R_{\mathrm{local}}(x\mid x_{\mathrm{ref}})
+    +
+    R_{\mathrm{pareto\text{-}proxy}}(x;A_t).
+\end{equation}
+
+If the training code is written in terms of a cost to minimize, we simply define
+\begin{equation}
+    \mathrm{cost}(x) = -R_{\mathrm{total}}(x).
+\label{eq:cost}
+\end{equation}
+
+Thus maximizing reward and minimizing cost are equivalent.
+
+\section{Behavior Analysis}
+
+We now analyze how the reward behaves in important scenarios.
+
+\subsection{Scenario 1: fidelity improves, structure unchanged}
+
+Suppose
+\begin{equation}
+    \Delta_{\Phi}>0,
+    \qquad
+    D=D_{\mathrm{ref}},
+    \qquad
+    C=C_{\mathrm{ref}}.
+\end{equation}
+Then
+\begin{equation}
+    G_D=G_C=P_D=P_C=0,
+\end{equation}
+and the local reward reduces to a strictly positive fidelity term:
+\begin{equation}
+    R_{\mathrm{local}}=
+    \alpha_{\mathrm{good}}\Bigl(e^{\kappa_{\mathrm{good}}\Delta_{\Phi}}-1\Bigr)>0.
+\end{equation}
+So fidelity improvement is always rewarded.
+
+\subsection{Scenario 2: fidelity preserved, structure improves}
+
+Suppose
+\begin{equation}
+    \Delta_{\Phi}=0,
+    \qquad
+    D<D_{\mathrm{ref}}
+    \quad\text{and/or}\quad
+    C<C_{\mathrm{ref}}.
+\end{equation}
+Then the fidelity term is zero, but the structure term is positive:
+\begin{equation}
+    R_{\mathrm{local}}=w(F)\Bigl(e^{\lambda_D G_D+\lambda_C G_C}-1\Bigr)>0.
+\end{equation}
+Hence structurally simpler circuits are preferred among equal-fidelity candidates.
+
+\subsection{Scenario 3: large fidelity drop, even with better structure}
+
+Suppose
+\begin{equation}
+    \Delta_{\Phi}< -\delta_{\mathrm{bad}}.
+\end{equation}
+Then
+\begin{equation}
+    R_{\mathrm{local}}<0
+\end{equation}
+regardless of $D$ and $C$.
+This preserves the fidelity-first principle in the region judged to be clearly unsafe.
+
+\subsection{Scenario 4: small fidelity drop but major structural gain}
+
+Suppose
+\begin{equation}
+    -\delta_{\mathrm{bad}}\le \Delta_{\Phi}<0,
+\end{equation}
+and assume that $D$ and/or $C$ improve substantially.
+Then the reward becomes
+\begin{equation}
+    R_{\mathrm{local}}=
+    \underbrace{-\alpha_{\mathrm{soft}}\Bigl(e^{\kappa_{\mathrm{soft}}(-\Delta_{\Phi})}-1\Bigr)}_{\text{negative}}
+    +
+    \underbrace{\eta w(F_{\mathrm{ref}})\Bigl(e^{\lambda_D G_D+\lambda_C G_C}-1\Bigr)}_{\text{positive}}.
+\end{equation}
+This regime allows controlled exploration.
+Depending on hyperparameter choices, the total may remain negative, near zero, or slightly positive.
+That flexibility is intentional: it allows the search to occasionally pass through simpler intermediate circuits that may later lead to better high-fidelity solutions.
+
+\subsection{Scenario 5: fidelity improves but structure worsens}
+
+Suppose
+\begin{equation}
+    \Delta_{\Phi}>0,
+    \qquad
+    D>D_{\mathrm{ref}}
+    \quad\text{or}\quad
+    C>C_{\mathrm{ref}}.
+\end{equation}
+Then the candidate still receives a positive fidelity reward, but may be penalized through $P_D$ and $P_C$:
+\begin{equation}
+    R_{\mathrm{local}}=
+    \alpha_{\mathrm{good}}\Bigl(e^{\kappa_{\mathrm{good}}\Delta_{\Phi}}-1\Bigr)
+    -w(F)(\mu_D P_D+\mu_C P_C)
+    + \text{possible structure gains}.
+\end{equation}
+This means fidelity is still primary, but unnecessary structural regressions are not ignored.
+
+\subsection{Scenario 6: candidate is a new frontier point}
+
+Even if the local reward is only modestly positive, the candidate can receive extra reward through
+\begin{equation}
+    R_{\mathrm{pareto}}(x;A_t)>0
+\end{equation}
+when it expands the non-dominated archive.
+This is one of the most important properties of the full design: it does not only reward improvement against a single incumbent, but also rewards the discovery of novel tradeoff points.
+
+\section{Edge Cases}
+
+\subsection{Edge case: $F=0$}
+
+If $F=0$, then
+\begin{equation}
+    \Phi(0) = -\log(1+\varepsilon_{\phi}-1) = -\log(1+\varepsilon_{\phi}-1?)
+\end{equation}
+which is more transparently written as
+\begin{equation}
+    \Phi(0) = -\log(1-0+\varepsilon_{\phi}) = -\log(1+\varepsilon_{\phi}).
+\end{equation}
+Since $\varepsilon_{\phi}>0$ is small, this is finite and slightly negative. There is no singularity.
+
+If the reference has much better fidelity, then $\Delta_{\Phi}$ will be strongly negative and the candidate falls into the bad-drop regime.
+
+\subsection{Edge case: $F\to 1$}
+
+As $F\to 1$,
+\begin{equation}
+    \Phi(F) = -\log(1-F+\varepsilon_{\phi})
+\end{equation}
+becomes large but remains finite because of $\varepsilon_{\phi}$.
+This is desirable: very high fidelity improvements are emphasized without causing numerical blow-up.
+
+\subsection{Edge case: $D=0$ or $C=0$}
+
+Because all depth and CNOT ratios are written using $D+1$ and $C+1$, there is no division by zero:
+\begin{align}
+    G_D &= \left[\log\frac{D_{\mathrm{ref}}+1}{D+1}\right]_+, \\
+    G_C &= \left[\log\frac{C_{\mathrm{ref}}+1}{C+1}\right]_+.
+\end{align}
+So empty or trivial circuits are handled safely.
+
+\subsection{Edge case: candidate identical to reference}
+
+If
+\begin{equation}
+    F=F_{\mathrm{ref}},
+    \qquad
+    D=D_{\mathrm{ref}},
+    \qquad
+    C=C_{\mathrm{ref}},
+\end{equation}
+then
+\begin{equation}
+    \Delta_{\Phi}=0,
+    \quad
+    G_D=G_C=P_D=P_C=0.
+\end{equation}
+Hence
+\begin{equation}
+    R_{\mathrm{local}}=0.
+\end{equation}
+If the archive bonus is also zero, then the total reward is exactly zero. This is desirable: no change gives no reward.
+
+\subsection{Edge case: fidelity equal, depth better, CNOT worse}
+
+Suppose
+\begin{equation}
+    \Delta_{\Phi}=0,
+    \qquad
+    D<D_{\mathrm{ref}},
+    \qquad
+    C>C_{\mathrm{ref}}.
+\end{equation}
+Then both a positive gain term $G_D$ and a regression penalty $P_C$ may be active.
+The reward will trade these off according to $\lambda_D$ and $\mu_C$.
+This is appropriate because the candidate is a mixed tradeoff point rather than a uniformly better circuit.
+
+\subsection{Edge case: structure improves strongly at very low fidelity}
+
+Suppose the candidate is structurally much simpler but fidelity is poor. Then $w(F)$ is close to zero, which suppresses structure bonuses. This prevents the optimization from overvaluing shallow but inaccurate circuits.
+
+\section{Hyperparameter Interpretation}
+
+The main hyperparameters play the following roles:
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth}>{\raggedright\arraybackslash}p{0.72\linewidth}}
+\toprule
+Parameter & Meaning \\
+\midrule
+$\varepsilon_{\phi}$ & numerical stabilizer in log-infidelity; should be small \\
+$\delta_{\mathrm{bad}}$ & tolerance separating mild from clearly bad fidelity drops \\
+$F_{\mathrm{gate}}$ & fidelity level at which structure reward begins to matter strongly \\
+$\tau$ & softness of the fidelity gate; smaller values make it closer to a hard threshold \\
+$\alpha_{\mathrm{bad}}$ & scale of severe fidelity penalties \\
+$\kappa_{\mathrm{bad}}$ & steepness of severe fidelity penalties \\
+$\alpha_{\mathrm{soft}}$ & scale of mild fidelity penalties \\
+$\kappa_{\mathrm{soft}}$ & steepness of mild fidelity penalties \\
+$\alpha_{\mathrm{good}}$ & scale of fidelity-improvement reward \\
+$\kappa_{\mathrm{good}}$ & steepness of fidelity-improvement reward \\
+$\lambda_D,\lambda_C$ & strengths of structure-improvement bonuses \\
+$\mu_D,\mu_C$ & strengths of structure-regression penalties \\
+$\eta$ & amount of structure reward allowed during mild-fidelity-drop exploration \\
+$\beta_{\mathrm{HV}}$ & weight of global Pareto expansion bonus \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Recommended Qualitative Tuning Strategy}
+
+A sensible practical strategy is:
+\begin{enumerate}[label=(\arabic*)]
+    \item start with strong fidelity protection, i.e. choose $\alpha_{\mathrm{bad}}$ and $\kappa_{\mathrm{bad}}$ so that clearly bad fidelity drops are always unattractive,
+    \item make the mild-drop regime narrow by using a small $\delta_{\mathrm{bad}}$,
+    \item set $\eta$ small so that exploration through mild degradation is possible but limited,
+    \item choose $F_{\mathrm{gate}}$ fairly high so that depth and CNOT pressure turn on mostly in the medium-to-high fidelity regime,
+    \item use a nonzero archive bonus so that novel Pareto points are not ignored.
+\end{enumerate}
+
+\section{What This Reward Guarantees and What It Does Not}
+
+\subsection{What it guarantees}
+
+The proposed reward guarantees the following qualitative behavior:
+\begin{enumerate}[label=(\roman*)]
+    \item large fidelity drops are punished strongly,
+    \item structure matters more when fidelity is already good,
+    \item equal-fidelity solutions are compared meaningfully by depth and CNOT count,
+    \item the search can still discover useful non-dominated tradeoffs through archive-aware reward,
+    \item the objective is more faithful to Pareto-front optimization than a simple weighted sum.
+\end{enumerate}
+
+\subsection{What it intentionally allows}
+
+The reward intentionally allows a narrow regime in which a small fidelity drop can coexist with some structure reward. This is not a flaw. It is a deliberate exploration mechanism motivated by the fact that some structurally simpler intermediate circuits may later lead to better solutions.
+
+\subsection{What it does not fully solve}
+
+No scalar reward can perfectly represent the full Pareto structure of a multi-objective problem. The archive-aware bonus helps substantially, but final model selection should still inspect the actual non-dominated set rather than relying on the scalar reward alone.
+
+\section{Bottom Line}
+
+The proposed reward is
+\begin{equation*}
+    R_{\mathrm{total}}(x)
+    =
+    R_{\mathrm{local}}(x\mid x_{\mathrm{ref}})
+    +
+    R_{\mathrm{pareto}}(x;A_t),
+\end{equation*}
+with $R_{\mathrm{local}}$ defined in \eqref{eq:Rlocal} and $R_{\mathrm{pareto}}$ given either by hypervolume improvement \eqref{eq:RparetoHV} or by the cheaper proxy \eqref{eq:RparetoProxy}.
+
+This design is a good fit for multi-objective unitary synthesis because it combines:
+\begin{itemize}
+    \item \textbf{fidelity sensitivity} through log-infidelity utility,
+    \item \textbf{nonlinear structure reward} through exponential coupling,
+    \item \textbf{controlled exploration} through a mild-drop regime,
+    \item \textbf{Pareto awareness} through archive expansion bonus.
+\end{itemize}
+
+In short, it is not merely a fidelity-first reward and not merely a scalarized compression reward. It is a compromise between safe local improvement and true frontier discovery.
+
+\end{document}

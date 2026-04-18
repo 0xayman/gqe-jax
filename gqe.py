@@ -97,10 +97,10 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
         )
 
     # Warmup is fidelity-only. After it ends, replay is rescored with the
-    # stationary QASER-style reward using the frozen warmup references.
+    # full reward using the frozen warmup references.
     pipeline._warmup_mode = False
     if pipeline.pareto_archive is not None:
-        pipeline._rescore_replay_buffer_with_stationary_reward()
+        pipeline._rescore_replay_buffer()
 
     for epoch in range(cfg.training.max_epochs):
         pipeline._current_epoch = epoch
@@ -108,13 +108,13 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
         # Raise the Pareto fidelity floor once training has matured
         if (
             pipeline.pareto_archive is not None
-            and epoch == cfg.pareto.floor_ramp_epoch
+            and epoch == cfg.reward.floor_ramp_epoch
         ):
-            pipeline.pareto_archive.set_fidelity_floor(cfg.pareto.fidelity_floor_late)
+            pipeline.pareto_archive.set_fidelity_floor(cfg.reward.fidelity_floor_late)
             if cfg.logging.verbose:
                 print(
                     f"  [Pareto] Epoch {epoch + 1}: "
-                    f"fidelity floor raised to {cfg.pareto.fidelity_floor_late}"
+                    f"fidelity floor raised to {cfg.reward.fidelity_floor_late}"
                 )
         epoch_start = time.perf_counter()
 
@@ -176,19 +176,19 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
         pareto_best_f = float("nan")
         pareto_min_cnot = -1
         pareto_min_depth = -1
-        pareto_threshold = float(cfg.pareto.fidelity_threshold)
-        epoch_structure_scale = (
+        pareto_threshold = float(cfg.reward.fidelity_threshold)
+        epoch_fidelity_gate = (
             float(
-                pipeline.structure_scale_for_fidelity(
+                pipeline.fidelity_gate(
                     np.asarray([epoch_best_fidelity], dtype=np.float32)
                 )[0]
             )
             if pipeline.pareto_archive is not None
             else float("nan")
         )
-        run_structure_scale = (
+        run_fidelity_gate = (
             float(
-                pipeline.structure_scale_for_fidelity(
+                pipeline.fidelity_gate(
                     np.asarray([run_best_fidelity], dtype=np.float32)
                 )[0]
             )
@@ -218,12 +218,11 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
                 else float("nan")
             )
             ref_fidelity = float(pipeline._reward_ref_fidelity)
-            lambda_depth, lambda_cnot = pipeline._reward_lambdas
             pareto_str = (
                 f" | pareto_size={pareto_size}"
                 f" | hv={pareto_hv:.4f}"
-                f" | lambda=[{lambda_depth:.2f},{lambda_cnot:.2f}]"
-                f" | scale=[{epoch_structure_scale:.2f},{run_structure_scale:.2f}]"
+                f" | lambda=[{cfg.reward.lambda_d:.2f},{cfg.reward.lambda_c:.2f}]"
+                f" | gate=[{epoch_fidelity_gate:.2f},{run_fidelity_gate:.2f}]"
                 f" | ref=[{ref_depth:.2f},{ref_cnot:.2f},{ref_fidelity:.6f}]"
                 if pipeline.pareto_archive is not None
                 else ""
@@ -255,10 +254,10 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
                     "pareto_fidelity_threshold": pareto_threshold,
                     "pareto_min_cnot_at_threshold": float(pareto_min_cnot),
                     "pareto_min_depth_at_threshold": float(pareto_min_depth),
-                    "reward_lambda_depth": float(pipeline._reward_lambdas[0]),
-                    "reward_lambda_cnot": float(pipeline._reward_lambdas[1]),
-                    "reward_structure_scale_epoch_best": epoch_structure_scale,
-                    "reward_structure_scale_run_best": run_structure_scale,
+                    "reward_lambda_d": float(cfg.reward.lambda_d),
+                    "reward_lambda_c": float(cfg.reward.lambda_c),
+                    "reward_fidelity_gate_epoch_best": epoch_fidelity_gate,
+                    "reward_fidelity_gate_run_best": run_fidelity_gate,
                     "reward_ref_depth": (
                         float(pipeline._reward_ref_depth)
                         if pipeline._reward_ref_depth is not None

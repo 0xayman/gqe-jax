@@ -1,5 +1,6 @@
 """Factory helpers for GQE component construction."""
 
+import jax
 from continuous_optimizer import ContinuousOptimizer
 from loss import GRPOLoss
 from scheduler import CosineScheduler, FixedScheduler, LinearScheduler

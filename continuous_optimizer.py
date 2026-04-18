@@ -168,18 +168,25 @@ class ContinuousOptimizer:
         self.top_k = top_k
         self.max_gates = max_gates
         self.num_restarts = num_restarts
+        backend = jax.default_backend()
+        is_gpu = backend in ('gpu', 'cuda')
+        if fast_runtime is None and is_gpu:
+            fast_runtime = True
+        elif fast_runtime is None:
+            fast_runtime = False
         self.fast_runtime = fast_runtime
         self._real_dtype = jnp.float32 if fast_runtime else jnp.float64
         self._complex_dtype = jnp.complex64 if fast_runtime else jnp.complex128
         self._np_real_dtype = np.float32 if fast_runtime else np.float64
         self._np_complex_dtype = np.complex64 if fast_runtime else np.complex128
         self._imag_unit = jnp.asarray(1.0j, dtype=self._complex_dtype)
-        self.u_target_jax = jnp.asarray(u_target, dtype=self._complex_dtype)
+        u_target_arr = np.asarray(u_target)
+        self.u_target_jax = jnp.asarray(u_target_arr, dtype=self._complex_dtype)
 
         self._identity = jnp.eye(2**num_qubits, dtype=self._complex_dtype)
-        self._pauli_x = jnp.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=self._complex_dtype)
-        self._pauli_y = jnp.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=self._complex_dtype)
-        self._pauli_z = jnp.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=self._complex_dtype)
+        self._pauli_x = jnp.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=self._complex_dtype).astype(self._complex_dtype)
+        self._pauli_y = jnp.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=self._complex_dtype).astype(self._complex_dtype)
+        self._pauli_z = jnp.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=self._complex_dtype).astype(self._complex_dtype)
         self._cnot_pairs = [
             (ctrl, tgt)
             for ctrl in range(num_qubits)

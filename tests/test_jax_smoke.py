@@ -14,7 +14,7 @@ from config import (
     GQEConfig,
     LoggingConfig,
     ModelConfig,
-    ParetoConfig,
+    RewardConfig,
     TargetConfig,
     TemperatureConfig,
     TrainingConfig,
@@ -71,22 +71,16 @@ def _tiny_cfg(
             top_k=1,
             num_restarts=2,
         ),
-        pareto=ParetoConfig(
+        reward=RewardConfig(
             enabled=pareto_enabled,
             fidelity_floor=0.0,
             fidelity_floor_late=0.0,
             floor_ramp_epoch=10,
             max_archive_size=16,
-            lambda_depth=0.35,
-            lambda_cnot=0.65,
-            structure_score_offset=1.0,
-            fidelity_log_eps=1.0e-8,
-            fidelity_log_cap=12.0,
+            lambda_d=0.35,
+            lambda_c=0.65,
+            eps_phi=1.0e-8,
             reference_ema=0.0,
-            structure_weight_min=0.15,
-            structure_weight_max=2.0,
-            structure_ramp_start=0.90,
-            structure_ramp_power=4.0,
             fidelity_threshold=0.99,
         ),
     )
@@ -121,7 +115,7 @@ def test_discrete_gqe_smoke():
     assert 0.0 <= best_cost <= 1.0
     assert isinstance(best_indices, list)
     assert len(best_indices) == cfg.model.max_gates_count + 1
-    # Pareto disabled in tiny cfg (default ParetoConfig has enabled=False)
+    # Pareto disabled in tiny cfg (RewardConfig constructed with enabled=False)
     assert pareto_archive is None
 
 
@@ -484,37 +478,35 @@ def test_qaser_reward_references_break_fidelity_ties_by_structure_after_warmup()
     assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
 
 
-def test_structure_scale_is_nonzero_and_increases_with_fidelity():
+def test_fidelity_gate_is_nonzero_and_increases_with_fidelity():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
 
-    scales = pipeline.structure_scale_for_fidelity(
+    gates = pipeline.fidelity_gate(
         np.asarray([0.10, 0.95, 0.99], dtype=np.float32)
     )
 
-    assert scales[0] > 0.0
-    assert scales[0] < scales[1] < scales[2]
+    assert gates[0] > 0.0
+    assert gates[0] < gates[1] < gates[2]
 
 
-def test_structure_scale_stays_near_min_before_ramp_start():
+def test_fidelity_gate_is_small_far_below_threshold():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
 
-    scales = pipeline.structure_scale_for_fidelity(
-        np.asarray([0.10, 0.50, 0.89], dtype=np.float32)
+    gates = pipeline.fidelity_gate(
+        np.asarray([0.10, 0.50], dtype=np.float32)
     )
 
-    np.testing.assert_allclose(
-        scales,
-        np.full_like(scales, pipeline.cfg.pareto.structure_weight_min),
-        atol=1e-7,
-    )
+    # Far below f_gate=0.90, the sigmoid gate is near zero
+    assert all(float(g) < 0.01 for g in gates)
 
 
-def test_qaser_scalarization_prefers_higher_fidelity_at_same_structure():
+def test_reward_prefers_higher_fidelity_at_same_structure():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
     pipeline._reward_ref_depth = 10.0
     pipeline._reward_ref_cnot = 5.0
+    pipeline._reward_ref_fidelity = 0.90
 
-    costs = pipeline._scalarize(
+    costs = pipeline._compute_reward(
         np.asarray([0.95, 0.99], dtype=np.float32),
         np.asarray([10, 10], dtype=np.int32),
         np.asarray([5, 5], dtype=np.int32),
@@ -523,17 +515,18 @@ def test_qaser_scalarization_prefers_higher_fidelity_at_same_structure():
     assert costs[1] < costs[0]
 
 
-def test_qaser_structure_gap_matters_more_at_high_fidelity():
+def test_reward_structure_gap_matters_more_at_high_fidelity():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
     pipeline._reward_ref_depth = 10.0
     pipeline._reward_ref_cnot = 5.0
+    pipeline._reward_ref_fidelity = 0.40
 
-    low_costs = pipeline._scalarize(
+    low_costs = pipeline._compute_reward(
         np.asarray([0.50, 0.50], dtype=np.float32),
         np.asarray([12, 8], dtype=np.int32),
         np.asarray([6, 4], dtype=np.int32),
     )
-    high_costs = pipeline._scalarize(
+    high_costs = pipeline._compute_reward(
         np.asarray([0.99, 0.99], dtype=np.float32),
         np.asarray([12, 8], dtype=np.int32),
         np.asarray([6, 4], dtype=np.int32),
@@ -546,12 +539,13 @@ def test_qaser_structure_gap_matters_more_at_high_fidelity():
     assert high_gap > low_gap
 
 
-def test_qaser_scalarization_prefers_better_structure_at_same_fidelity():
+def test_reward_prefers_better_structure_at_same_fidelity():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
     pipeline._reward_ref_depth = 10.0
     pipeline._reward_ref_cnot = 5.0
+    pipeline._reward_ref_fidelity = 0.90
 
-    costs = pipeline._scalarize(
+    costs = pipeline._compute_reward(
         np.asarray([0.99, 0.99], dtype=np.float32),
         np.asarray([12, 8], dtype=np.int32),
         np.asarray([6, 4], dtype=np.int32),
@@ -582,6 +576,7 @@ def test_qiskit_reconstruction_matches_internal_optimizer_unitary():
         top_k=0,
         max_gates=28,
         num_restarts=3,
+        fast_runtime=False,
     )
 
     verified_f, gate_specs, opt_params, _ = verifier.optimize_circuit_with_params(

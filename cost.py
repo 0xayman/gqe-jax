@@ -48,10 +48,11 @@ def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array
 def compose_unitary_batch(gate_batch: jax.Array) -> jax.Array:
     batch_size = gate_batch.shape[0]
     d = gate_batch.shape[-1]
-    init = jnp.broadcast_to(jnp.eye(d, dtype=gate_batch.dtype), (batch_size, d, d))
+    dtype = gate_batch.dtype
+    init = jnp.broadcast_to(jnp.eye(d, dtype=dtype), (batch_size, d, d))
 
     def step(unitary, gate):
-        return gate @ unitary, None
+        return jnp.matmul(gate, unitary), None
 
     unitary, _ = jax.lax.scan(step, init, jnp.swapaxes(gate_batch, 0, 1))
     return unitary

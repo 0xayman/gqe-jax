@@ -111,61 +111,75 @@ class ParetoGDConfig:
 
 
 @dataclass(frozen=True)
-class ParetoConfig:
-    """Configuration for Pareto-front tracking plus QASER-style reward shaping.
+class RewardConfig:
+    """Configuration for the GQE reward function (see docs/gqe_reward_design.tex).
 
-    When enabled, the training pipeline still maintains a Pareto archive over:
-      - fidelity (maximize)
-      - depth (minimize)
-      - cnot_count (minimize)
+    Total reward:
+        R_total(x) = R_local(x | x_ref) + R_pareto(x; A_t)
 
-    Replay training, however, uses a stationary QASER-inspired scalar cost:
+    Local comparison reward (piecewise in ΔΦ = Φ(F) - Φ(F_ref)):
+        Φ(F) = -log(1 - F + ε_φ)    [log-infidelity utility]
+        w(F) = σ((F - F_gate) / τ)   [soft fidelity gate]
+        G_D  = [log((D_ref+1)/(D+1))]+    [positive depth gain]
+        G_C  = [log((C_ref+1)/(C+1))]+    [positive CNOT gain]
+        P_D  = [log((D+1)/(D_ref+1))]+    [depth regression]
+        P_C  = [log((C+1)/(C_ref+1))]+    [CNOT regression]
 
-      phi(F) = clip(-log(1 - F + eps), 0, phi_max)
-      B(D, C) = lambda_depth * (D_ref + 1) / (D + 1)
-              + lambda_cnot  * (C_ref + 1) / (C + 1)
-      p(F) = clip(
-               (F - structure_ramp_start)
-               / max(fidelity_threshold - structure_ramp_start, eps),
-               0, 1
-             )
-      s(F) = structure_weight_min
-           + (structure_weight_max - structure_weight_min) * p(F) ** structure_ramp_power
-      score = phi(F) * max(structure_score_offset + s(F) * (B - 1), eps)
-      cost = -score
+        Regime 1 (ΔΦ < -δ_bad):
+            R_local = -α_bad * (exp(κ_bad * (-ΔΦ - δ_bad)) - 1)
+        Regime 2 (-δ_bad ≤ ΔΦ < 0):
+            R_local = -α_soft * (exp(κ_soft * (-ΔΦ)) - 1)
+                    + η * w(F_ref) * (exp(λ_D*G_D + λ_C*G_C) - 1)
+        Regime 3 (ΔΦ ≥ 0):
+            R_local = α_good * (exp(κ_good * ΔΦ) - 1)
+                    + w(F) * (exp(λ_D*G_D + λ_C*G_C) - 1)
+                    - w(F) * (μ_D*P_D + μ_C*P_C)
 
-    The structure references (D_ref, C_ref) are initialized during the
-    fidelity-only warmup from the best warmup circuit by fidelity, then kept
-    fixed or updated slowly via an EMA when higher-fidelity circuits appear.
-    Equal-fidelity but structurally better circuits are allowed to refresh the
-    references after warmup so the reward does not freeze once fidelity saturates.
+    Pareto proxy bonus:
+        R_pareto = β_1 * [non-dominated w.r.t. archive] + β_2 * N_dom
 
-    Legacy Pareto scalarization fields are retained for config compatibility.
-    The fidelity threshold is also used as the point where structure pressure
-    reaches full strength, in addition to Pareto summary tags plus
-    depth-focused final-circuit selection.
+    The archive tracks non-dominated circuits over (fidelity↑, depth↓, cnot↓).
     """
 
-    enabled: bool = False          # set to true in config.yml to activate
-    fidelity_floor: float = 0.5    # circuits below this fidelity are not archived
-    fidelity_floor_late: float = 0.9  # floor raised to this after floor_ramp_epoch
-    floor_ramp_epoch: int = 100    # epoch at which the floor is raised
-    max_archive_size: int = 500    # cap on archive size (pruned by crowding distance)
-    lambda_depth: float = 0.35     # structure bonus weight for depth
-    lambda_cnot: float = 0.65      # structure bonus weight for CNOT count
-    structure_score_offset: float = 1.0  # additive offset inside phi(F) * (...)
-    fidelity_log_eps: float = 1.0e-8  # numerical epsilon in -log(1 - F + eps)
-    fidelity_log_cap: float = 12.0  # upper clip for the fidelity shaping term
-    reference_ema: float = 0.0     # 0 = freeze refs after warmup; >0 updates slowly
-    structure_weight_min: float = 0.15  # nonzero structure pressure even at low fidelity
-    structure_weight_max: float = 2.0   # full structure pressure once fidelity is high
-    structure_ramp_start: float = 0.90  # keep structure pressure near-min below this fidelity
-    structure_ramp_power: float = 4.0   # higher = stay fidelity-first for longer
-    alpha_F: float = 3.0           # legacy/unused by reward; kept for compatibility
-    alpha_d: float = 1.0           # legacy/unused by reward; kept for compatibility
-    alpha_c: float = 1.0           # legacy/unused by reward; kept for compatibility
-    w_F_min: float = 0.6           # legacy/unused by reward; kept for compatibility
-    fidelity_threshold: float = 0.99  # full structure pressure + Pareto depth/CNOT threshold
+    # ── Pareto archive ────────────────────────────────────────────────────────
+    enabled: bool = True
+    fidelity_floor: float = 0.5
+    fidelity_floor_late: float = 0.9
+    floor_ramp_epoch: int = 100
+    max_archive_size: int = 500
+    fidelity_threshold: float = 0.99   # used for archive queries and logging
+
+    # ── Log-infidelity utility ────────────────────────────────────────────────
+    eps_phi: float = 1.0e-8            # ε_φ in Φ(F) = -log(1 - F + ε_φ)
+
+    # ── Soft fidelity gate ────────────────────────────────────────────────────
+    f_gate: float = 0.90               # F_gate: centre of sigmoid gate
+    tau: float = 0.05                  # τ: gate temperature (smaller = sharper)
+
+    # ── Bad-drop threshold ────────────────────────────────────────────────────
+    delta_bad: float = 0.5             # δ_bad: separates mild from clearly bad drops
+
+    # ── Penalty / reward magnitudes and steepnesses ───────────────────────────
+    alpha_bad: float = 2.0             # α_bad
+    kappa_bad: float = 1.0             # κ_bad
+    alpha_soft: float = 0.5            # α_soft
+    kappa_soft: float = 1.0            # κ_soft
+    alpha_good: float = 1.0            # α_good
+    kappa_good: float = 1.0            # κ_good
+
+    # ── Structure terms ───────────────────────────────────────────────────────
+    lambda_d: float = 0.4              # λ_D: depth-improvement bonus weight
+    lambda_c: float = 0.6              # λ_C: CNOT-improvement bonus weight
+    mu_d: float = 0.1                  # μ_D: depth-regression penalty (0 = off)
+    mu_c: float = 0.2                  # μ_C: CNOT-regression penalty (0 = off)
+    eta: float = 0.3                   # η ∈ [0,1]: structure-reward fraction in mild-drop regime
+
+    # ── Pareto proxy bonus ────────────────────────────────────────────────────
+    beta_1: float = 0.5                # β_1: bonus for entering the non-dominated front
+    beta_2: float = 0.05               # β_2: bonus per archive point dominated
+
+    # ── Reference update ──────────────────────────────────────────────────────
+    reference_ema: float = 0.0         # 0 = hard update; >0 = EMA blend
 
 
 @dataclass(frozen=True)
@@ -178,7 +192,7 @@ class GQEConfig:
     logging: LoggingConfig
     pool: PoolConfig = field(default_factory=PoolConfig)
     continuous_opt: ContinuousOptConfig = field(default_factory=ContinuousOptConfig)
-    pareto: ParetoConfig = field(default_factory=ParetoConfig)
+    reward: RewardConfig = field(default_factory=RewardConfig)
     pareto_gd: ParetoGDConfig = field(default_factory=ParetoGDConfig)
 
 
@@ -302,57 +316,51 @@ def validate_config(raw: dict) -> None:
         if not (0.0 < pgd.get("fidelity_eps", 1e-6) < 1.0):
             raise ValueError("pareto_gd.fidelity_eps must be in (0, 1)")
 
-    p = raw.get("pareto", {})
-    if p:
-        _require_bool("pareto.enabled", p.get("enabled", False))
-        if not (0.0 <= p.get("fidelity_floor", 0.5) <= 1.0):
-            raise ValueError("pareto.fidelity_floor must be in [0, 1]")
-        if not (0.0 <= p.get("fidelity_floor_late", 0.9) <= 1.0):
-            raise ValueError("pareto.fidelity_floor_late must be in [0, 1]")
-        if p.get("fidelity_floor", 0.5) > p.get("fidelity_floor_late", 0.9):
-            raise ValueError("pareto.fidelity_floor must be <= fidelity_floor_late")
-        if p.get("floor_ramp_epoch", 100) < 0:
-            raise ValueError("pareto.floor_ramp_epoch must be >= 0")
-        if p.get("max_archive_size", 500) <= 0:
-            raise ValueError("pareto.max_archive_size must be positive")
-        if p.get("lambda_depth", 0.35) < 0.0:
-            raise ValueError("pareto.lambda_depth must be >= 0")
-        if p.get("lambda_cnot", 0.65) < 0.0:
-            raise ValueError("pareto.lambda_cnot must be >= 0")
-        if p.get("lambda_depth", 0.35) + p.get("lambda_cnot", 0.65) <= 0.0:
-            raise ValueError("pareto.lambda_depth + pareto.lambda_cnot must be > 0")
-        if p.get("structure_score_offset", 1.0) <= 0.0:
-            raise ValueError("pareto.structure_score_offset must be positive")
-        if p.get("fidelity_log_eps", 1e-8) <= 0.0:
-            raise ValueError("pareto.fidelity_log_eps must be positive")
-        if p.get("fidelity_log_cap", 12.0) <= 0.0:
-            raise ValueError("pareto.fidelity_log_cap must be positive")
-        if not (0.0 <= p.get("reference_ema", 0.0) <= 1.0):
-            raise ValueError("pareto.reference_ema must be in [0, 1]")
-        if p.get("structure_weight_min", 0.15) < 0.0:
-            raise ValueError("pareto.structure_weight_min must be >= 0")
-        if p.get("structure_weight_max", 2.0) <= 0.0:
-            raise ValueError("pareto.structure_weight_max must be positive")
-        if p.get("structure_weight_max", 2.0) < p.get("structure_weight_min", 0.15):
-            raise ValueError(
-                "pareto.structure_weight_max must be >= pareto.structure_weight_min"
-            )
-        if not (0.0 <= p.get("structure_ramp_start", 0.90) < p.get("fidelity_threshold", 0.99)):
-            raise ValueError(
-                "pareto.structure_ramp_start must be in [0, pareto.fidelity_threshold)"
-            )
-        if p.get("structure_ramp_power", 4.0) <= 0.0:
-            raise ValueError("pareto.structure_ramp_power must be positive")
-        if p.get("alpha_F", 3.0) <= 0:
-            raise ValueError("pareto.alpha_F must be positive")
-        if p.get("alpha_d", 1.0) <= 0:
-            raise ValueError("pareto.alpha_d must be positive")
-        if p.get("alpha_c", 1.0) <= 0:
-            raise ValueError("pareto.alpha_c must be positive")
-        if not (0.0 <= p.get("w_F_min", 0.6) < 1.0):
-            raise ValueError("pareto.w_F_min must be in [0, 1)")
-        if not (0.0 < p.get("fidelity_threshold", 0.99) <= 1.0):
-            raise ValueError("pareto.fidelity_threshold must be in (0, 1]")
+    r = raw.get("reward", {})
+    if r:
+        _require_bool("reward.enabled", r.get("enabled", True))
+        if not (0.0 <= r.get("fidelity_floor", 0.5) <= 1.0):
+            raise ValueError("reward.fidelity_floor must be in [0, 1]")
+        if not (0.0 <= r.get("fidelity_floor_late", 0.9) <= 1.0):
+            raise ValueError("reward.fidelity_floor_late must be in [0, 1]")
+        if r.get("fidelity_floor", 0.5) > r.get("fidelity_floor_late", 0.9):
+            raise ValueError("reward.fidelity_floor must be <= reward.fidelity_floor_late")
+        if r.get("floor_ramp_epoch", 100) < 0:
+            raise ValueError("reward.floor_ramp_epoch must be >= 0")
+        if r.get("max_archive_size", 500) <= 0:
+            raise ValueError("reward.max_archive_size must be positive")
+        if not (0.0 < r.get("fidelity_threshold", 0.99) <= 1.0):
+            raise ValueError("reward.fidelity_threshold must be in (0, 1]")
+        if r.get("eps_phi", 1e-8) <= 0.0:
+            raise ValueError("reward.eps_phi must be positive")
+        if not (0.0 <= r.get("f_gate", 0.90) < 1.0):
+            raise ValueError("reward.f_gate must be in [0, 1)")
+        if r.get("tau", 0.05) <= 0.0:
+            raise ValueError("reward.tau must be positive")
+        if r.get("delta_bad", 0.5) < 0.0:
+            raise ValueError("reward.delta_bad must be >= 0")
+        for _field in ("alpha_bad", "kappa_bad", "alpha_soft", "kappa_soft",
+                       "alpha_good", "kappa_good"):
+            if r.get(_field, 1.0) <= 0.0:
+                raise ValueError(f"reward.{_field} must be positive")
+        if r.get("lambda_d", 0.4) < 0.0:
+            raise ValueError("reward.lambda_d must be >= 0")
+        if r.get("lambda_c", 0.6) < 0.0:
+            raise ValueError("reward.lambda_c must be >= 0")
+        if r.get("lambda_d", 0.4) + r.get("lambda_c", 0.6) <= 0.0:
+            raise ValueError("reward.lambda_d + reward.lambda_c must be > 0")
+        if r.get("mu_d", 0.1) < 0.0:
+            raise ValueError("reward.mu_d must be >= 0")
+        if r.get("mu_c", 0.2) < 0.0:
+            raise ValueError("reward.mu_c must be >= 0")
+        if not (0.0 <= r.get("eta", 0.3) <= 1.0):
+            raise ValueError("reward.eta must be in [0, 1]")
+        if r.get("beta_1", 0.5) < 0.0:
+            raise ValueError("reward.beta_1 must be >= 0")
+        if r.get("beta_2", 0.05) < 0.0:
+            raise ValueError("reward.beta_2 must be >= 0")
+        if not (0.0 <= r.get("reference_ema", 0.0) <= 1.0):
+            raise ValueError("reward.reference_ema must be in [0, 1]")
 
 
 def load_config(path: str) -> GQEConfig:
@@ -374,7 +382,7 @@ def load_config(path: str) -> GQEConfig:
     validate_config(raw)
     pool_raw = raw.get("pool", {})
     co_raw = raw.get("continuous_opt", {})
-    pareto_raw = raw.get("pareto", {})
+    reward_raw = raw.get("reward", {})
     pareto_gd_raw = raw.get("pareto_gd", {})
     return GQEConfig(
         target=TargetConfig(**raw["target"]),
@@ -387,6 +395,6 @@ def load_config(path: str) -> GQEConfig:
         buffer=BufferConfig(**raw["buffer"]),
         logging=LoggingConfig(**raw["logging"]),
         continuous_opt=ContinuousOptConfig(**co_raw) if co_raw else ContinuousOptConfig(),
-        pareto=ParetoConfig(**pareto_raw) if pareto_raw else ParetoConfig(),
+        reward=RewardConfig(**reward_raw) if reward_raw else RewardConfig(),
         pareto_gd=ParetoGDConfig(**pareto_gd_raw) if pareto_gd_raw else ParetoGDConfig(),
     )
