@@ -72,45 +72,6 @@ class ContinuousOptConfig:
 
 
 @dataclass(frozen=True)
-class ParetoGDConfig:
-    """Configuration for post-training gradient-descent optimization of
-    Pareto-optimal circuits.
-
-    After the generative training loop finishes, gradient descent is run on
-    the rotation-gate angles of every Pareto-archived circuit whose fidelity
-    is below ``1.0 - fidelity_eps``.  The gate structure is kept fixed; only
-    the continuous angles are optimised.
-
-    Attributes
-    ----------
-    enabled:
-        Set to ``true`` to activate post-training GD optimization.
-    steps:
-        Number of optimizer iterations per circuit.
-        For L-BFGS 200 steps is usually sufficient; Adam may need more.
-    lr:
-        Learning rate / step size for the optimizer.
-    optimizer:
-        ``"lbfgs"`` (recommended) or ``"adam"``.
-    num_restarts:
-        Number of independent random angle initialisations.  The restart
-        with the highest fidelity is kept.  Higher values improve the chance
-        of escaping local minima at the cost of more compute.
-    fidelity_eps:
-        Circuits with fidelity >= ``1 - fidelity_eps`` are considered perfect
-        and are skipped.  Default ``1e-6`` treats anything above 0.999999 as
-        already optimal.
-    """
-
-    enabled: bool = False
-    steps: int = 200
-    lr: float = 0.1
-    optimizer: str = "lbfgs"
-    num_restarts: int = 3
-    fidelity_eps: float = 1e-6
-
-
-@dataclass(frozen=True)
 class RewardConfig:
     """Configuration for the GQE reward function (see docs/gqe_reward_design.tex).
 
@@ -193,7 +154,6 @@ class GQEConfig:
     pool: PoolConfig = field(default_factory=PoolConfig)
     continuous_opt: ContinuousOptConfig = field(default_factory=ContinuousOptConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
-    pareto_gd: ParetoGDConfig = field(default_factory=ParetoGDConfig)
 
 
 VALID_TARGET_TYPES = {"random", "random_reachable", "haar_random", "file"}
@@ -299,23 +259,6 @@ def validate_config(raw: dict) -> None:
         if co.get("num_restarts", 1) < 1:
             raise ValueError("continuous_opt.num_restarts must be >= 1")
 
-    pgd = raw.get("pareto_gd", {})
-    if pgd:
-        _require_bool("pareto_gd.enabled", pgd.get("enabled", False))
-        if pgd.get("steps", 1) <= 0:
-            raise ValueError("pareto_gd.steps must be positive")
-        if pgd.get("lr", 0.1) <= 0:
-            raise ValueError("pareto_gd.lr must be positive")
-        if pgd.get("optimizer", "lbfgs") not in {"lbfgs", "adam"}:
-            raise ValueError(
-                f"Invalid pareto_gd.optimizer: {pgd['optimizer']!r}. "
-                "Must be 'lbfgs' or 'adam'."
-            )
-        if pgd.get("num_restarts", 1) < 1:
-            raise ValueError("pareto_gd.num_restarts must be >= 1")
-        if not (0.0 < pgd.get("fidelity_eps", 1e-6) < 1.0):
-            raise ValueError("pareto_gd.fidelity_eps must be in (0, 1)")
-
     r = raw.get("reward", {})
     if r:
         _require_bool("reward.enabled", r.get("enabled", True))
@@ -383,7 +326,6 @@ def load_config(path: str) -> GQEConfig:
     pool_raw = raw.get("pool", {})
     co_raw = raw.get("continuous_opt", {})
     reward_raw = raw.get("reward", {})
-    pareto_gd_raw = raw.get("pareto_gd", {})
     return GQEConfig(
         target=TargetConfig(**raw["target"]),
         pool=PoolConfig(
@@ -396,5 +338,4 @@ def load_config(path: str) -> GQEConfig:
         logging=LoggingConfig(**raw["logging"]),
         continuous_opt=ContinuousOptConfig(**co_raw) if co_raw else ContinuousOptConfig(),
         reward=RewardConfig(**reward_raw) if reward_raw else RewardConfig(),
-        pareto_gd=ParetoGDConfig(**pareto_gd_raw) if pareto_gd_raw else ParetoGDConfig(),
     )

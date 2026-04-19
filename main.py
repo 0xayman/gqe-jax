@@ -321,7 +321,7 @@ def main():
     report_indices, report_source = _select_report_token_sequence(
         best_indices,
         pareto_archive,
-        cfg.pareto.fidelity_threshold,
+        cfg.reward.fidelity_threshold,
     )
     print(f"  Reported circuit source: {report_source}")
 
@@ -389,7 +389,7 @@ def main():
         qiskit_depth,
         qiskit_total,
         qiskit_two_q,
-        cfg.pareto.fidelity_threshold,
+        cfg.reward.fidelity_threshold,
     )
 
 

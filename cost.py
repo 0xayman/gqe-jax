@@ -19,7 +19,7 @@ def _unbiased_std(values: jax.Array) -> jax.Array:
 def process_fidelity(u_target: np.ndarray, u_circuit: np.ndarray) -> float:
     d = u_target.shape[0]
     trace = np.trace(u_target.conj().T @ u_circuit)
-    return float((abs(trace) ** 2) / (d**2))
+    return float(np.clip((abs(trace) ** 2) / (d**2), 0.0, 1.0))
 
 
 def compilation_cost(gate_matrices: List[np.ndarray], u_target: np.ndarray) -> float:
@@ -41,7 +41,7 @@ def build_cost_fn(u_target: np.ndarray) -> Callable[[List[np.ndarray]], float]:
 def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array:
     d = u_target.shape[0]
     trace = jnp.trace(jnp.conjugate(u_target).T @ u_circuit)
-    return (jnp.abs(trace) ** 2) / (d**2)
+    return jnp.clip((jnp.abs(trace) ** 2) / (d**2), 0.0, 1.0)
 
 
 @jax.jit

@@ -302,55 +302,6 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
     if best_indices is not None:
         best_indices = np.asarray(best_indices, dtype=np.int32).tolist()
 
-    # ── Post-training Pareto GD optimization ────────────────────────────────
-    if (
-        cfg.pareto_gd.enabled
-        and pipeline.pareto_archive is not None
-        and len(pipeline.pareto_archive) > 0
-        and u_target is not None
-        and pool is not None
-    ):
-        from pareto_gd_optimizer import ParetoGDOptimizer
-
-        if cfg.logging.verbose:
-            print(
-                f"\n[ParetoGD] Starting post-training gradient-descent "
-                f"optimization on {len(pipeline.pareto_archive)} Pareto circuits "
-                f"(optimizer={cfg.pareto_gd.optimizer}, "
-                f"steps={cfg.pareto_gd.steps}, "
-                f"restarts={cfg.pareto_gd.num_restarts})..."
-            )
-
-        gd_opt = ParetoGDOptimizer(
-            u_target=u_target,
-            num_qubits=cfg.target.num_qubits,
-            max_gates=cfg.model.max_gates_count,
-            steps=cfg.pareto_gd.steps,
-            lr=cfg.pareto_gd.lr,
-            optimizer_type=cfg.pareto_gd.optimizer,
-            num_restarts=cfg.pareto_gd.num_restarts,
-            fidelity_eps=cfg.pareto_gd.fidelity_eps,
-        )
-        # pool_names_no_bos: gate name strings indexed from 0, BOS excluded
-        pool_names_no_bos = [name for name, _ in pool]
-        pipeline.pareto_archive, pipeline.rng_key = gd_opt.optimize_archive(
-            pipeline.pareto_archive,
-            pool_names_no_bos,
-            pipeline.rng_key,
-            verbose=cfg.logging.verbose,
-        )
-
-        if cfg.logging.verbose:
-            archive = pipeline.pareto_archive
-            top = archive.best_by_fidelity()
-            hv = archive.hypervolume_2d()
-            best_f = top.fidelity if top is not None else float("nan")
-            print(
-                f"[ParetoGD] Done — archive size={len(archive)} | "
-                f"hv={hv:.6f} | "
-                f"best_fidelity={best_f:.6f}"
-            )
-
     pipeline.set_cost(None)
     if logger:
         logger.finalize("success")

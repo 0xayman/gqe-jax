@@ -145,7 +145,7 @@ def build_circuit_unitary(
 def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array:
     d = u_target.shape[0]
     overlap = jnp.trace(jnp.conjugate(u_target).T @ u_circuit)
-    return (jnp.abs(overlap) ** 2) / (d**2)
+    return jnp.clip((jnp.abs(overlap) ** 2) / (d**2), 0.0, 1.0)
 
 
 class ContinuousOptimizer:

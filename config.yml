@@ -6,14 +6,14 @@ target:
   path: "targets/haar_random_q3.npy"
 
 pool:
-  rotation_gates: ["rz"] # choose from rz | rx | ry; order is preserved in the pool/Qiskit basis
+  rotation_gates: ["rz", "ry"] # choose from rz | rx | ry; order is preserved in the pool/Qiskit basis
 
 model:
   size: "small" # tiny | small | medium | large
   max_gates_count: 125 # Sequence length N
 
 training:
-  max_epochs: 50
+  max_epochs: 200
   num_samples: 200 # Circuits generated per epoch (rollout size)
   batch_size: 32 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
@@ -23,10 +23,10 @@ training:
   early_stop: false # Stop training once fidelity reaches 1.0
 
 temperature:
-  scheduler: "fixed" # fixed | linear | cosine
-  initial_value: 0.5
+  scheduler: "cosine" # fixed | linear | cosine
+  initial_value: 1.2
   delta: 0.02
-  min_value: 0.1
+  min_value: 0.3
   max_value: 1.5
 
 buffer:
@@ -41,49 +41,41 @@ logging:
 continuous_opt:
   enabled: true
   optimizer: lbfgs # lbfgs | adam
-  steps: 200 # lbfgs: max L-BFGS iterations | adam: gradient steps
+  steps: 300 # lbfgs: max L-BFGS iterations | adam: gradient steps
   lr: 0.1 # lbfgs is ~10x faster than adam for small param counts
   top_k: 0 # optimize all circuits; set to e.g. 20 to only optimize top-20% by discrete fidelity
   num_restarts: 3
 
-pareto_gd:
-  enabled: true # Run GD angle optimization on Pareto circuits after training
-  steps: 200 # Optimizer iterations per circuit (L-BFGS: 200 is usually enough)
-  lr: 0.1 # Learning rate / step size
-  optimizer: lbfgs # lbfgs (recommended) | adam
-  num_restarts: 3 # Random angle restarts — best result is kept
-  fidelity_eps: 1.0e-6 # Circuits with fidelity >= 1-eps are skipped (already perfect)
-
 reward:
   enabled: true
   # ── Pareto archive ───────────────────────────────────────────────────────
-  fidelity_floor: 0.5          # circuits below this fidelity are not archived
-  fidelity_floor_late: 0.9     # floor raised to this after floor_ramp_epoch
-  floor_ramp_epoch: 100        # epoch at which the fidelity floor is raised
+  fidelity_floor: 0.5 # circuits below this fidelity are not archived
+  fidelity_floor_late: 0.9 # floor raised to this after floor_ramp_epoch
+  floor_ramp_epoch: 100 # epoch at which the fidelity floor is raised
   max_archive_size: 500
-  fidelity_threshold: 0.99     # archive query threshold for depth/CNOT reporting
+  fidelity_threshold: 0.99 # archive query threshold for depth/CNOT reporting
   # ── Log-infidelity utility ───────────────────────────────────────────────
-  eps_phi: 1.0e-8              # ε_φ in Φ(F) = -log(1 - F + ε_φ)
+  eps_phi: 1.0e-8 # ε_φ in Φ(F) = -log(1 - F + ε_φ)
   # ── Soft fidelity gate ───────────────────────────────────────────────────
-  f_gate: 0.90                 # F_gate: sigmoid centre; structure matters above this
-  tau: 0.05                    # τ: gate temperature (smaller = sharper transition)
+  f_gate: 0.75 # F_gate: sigmoid centre; structure matters above this
+  tau: 0.05 # τ: gate temperature (smaller = sharper transition)
   # ── Bad-drop threshold ───────────────────────────────────────────────────
-  delta_bad: 0.5               # δ_bad in log-infidelity units; separates mild from bad drops
+  delta_bad: 0.5 # δ_bad in log-infidelity units; separates mild from bad drops
   # ── Penalty / reward scales and steepnesses ─────────────────────────────
-  alpha_bad: 2.0               # α_bad: scale of severe fidelity-drop penalty
-  kappa_bad: 1.0               # κ_bad: steepness of severe penalty
-  alpha_soft: 0.5              # α_soft: scale of mild fidelity-drop penalty
-  kappa_soft: 1.0              # κ_soft: steepness of mild penalty
-  alpha_good: 1.0              # α_good: scale of fidelity-improvement reward
-  kappa_good: 1.0              # κ_good: steepness of fidelity reward
+  alpha_bad: 2.0 # α_bad: scale of severe fidelity-drop penalty
+  kappa_bad: 1.0 # κ_bad: steepness of severe penalty
+  alpha_soft: 0.5 # α_soft: scale of mild fidelity-drop penalty
+  kappa_soft: 1.0 # κ_soft: steepness of mild penalty
+  alpha_good: 1.0 # α_good: scale of fidelity-improvement reward
+  kappa_good: 1.0 # κ_good: steepness of fidelity reward
   # ── Structure terms ──────────────────────────────────────────────────────
-  lambda_d: 0.4                # λ_D: depth-improvement bonus weight
-  lambda_c: 0.6                # λ_C: CNOT-improvement bonus weight (CNOT more costly on HW)
-  mu_d: 0.1                    # μ_D: depth-regression penalty (set 0 to disable)
-  mu_c: 0.2                    # μ_C: CNOT-regression penalty (set 0 to disable)
-  eta: 0.3                     # η ∈ [0,1]: structure-reward fraction in mild-drop regime
+  lambda_d: 0.4 # λ_D: depth-improvement bonus weight
+  lambda_c: 1.0 # λ_C: CNOT-improvement bonus weight (CNOT more costly on HW)
+  mu_d: 0.1 # μ_D: depth-regression penalty (set 0 to disable)
+  mu_c: 0.4 # μ_C: CNOT-regression penalty (set 0 to disable)
+  eta: 0.3 # η ∈ [0,1]: structure-reward fraction in mild-drop regime
   # ── Pareto proxy bonus ───────────────────────────────────────────────────
-  beta_1: 0.5                  # β_1: bonus for entering the non-dominated front
-  beta_2: 0.05                 # β_2: extra bonus per archive point dominated
+  beta_1: 0.5 # β_1: bonus for entering the non-dominated front
+  beta_2: 0.05 # β_2: extra bonus per archive point dominated
   # ── Reference update ─────────────────────────────────────────────────────
-  reference_ema: 0.05          # EMA blend for structure refs; 0 = hard update
+  reference_ema: 0.05 # EMA blend for structure refs; 0 = hard update
