@@ -33,31 +33,72 @@ class ParetoArchive:
     """Maintains the Pareto-optimal set of circuits.
 
     Invariant: no entry in the archive dominates any other entry.
+
+    Maintains sidecar NumPy arrays of objective values to make dominance
+    checks vectorized; this keeps archive updates and batch bonus queries
+    out of Python hot loops.
     """
 
-    def __init__(self, max_size: int = 500, fidelity_floor: float = 0.5):
+    def __init__(
+        self,
+        max_size: int = 500,
+        fidelity_floor: float = 0.5,
+        fidelity_tol: float = 1e-4,
+    ):
+        """Build an empty Pareto archive.
+
+        ``fidelity_tol`` defines when two circuits count as fidelity-tied for
+        the purpose of dominance. With tolerance, a candidate whose fidelity is
+        within ``fidelity_tol`` of an archive entry can still dominate it when
+        its structure (depth or cnot_count) is strictly better. Without this,
+        float-32 jitter produces "non-dominated" near-duplicates that flood the
+        archive and inflate the Pareto bonus signal.
+        """
         self.max_size = max_size
         self.fidelity_floor = fidelity_floor
+        self.fidelity_tol = float(fidelity_tol)
         self._archive: List[ParetoPoint] = []
+        self._fid = np.zeros((0,), dtype=np.float32)
+        self._depth = np.zeros((0,), dtype=np.int32)
+        self._cnot = np.zeros((0,), dtype=np.int32)
+
+    def _rebuild_arrays(self) -> None:
+        if not self._archive:
+            self._fid = np.zeros((0,), dtype=np.float32)
+            self._depth = np.zeros((0,), dtype=np.int32)
+            self._cnot = np.zeros((0,), dtype=np.int32)
+            return
+        self._fid = np.fromiter(
+            (p.fidelity for p in self._archive), dtype=np.float32, count=len(self._archive)
+        )
+        self._depth = np.fromiter(
+            (p.depth for p in self._archive), dtype=np.int32, count=len(self._archive)
+        )
+        self._cnot = np.fromiter(
+            (p.cnot_count for p in self._archive), dtype=np.int32, count=len(self._archive)
+        )
 
     # ------------------------------------------------------------------
     # Core dominance logic
     # ------------------------------------------------------------------
 
     @staticmethod
-    def dominates(a: ParetoPoint, b: ParetoPoint) -> bool:
+    def dominates(
+        a: ParetoPoint, b: ParetoPoint, fidelity_tol: float = 0.0
+    ) -> bool:
         """Return True if a dominates b.
 
         a dominates b iff a is at least as good on every objective
-        and strictly better on at least one.
+        and strictly better on at least one. Fidelity comparison uses
+        ``fidelity_tol`` as a tolerance: within ±tol counts as tied.
         """
         better_or_equal = (
-            a.fidelity >= b.fidelity
+            a.fidelity + fidelity_tol >= b.fidelity
             and a.depth <= b.depth
             and a.cnot_count <= b.cnot_count
         )
         strictly_better = (
-            a.fidelity > b.fidelity
+            a.fidelity > b.fidelity + fidelity_tol
             or a.depth < b.depth
             or a.cnot_count < b.cnot_count
         )
@@ -76,14 +117,35 @@ class ParetoArchive:
         if point.fidelity < self.fidelity_floor:
             return False
 
-        # Reject if any existing member dominates the new point
-        for existing in self._archive:
-            if self.dominates(existing, point):
+        if self._fid.size > 0:
+            pf = np.float32(point.fidelity)
+            pd = np.int32(point.depth)
+            pc = np.int32(point.cnot_count)
+            tol = np.float32(self.fidelity_tol)
+            # Does any archive entry dominate the new point?
+            better_or_equal = (
+                (self._fid + tol >= pf) & (self._depth <= pd) & (self._cnot <= pc)
+            )
+            strictly_better = (
+                (self._fid > pf + tol) | (self._depth < pd) | (self._cnot < pc)
+            )
+            if np.any(better_or_equal & strictly_better):
                 return False
 
-        # Remove members that the new point dominates
-        self._archive = [p for p in self._archive if not self.dominates(point, p)]
+            # Does the new point dominate each archive entry?
+            nd_be = (self._fid <= pf + tol) & (self._depth >= pd) & (self._cnot >= pc)
+            nd_sb = (self._fid + tol < pf) | (self._depth > pd) | (self._cnot > pc)
+            keep = ~(nd_be & nd_sb)
+            if not keep.all():
+                self._archive = [p for p, k in zip(self._archive, keep.tolist()) if k]
+                self._fid = self._fid[keep]
+                self._depth = self._depth[keep]
+                self._cnot = self._cnot[keep]
+
         self._archive.append(point)
+        self._fid = np.append(self._fid, np.float32(point.fidelity))
+        self._depth = np.append(self._depth, np.int32(point.depth))
+        self._cnot = np.append(self._cnot, np.int32(point.cnot_count))
 
         # Prune to max_size if needed
         if self.max_size > 0 and len(self._archive) > self.max_size:
@@ -120,7 +182,11 @@ class ParetoArchive:
             for i in range(1, n - 1):
                 cd[order[i]] += (vals[order[i + 1]] - vals[order[i - 1]]) / val_range
 
-        self._archive.pop(int(np.argmin(cd)))
+        remove_idx = int(np.argmin(cd))
+        self._archive.pop(remove_idx)
+        self._fid = np.delete(self._fid, remove_idx)
+        self._depth = np.delete(self._depth, remove_idx)
+        self._cnot = np.delete(self._cnot, remove_idx)
 
     # ------------------------------------------------------------------
     # Floor management
@@ -130,6 +196,7 @@ class ParetoArchive:
         """Raise the fidelity floor and evict any entries below it."""
         self.fidelity_floor = floor
         self._archive = [p for p in self._archive if p.fidelity >= floor]
+        self._rebuild_arrays()
 
     # ------------------------------------------------------------------
     # Quality metrics
@@ -199,3 +266,41 @@ class ParetoArchive:
 
     def __len__(self) -> int:
         return len(self._archive)
+
+    def bulk_nondominated_mask_and_dom_count(
+        self,
+        fidelities: np.ndarray,
+        depths: np.ndarray,
+        cnot_counts: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized Pareto-proxy queries for a batch of candidates.
+
+        For each candidate i, returns:
+          - whether candidate i is NOT dominated by any archive member
+          - the number of archive members that candidate i dominates
+        """
+        n_cand = int(fidelities.shape[0])
+        if self._fid.size == 0:
+            return (
+                np.ones((n_cand,), dtype=bool),
+                np.zeros((n_cand,), dtype=np.int32),
+            )
+        f = np.asarray(fidelities, dtype=np.float32)[:, None]
+        d = np.asarray(depths, dtype=np.int32)[:, None]
+        c = np.asarray(cnot_counts, dtype=np.int32)[:, None]
+        af = self._fid[None, :]
+        ad = self._depth[None, :]
+        ac = self._cnot[None, :]
+        tol = np.float32(self.fidelity_tol)
+
+        arc_dom_cand_be = (af + tol >= f) & (ad <= d) & (ac <= c)
+        arc_dom_cand_sb = (af > f + tol) | (ad < d) | (ac < c)
+        arc_dom_cand = arc_dom_cand_be & arc_dom_cand_sb
+
+        cand_dom_arc_be = (f + tol >= af) & (d <= ad) & (c <= ac)
+        cand_dom_arc_sb = (f > af + tol) | (d < ad) | (c < ac)
+        cand_dom_arc = cand_dom_arc_be & cand_dom_arc_sb
+
+        is_nondominated = ~arc_dom_cand.any(axis=1)
+        n_dom = cand_dom_arc.sum(axis=1).astype(np.int32)
+        return is_nondominated, n_dom

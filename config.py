@@ -142,6 +142,25 @@ class RewardConfig:
     # ── Reference update ──────────────────────────────────────────────────────
     reference_ema: float = 0.0         # 0 = hard update; >0 = EMA blend
 
+    # ── Absolute fidelity bonus ───────────────────────────────────────────────
+    # Adds α_abs * Φ(F) to every circuit's reward, unconditionally (independent
+    # of reference comparison). Creates a universal pull toward F=1 that
+    # complements the per-bucket relative signal — without it, a circuit at the
+    # bucket ceiling has ΔΦ=0 and gets no fidelity reward for pushing higher.
+    # Default 0 preserves the legacy purely-relative reward.
+    alpha_abs: float = 0.0
+
+    # ── Reference mode ────────────────────────────────────────────────────────
+    # "global":     single (F_ref, D_ref, C_ref) = current best-fidelity (legacy).
+    # "per_bucket": all refs come from the archive entry with cnot ≤ candidate
+    #               that has the highest fidelity. Best CNOT reduction; tends to
+    #               drift away from F=1.
+    # "hybrid":     fidelity terms (ΔΦ, w_F_ref) use the global best-fidelity
+    #               reference; structure terms (D_ref, C_ref) use the per-bucket
+    #               best. Pushes each CNOT bucket toward F=1 while rewarding
+    #               progress at low-CNOT budgets.
+    reference_mode: str = "global"
+
 
 @dataclass(frozen=True)
 class GQEConfig:
@@ -304,6 +323,15 @@ def validate_config(raw: dict) -> None:
             raise ValueError("reward.beta_2 must be >= 0")
         if not (0.0 <= r.get("reference_ema", 0.0) <= 1.0):
             raise ValueError("reward.reference_ema must be in [0, 1]")
+        if r.get("alpha_abs", 0.0) < 0.0:
+            raise ValueError("reward.alpha_abs must be >= 0")
+        if "reference_mode" in r:
+            valid_modes = {"global", "per_bucket", "hybrid"}
+            if r["reference_mode"] not in valid_modes:
+                raise ValueError(
+                    f"reward.reference_mode must be one of {sorted(valid_modes)}, "
+                    f"got {r['reference_mode']!r}"
+                )
 
 
 def load_config(path: str) -> GQEConfig:

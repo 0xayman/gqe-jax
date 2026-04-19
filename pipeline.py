@@ -11,7 +11,9 @@ from flax.training import train_state
 
 from cost import _unbiased_std, compilation_cost_batch_jax, process_fidelity
 from data import BufferDataset, ReplayBuffer
+from kv_rollout import build_kv_rollout_fn
 from loss import reduce_sequence_log_probs
+from model import _SIZES as _MODEL_SIZES
 from pareto import ParetoArchive, ParetoPoint
 
 
@@ -140,6 +142,55 @@ class Pipeline:
     def _make_starting_idx(self, batch_size: int) -> np.ndarray:
         return np.full((batch_size, 1), self.bos_token_id, dtype=np.int32)
 
+    @staticmethod
+    def _make_batch_structure_fn(
+        num_qubits: int,
+        token_qubit0: jax.Array,
+        token_qubit1: jax.Array,
+    ):
+        """Build a JIT function computing (depth, total_gates) for a batch.
+
+        ``token_qubit1`` uses ``-1`` for single-qubit gates. BOS tokens
+        (id ``0``) map to a sentinel that does not advance any qubit's depth.
+        """
+
+        def fn(token_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
+            # token_ids: (B, T) int32 — without BOS.
+            q0 = token_qubit0[token_ids]                          # (B, T)
+            q1 = token_qubit1[token_ids]                          # (B, T)  -1 for single-qubit
+            is_cnot = q1 >= 0
+            q1_safe = jnp.where(is_cnot, q1, 0)
+            total_gates = jnp.full(
+                (token_ids.shape[0],), token_ids.shape[1], dtype=jnp.int32
+            )
+
+            def step(depths, xs):
+                q0_t, q1_t, is_cnot_t, q1_safe_t = xs          # each (B,)
+                batch_idx = jnp.arange(depths.shape[0])
+                d0 = depths[batch_idx, q0_t]
+                d1 = depths[batch_idx, q1_safe_t]
+                new_d = jnp.where(is_cnot_t, jnp.maximum(d0, d1) + 1, d0 + 1)
+                depths = depths.at[batch_idx, q0_t].set(new_d)
+                depths = depths.at[batch_idx, q1_safe_t].set(
+                    jnp.where(is_cnot_t, new_d, depths[batch_idx, q1_safe_t])
+                )
+                return depths, None
+
+            B, T = token_ids.shape
+            init = jnp.zeros((B, num_qubits), dtype=jnp.int32)
+            # scan over time axis
+            q0_T = jnp.transpose(q0, (1, 0))
+            q1_T = jnp.transpose(q1, (1, 0))
+            is_cnot_T = jnp.transpose(is_cnot, (1, 0))
+            q1_safe_T = jnp.transpose(q1_safe, (1, 0))
+            final_depths, _ = jax.lax.scan(
+                step, init, (q0_T, q1_T, is_cnot_T, q1_safe_T)
+            )
+            depths_max = jnp.max(final_depths, axis=1)
+            return depths_max, total_gates
+
+        return fn
+
     def _decode_gate_token_ids(self, token_ids: np.ndarray) -> np.ndarray:
         token_ids = np.asarray(token_ids, dtype=np.int32)
         if token_ids.size == 0:
@@ -236,6 +287,25 @@ class Pipeline:
         self._grpo_step = jax.jit(grpo_step)
         self._rollout_sequence_log_probs = jax.jit(rollout_sequence_log_probs)
         self._generate_rollout = jax.jit(generate_rollout)
+        # KV-cache rollout: O(N) decode instead of O(N^2). Same sampling logic
+        # as ``generate_rollout`` (mask BOS, sample from softmax(-beta * logits)).
+        _arch = _MODEL_SIZES[self.cfg.model.size]
+        self._generate_rollout_kv = build_kv_rollout_fn(
+            n_layer=_arch.n_layer,
+            n_head=_arch.n_head,
+            n_embd=_arch.n_embd,
+            vocab_size=self.vocab_size,
+            batch_size=batch_size,
+            total_len=total_len,
+            bos_token_id=self.bos_token_id,
+        )
+        self._batch_structure_jit = jax.jit(
+            self._make_batch_structure_fn(
+                num_qubits=self.cfg.target.num_qubits,
+                token_qubit0=jnp.asarray(self.token_qubit0, dtype=jnp.int32),
+                token_qubit1=jnp.asarray(self.token_qubit1, dtype=jnp.int32),
+            )
+        )
         if self.u_target_jax is not None:
             self._discrete_cost_batch = jax.jit(
                 lambda token_ids: compilation_cost_batch_jax(
@@ -329,16 +399,17 @@ class Pipeline:
         token_ids: shape (batch, ngates) — gate tokens without BOS.
         Both returned arrays have shape (batch,) and dtype int32.
         """
-        token_ids = np.asarray(token_ids, dtype=np.int32)
-        n = len(token_ids)
-        depths = np.zeros(n, dtype=np.int32)
-        total_gates = np.zeros(n, dtype=np.int32)
-
-        for i, row in enumerate(token_ids):
-            d, t, _ = self.sequence_structure_metrics(row)
-            depths[i] = d
-            total_gates[i] = t
-        return depths, total_gates
+        if token_ids.shape[0] == 0:
+            return (
+                np.zeros((0,), dtype=np.int32),
+                np.zeros((0,), dtype=np.int32),
+            )
+        token_ids_j = jnp.asarray(token_ids, dtype=jnp.int32)
+        depths_j, totals_j = self._batch_structure_jit(token_ids_j)
+        return (
+            np.asarray(depths_j, dtype=np.int32),
+            np.asarray(totals_j, dtype=np.int32),
+        )
 
     def _select_reward_reference_index(
         self,
@@ -473,31 +544,72 @@ class Pipeline:
         depths: np.ndarray,
         cnot_counts: np.ndarray,
     ) -> np.ndarray:
-        """Pareto proxy bonus: β_1 * [non-dominated] + β_2 * N_dom."""
+        """Pareto proxy bonus: β_1 * [non-dominated] + β_2 * N_dom.
+
+        Fully vectorized: O(n_cand * n_archive) NumPy broadcast rather than a
+        Python double loop.
+        """
         r = self.cfg.reward
         beta_1 = np.float32(r.beta_1)
         beta_2 = np.float32(r.beta_2)
         archive = self.pareto_archive
-        n = len(fidelities)
-        bonus = np.zeros(n, dtype=np.float32)
 
-        for i in range(n):
-            pt = ParetoPoint(
-                fidelity=float(fidelities[i]),
-                depth=int(depths[i]),
-                total_gates=0,
-                cnot_count=int(cnot_counts[i]),
-                token_sequence=np.zeros(1, dtype=np.int32),
-                epoch=self._current_epoch,
-            )
-            if any(archive.dominates(e, pt) for e in archive._archive):
-                continue
-            bonus[i] += beta_1
-            bonus[i] += beta_2 * sum(
-                1 for e in archive._archive if archive.dominates(pt, e)
-            )
-
+        is_nd, n_dom = archive.bulk_nondominated_mask_and_dom_count(
+            np.asarray(fidelities, dtype=np.float32),
+            np.asarray(depths, dtype=np.int32),
+            np.asarray(cnot_counts, dtype=np.int32),
+        )
+        bonus = np.where(
+            is_nd,
+            beta_1 + beta_2 * n_dom.astype(np.float32),
+            np.float32(0.0),
+        ).astype(np.float32)
         return bonus
+
+    def _per_bucket_references(
+        self,
+        cnot_counts: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return per-candidate (F_ref, D_ref, C_ref) arrays from the archive.
+
+        For each candidate C_i, picks the archive entry with cnot ≤ C_i that
+        has the highest fidelity (tie-break: lowest depth, then lowest cnot).
+        Candidates with no qualifying archive entry fall back to the global
+        reference scalars.
+        """
+        n_cand = cnot_counts.shape[0]
+        global_F = np.float32(self._reward_ref_fidelity)
+        global_D = np.float32(self._reward_ref_depth)
+        global_C = np.float32(self._reward_ref_cnot)
+
+        archive = self.pareto_archive
+        if archive is None or archive._fid.size == 0:
+            return (
+                np.full((n_cand,), global_F, dtype=np.float32),
+                np.full((n_cand,), global_D, dtype=np.float32),
+                np.full((n_cand,), global_C, dtype=np.float32),
+            )
+
+        af = archive._fid.astype(np.float32)                  # (A,)
+        ad = archive._depth.astype(np.float32)                # (A,)
+        ac = archive._cnot.astype(np.float32)                 # (A,)
+
+        C = np.asarray(cnot_counts, dtype=np.float32)[:, None]  # (n, 1)
+        bucket_mask = ac[None, :] <= C                          # (n, A)
+
+        # Score favours high F, then low D, then low C (lexicographic via scalar).
+        # Scaling: F dominates (range [0, 1] with coefficient 1e6), D next (1e3),
+        # C last (1). All archive ints are small (depth/cnot ≤ a few hundred) so
+        # this composite ordering is exact for realistic sizes.
+        score = af * 1e6 - ad * 1e3 - ac
+        score_masked = np.where(bucket_mask, score[None, :], -np.inf)   # (n, A)
+        best_idx = np.argmax(score_masked, axis=1)                      # (n,)
+        any_valid = bucket_mask.any(axis=1)                             # (n,)
+
+        F_ref = np.where(any_valid, af[best_idx], global_F).astype(np.float32)
+        D_ref = np.where(any_valid, ad[best_idx], global_D).astype(np.float32)
+        C_ref = np.where(any_valid, ac[best_idx], global_C).astype(np.float32)
+        return F_ref, D_ref, C_ref
 
     def _compute_reward(
         self,
@@ -517,14 +629,34 @@ class Pipeline:
         D = np.asarray(depths, dtype=np.float32)
         C = np.asarray(cnot_counts, dtype=np.float32)
 
-        F_ref = np.float32(self._reward_ref_fidelity)
-        D_ref = np.float32(self._reward_ref_depth)
-        C_ref = np.float32(self._reward_ref_cnot)
+        mode = getattr(r, "reference_mode", "global")
+        global_F = np.float32(self._reward_ref_fidelity)
+        global_D = np.float32(self._reward_ref_depth)
+        global_C = np.float32(self._reward_ref_cnot)
+        if mode == "global":
+            F_ref_for_fidelity = global_F
+            D_ref = global_D
+            C_ref = global_C
+        elif mode == "per_bucket":
+            pb_F, pb_D, pb_C = self._per_bucket_references(C.astype(np.int32))
+            F_ref_for_fidelity = pb_F
+            D_ref, C_ref = pb_D, pb_C
+        elif mode == "hybrid":
+            _, pb_D, pb_C = self._per_bucket_references(C.astype(np.int32))
+            F_ref_for_fidelity = global_F
+            D_ref, C_ref = pb_D, pb_C
+        else:
+            raise ValueError(f"Unknown reward.reference_mode: {mode!r}")
 
         # Log-infidelity difference ΔΦ = Φ(F) - Φ(F_ref)
         phi_F = self._phi(F)
-        phi_F_ref = float(self._phi(np.array([F_ref], dtype=np.float32))[0])
-        delta_phi = phi_F - np.float32(phi_F_ref)
+        if np.ndim(F_ref_for_fidelity) == 0:
+            phi_F_ref = np.float32(
+                float(self._phi(np.array([F_ref_for_fidelity], dtype=np.float32))[0])
+            )
+        else:
+            phi_F_ref = self._phi(F_ref_for_fidelity)
+        delta_phi = phi_F - phi_F_ref
 
         # Positive structure gains: G_X = [log((X_ref+1)/(X+1))]+
         G_D = np.maximum(np.float32(0.0), np.log((D_ref + 1.0) / (D + 1.0)))
@@ -534,12 +666,26 @@ class Pipeline:
         P_D = np.maximum(np.float32(0.0), np.log((D + 1.0) / (D_ref + 1.0)))
         P_C = np.maximum(np.float32(0.0), np.log((C + 1.0) / (C_ref + 1.0)))
 
-        # Soft fidelity gates
+        # Soft fidelity gates (uses the same F_ref source as ΔΦ)
         w_F = self.fidelity_gate(F)
-        w_F_ref = float(self.fidelity_gate(np.array([F_ref], dtype=np.float32))[0])
+        if np.ndim(F_ref_for_fidelity) == 0:
+            w_F_ref = np.float32(
+                float(
+                    self.fidelity_gate(
+                        np.array([F_ref_for_fidelity], dtype=np.float32)
+                    )[0]
+                )
+            )
+        else:
+            w_F_ref = self.fidelity_gate(F_ref_for_fidelity)
 
-        # Exponential structure coupling (shared across regimes 2 & 3)
+        # Exponential structure coupling (shared across regimes 2 & 3).
+        # _MAX_EXP_BAD is tighter than _MAX_EXP: with eps_phi=1e-8, Φ(1.0)≈18.4
+        # so regime-1 excess can reach ~18 and exp(18)≈6.6e7, which dominates
+        # GRPO's advantage normalization and causes policy thrash. Clamping at 5
+        # keeps exp(κ·excess)≤148 — strong penalty, still gradient-friendly.
         _MAX_EXP = np.float32(30.0)
+        _MAX_EXP_BAD = np.float32(5.0)
         lam_d = np.float32(r.lambda_d)
         lam_c = np.float32(r.lambda_c)
         struct_arg = np.clip(lam_d * G_D + lam_c * G_C, np.float32(0.0), _MAX_EXP)
@@ -548,7 +694,7 @@ class Pipeline:
         delta_bad = np.float32(r.delta_bad)
 
         # Regime 1: clearly bad fidelity drop (ΔΦ < -δ_bad)
-        excess = np.clip(-delta_phi - delta_bad, np.float32(0.0), _MAX_EXP)
+        excess = np.clip(-delta_phi - delta_bad, np.float32(0.0), _MAX_EXP_BAD)
         r_bad = -np.float32(r.alpha_bad) * (
             np.exp(np.float32(r.kappa_bad) * excess) - np.float32(1.0)
         )
@@ -559,7 +705,7 @@ class Pipeline:
             -np.float32(r.alpha_soft) * (
                 np.exp(np.float32(r.kappa_soft) * neg_dp) - np.float32(1.0)
             )
-            + np.float32(r.eta) * np.float32(w_F_ref) * struct_bonus
+            + np.float32(r.eta) * np.asarray(w_F_ref, dtype=np.float32) * struct_bonus
         )
 
         # Regime 3: non-worse fidelity (ΔΦ ≥ 0)
@@ -578,6 +724,11 @@ class Pipeline:
             r_bad,
             np.where(delta_phi < np.float32(0.0), r_soft, r_good),
         ).astype(np.float32)
+
+        # Add absolute fidelity bonus (ungated; applies to every candidate)
+        alpha_abs = np.float32(getattr(r, "alpha_abs", 0.0))
+        if alpha_abs > 0.0:
+            reward = reward + alpha_abs * phi_F
 
         # Add Pareto proxy bonus
         if self.pareto_archive is not None and (r.beta_1 > 0.0 or r.beta_2 > 0.0):
@@ -672,8 +823,9 @@ class Pipeline:
         if idx is None and (ngates is None or ngates == self.ngates):
             beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
             self.rng_key, rollout_key = jax.random.split(self.rng_key)
+            # KV-cache rollout: O(N) instead of O(N^2) over the transformer.
             return np.asarray(
-                self._generate_rollout(self.state.params, rollout_key, beta),
+                self._generate_rollout_kv(self.state.params, rollout_key, beta),
                 dtype=np.int32,
             )
 

@@ -10,7 +10,7 @@ pool:
 
 model:
   size: "small" # tiny | small | medium | large
-  max_gates_count: 125 # Sequence length N
+  max_gates_count: 96 # Sequence length N
 
 training:
   max_epochs: 200
@@ -41,10 +41,10 @@ logging:
 continuous_opt:
   enabled: true
   optimizer: lbfgs # lbfgs | adam
-  steps: 300 # lbfgs: max L-BFGS iterations | adam: gradient steps
+  steps: 80 # lbfgs: max L-BFGS iterations | adam: gradient steps
   lr: 0.1 # lbfgs is ~10x faster than adam for small param counts
   top_k: 0 # optimize all circuits; set to e.g. 20 to only optimize top-20% by discrete fidelity
-  num_restarts: 3
+  num_restarts: 2
 
 reward:
   enabled: true
@@ -79,3 +79,17 @@ reward:
   beta_2: 0.05 # β_2: extra bonus per archive point dominated
   # ── Reference update ─────────────────────────────────────────────────────
   reference_ema: 0.05 # EMA blend for structure refs; 0 = hard update
+  # ── Absolute fidelity bonus ──────────────────────────────────────────────
+  # Adds α_abs·Φ(F) to every reward, independent of reference. With
+  # eps_phi=1e-8, Φ(1.0)≈18.4. Keep α_abs small so it's a gentle universal
+  # pull toward F=1 without overpowering the per-bucket CNOT-reduction signal
+  # (earlier runs at α_abs=0.1 pulled the policy away from low-CNOT territory).
+  alpha_abs: 0.03
+  # ── Reference mode ───────────────────────────────────────────────────────
+  # global     — single best-fidelity ref (legacy; pushes to F=1 at any CNOT)
+  # per_bucket — per-CNOT-bucket ref for everything (best CNOT reduction;
+  #              tends to drift below F=1 at every bucket)
+  # hybrid     — global ref for fidelity (ΔΦ, gate), per-bucket ref for
+  #              structure (D, C). Pushes each bucket toward F=1 while
+  #              rewarding low-CNOT progress.
+  reference_mode: "per_bucket"
