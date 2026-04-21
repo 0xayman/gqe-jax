@@ -17,8 +17,8 @@ model:
   # max_gates_count: 128
 
 training:
-  max_epochs: 200
-  num_samples: 200 # Circuits generated per epoch (rollout size)
+  max_epochs: 50
+  num_samples: 500 # Circuits generated per epoch (rollout size)
   batch_size: 32 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
   grad_norm_clip: 1.0
@@ -34,7 +34,7 @@ temperature:
   max_value: 1.5
 
 buffer:
-  max_size: 500
+  max_size: 1000
   steps_per_epoch: 4
 
 logging:

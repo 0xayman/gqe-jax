@@ -3,19 +3,16 @@ import jax
 from dotenv import load_dotenv
 
 from config import load_config
-from continuous_optimizer import ContinuousOptimizer
-from cost import build_cost_fn, process_fidelity
+from cost import build_cost_fn
 from gqe import _build_logger, gqe
 from operator_pool import build_operator_pool
+from reporting import (
+    build_reported_circuit,
+    circuit_stats,
+    gate_names_from_token_sequence,
+    select_report_token_sequence,
+)
 from target import build_target
-
-
-def _compose_unitary(gate_matrices, d: int) -> np.ndarray:
-    """Compose an ordered gate list into a single unitary (for result decoding)."""
-    u = np.eye(d, dtype=np.complex128)
-    for gate in gate_matrices:
-        u = gate @ u
-    return u
 
 
 def _basis_gates(rotation_gates: tuple[str, ...] | list[str]) -> list[str]:
@@ -54,142 +51,6 @@ def _compile_target_with_qiskit(
         f"  |  Depth: {compiled.depth()}  |  Gates: {compiled.count_ops()}"
     )
     return compiled
-
-def _circuit_stats(qc) -> tuple[int, int, int]:
-    """Return (depth, total_gates, two_qubit_gates) for a QuantumCircuit."""
-    depth = qc.depth()
-    total = sum(qc.count_ops().values())
-    two_q = sum(1 for inst in qc.data if len(inst.qubits) >= 2)
-    return depth, total, two_q
-
-
-def _build_qiskit_circuit_from_names(gate_names: list[str], num_qubits: int):
-    """Build a Qiskit QuantumCircuit from pool gate name strings.
-
-    Used when continuous_opt is disabled and no gate_specs/opt_params are available.
-    Angles for rotation gates use the pool default (π/4); only structure matters for
-    depth and gate-count comparison.
-    """
-    from qiskit import QuantumCircuit
-
-    qc = QuantumCircuit(num_qubits)
-    default_angle = np.pi / 4
-    def _map_qubit(qubit: int) -> int:
-        return num_qubits - 1 - qubit
-    for name in gate_names:
-        parts = name.split("_")
-        gate_type = parts[0]
-        if gate_type in ("RX", "RY", "RZ"):
-            qubit = int(parts[1][1:])
-            getattr(qc, gate_type.lower())(default_angle, _map_qubit(qubit))
-        elif gate_type == "SX":
-            qubit = int(parts[1][1:])
-            qc.sx(_map_qubit(qubit))
-        elif gate_type == "CNOT":
-            ctrl, tgt = int(parts[1][1:]), int(parts[2][1:])
-            qc.cx(_map_qubit(ctrl), _map_qubit(tgt))
-    return qc
-
-
-_GATE_TOKEN_OFFSET = 2  # BOS=0, STOP=1, gates start at 2
-
-
-def _gate_names_from_token_sequence(token_sequence, pool) -> list[str]:
-    """Decode a BOS-prefixed token sequence into pool gate names.
-
-    Strips the leading BOS and filters any STOP / padding tokens so the result
-    contains only real gate names in emission order.
-    """
-    gate_indices = [
-        int(token_id) - _GATE_TOKEN_OFFSET
-        for token_id in np.asarray(token_sequence, dtype=np.int32)[1:].tolist()
-        if int(token_id) >= _GATE_TOKEN_OFFSET
-    ]
-    return [pool[i][0] for i in gate_indices]
-
-
-def _gate_indices_from_token_sequence(token_sequence) -> list[int]:
-    """Decode a BOS-prefixed token sequence into zero-based pool indices."""
-    return [
-        int(token_id) - _GATE_TOKEN_OFFSET
-        for token_id in np.asarray(token_sequence, dtype=np.int32)[1:].tolist()
-        if int(token_id) >= _GATE_TOKEN_OFFSET
-    ]
-
-
-def _select_report_token_sequence(
-    best_indices,
-    best_angles,
-    pareto_archive,
-    min_fidelity: float,
-):
-    """Select the circuit to report at the end of training.
-
-    When Pareto mode is enabled, depth-focused reporting should come from the
-    archive rather than the raw-fidelity tracker so the selected circuit is
-    consistent with the reported Pareto trade-offs.
-
-    Returns ``(token_sequence, opt_angles, stored_fidelity, source)`` where
-    ``opt_angles`` and ``stored_fidelity`` come from the archive entry when
-    available (so reporting can reproduce the stored fidelity exactly without
-    re-running the angle optimiser).
-    """
-    if pareto_archive is not None and len(pareto_archive) > 0:
-        entries = pareto_archive.to_sorted_list()
-        index_by_id = {id(p): i for i, p in enumerate(entries)}
-
-        best_depth = pareto_archive.best_by_depth(min_fidelity=min_fidelity)
-        if best_depth is not None:
-            i = index_by_id.get(id(best_depth), -1)
-            return (
-                np.asarray(best_depth.token_sequence, dtype=np.int32),
-                best_depth.opt_angles,
-                float(best_depth.fidelity),
-                f"Pareto best depth [{i}]BD (F≥{min_fidelity:.3f})",
-            )
-        best_fidelity = pareto_archive.best_by_fidelity()
-        if best_fidelity is not None:
-            i = index_by_id.get(id(best_fidelity), -1)
-            return (
-                np.asarray(best_fidelity.token_sequence, dtype=np.int32),
-                best_fidelity.opt_angles,
-                float(best_fidelity.fidelity),
-                f"Pareto best fidelity [{i}]BF "
-                f"(no circuit reached F≥{min_fidelity:.3f})",
-            )
-
-    if best_indices is None:
-        return None, None, None, "No circuit available"
-    return (
-        np.asarray(best_indices, dtype=np.int32),
-        best_angles,
-        None,
-        "Raw-fidelity best",
-    )
-
-
-def _build_qiskit_circuit(gate_specs, opt_params, num_qubits):
-    """Build a Qiskit QuantumCircuit from gate_specs and optimized angle params."""
-    from qiskit import QuantumCircuit
-    qc = QuantumCircuit(num_qubits)
-    param_idx = 0
-    def _map_qubit(qubit: int) -> int:
-        return num_qubits - 1 - qubit
-    for spec in gate_specs:
-        if spec.is_parametric:
-            theta = float(opt_params[param_idx])
-            param_idx += 1
-            if spec.gate_type == "RX":
-                qc.rx(theta, _map_qubit(spec.qubits[0]))
-            elif spec.gate_type == "RY":
-                qc.ry(theta, _map_qubit(spec.qubits[0]))
-            elif spec.gate_type == "RZ":
-                qc.rz(theta, _map_qubit(spec.qubits[0]))
-        elif spec.gate_type == "SX":
-            qc.sx(_map_qubit(spec.qubits[0]))
-        elif spec.gate_type == "CNOT":
-            qc.cx(_map_qubit(spec.qubits[0]), _map_qubit(spec.qubits[1]))
-    return qc
 
 
 def _print_pareto_summary(
@@ -309,7 +170,7 @@ def main():
         cfg.target.num_qubits,
         cfg.pool.rotation_gates,
     )
-    qiskit_depth, qiskit_total, qiskit_two_q = _circuit_stats(qiskit_compiled)
+    qiskit_depth, qiskit_total, qiskit_two_q = circuit_stats(qiskit_compiled)
 
     # ── Build cost function ─────────────────────────────────────────────────
     cost_fn = build_cost_fn(u_target)
@@ -326,7 +187,7 @@ def main():
     print(f"  Best raw cost (1 - F): {best_cost:.6f}")
 
     report_indices, report_angles, report_fidelity, report_source = (
-        _select_report_token_sequence(
+        select_report_token_sequence(
             best_indices,
             best_angles,
             pareto_archive,
@@ -336,76 +197,25 @@ def main():
     print(f"  Reported circuit source: {report_source}")
 
     if report_indices is not None:
-        gate_indices = _gate_indices_from_token_sequence(report_indices)
-        gate_names = _gate_names_from_token_sequence(report_indices, pool)
+        gate_names = gate_names_from_token_sequence(report_indices, pool)
         selected_cnot_count = sum(name.startswith("CNOT") for name in gate_names)
         print(f"  Reported circuit ({len(gate_names)} gates):")
         for k, name in enumerate(gate_names):
             print(f"    [{k}] {name}")
 
-        from qiskit.quantum_info import Operator
-
-        if cfg.continuous_opt.enabled and report_angles is not None:
-            # Use the angles that achieved ``report_fidelity`` during training.
-            # ``report_angles`` is aligned with ``report_indices[1:]`` (same
-            # length as max_gates, with zeros at BOS/STOP/non-parametric
-            # positions). Walk the token sequence and pick out the angle at
-            # each surviving parametric-gate position, in emission order.
-            from continuous_optimizer import parse_gate_spec
-
-            gate_specs = [parse_gate_spec(name) for name in gate_names]
-            tokens_no_bos = (
-                np.asarray(report_indices, dtype=np.int32)[1:].tolist()
-            )
-            angles_full = np.asarray(report_angles, dtype=np.float64)
-            compact_params = []
-            name_idx = 0
-            for pos, tok in enumerate(tokens_no_bos):
-                if tok < _GATE_TOKEN_OFFSET:
-                    continue
-                spec = gate_specs[name_idx]
-                if spec.is_parametric:
-                    compact_params.append(float(angles_full[pos]))
-                name_idx += 1
-            opt_params = np.asarray(compact_params, dtype=np.float64)
-            verified_f = (
-                report_fidelity if report_fidelity is not None else float("nan")
-            )
-            gqe_qc = _build_qiskit_circuit(gate_specs, opt_params, cfg.target.num_qubits)
-        elif cfg.continuous_opt.enabled:
-            # Fallback: no stored angles (e.g. raw-fidelity best without an
-            # active archive). Re-optimise to report a coherent fidelity.
-            verifier = ContinuousOptimizer(
-                u_target=u_target,
-                num_qubits=cfg.target.num_qubits,
-                steps=cfg.continuous_opt.steps,
-                lr=cfg.continuous_opt.lr,
-                optimizer_type=cfg.continuous_opt.optimizer,
-                top_k=0,
-                max_gates=cfg.model.max_gates_count,
-                num_restarts=cfg.continuous_opt.num_restarts,
-            )
-            verified_f, gate_specs, opt_params, _ = verifier.optimize_circuit_with_params(
-                gate_names,
-                jax.random.PRNGKey(cfg.training.seed),
-            )
-            gqe_qc = _build_qiskit_circuit(gate_specs, opt_params, cfg.target.num_qubits)
-        else:
-            gate_matrices = [pool[i][1] for i in gate_indices]
-            u_circuit = _compose_unitary(gate_matrices, d)
-            verified_f = process_fidelity(u_target, u_circuit)
-            gate_specs, opt_params = None, None
-            gqe_qc = _build_qiskit_circuit_from_names(gate_names, cfg.target.num_qubits)
-
-        gqe_fidelity = process_fidelity(
-            u_target,
-            np.asarray(Operator(gqe_qc).data, dtype=np.complex128),
+        reported = build_reported_circuit(
+            cfg=cfg,
+            pool=pool,
+            u_target=u_target,
+            report_indices=report_indices,
+            report_angles=report_angles,
+            report_fidelity=report_fidelity,
         )
 
-        print(f"  Reported raw fidelity: {verified_f:.6f}")
-        print(f"  Reported GQE fidelity: {gqe_fidelity:.6f}")
+        print(f"  Reported raw fidelity: {reported.verified_fidelity:.6f}")
+        print(f"  Reported GQE fidelity: {reported.qc_fidelity:.6f}")
         print(f"  Reported raw CNOTs:    {selected_cnot_count}")
-        print(f"  Reported GQE CNOTs:    {int(gqe_qc.count_ops().get('cx', 0))}")
+        print(f"  Reported GQE CNOTs:    {int(reported.qc.count_ops().get('cx', 0))}")
 
     # ── Pareto front summary ─────────────────────────────────────────────────
     _print_pareto_summary(
