@@ -11,7 +11,7 @@ and strictly better on at least one.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -27,6 +27,11 @@ class ParetoPoint:
     cnot_count: int
     token_sequence: np.ndarray  # shape (max_gates_count + 1,) including BOS
     epoch: int
+    # Optimised rotation angles aligned to the non-BOS portion of
+    # ``token_sequence`` (shape ``(max_gates_count,)``). Stored so downstream
+    # reporting can rebuild the exact circuit without re-running the angle
+    # optimiser from a fresh RNG state.
+    opt_angles: Optional[np.ndarray] = None
 
 
 class ParetoArchive:
@@ -263,6 +268,11 @@ class ParetoArchive:
         """Return the shallowest entry among circuits with fidelity >= min_fidelity."""
         candidates = [p for p in self._archive if p.fidelity >= min_fidelity]
         return min(candidates, key=lambda p: p.depth) if candidates else None
+
+    def best_by_total_gates(self, min_fidelity: float = 0.0) -> Optional[ParetoPoint]:
+        """Return the entry with fewest total gates among circuits with fidelity >= min_fidelity."""
+        candidates = [p for p in self._archive if p.fidelity >= min_fidelity]
+        return min(candidates, key=lambda p: p.total_gates) if candidates else None
 
     def __len__(self) -> int:
         return len(self._archive)

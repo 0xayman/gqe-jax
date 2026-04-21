@@ -29,6 +29,10 @@ class GateSpec:
 
 
 def parse_gate_spec(token_name: str) -> GateSpec:
+    # Non-gate vocabulary tokens (BOS, STOP, padding) decode to NOOP so a single
+    # fixed-length tensor can mix real gates and padding without branching.
+    if token_name.startswith("<") and token_name.endswith(">"):
+        return GateSpec("NOOP", (0,), 0.0, is_parametric=False)
     if token_name.startswith(("RX", "RY", "RZ")):
         parts = token_name.split("_")
         axis = parts[0]
@@ -607,12 +611,20 @@ class ContinuousOptimizer:
         qubit0_batch: jax.Array,
         cnot_pair_batch: jax.Array,
         rng_key: jax.Array,
-    ) -> tuple[np.ndarray, jax.Array]:
+    ) -> tuple[np.ndarray, np.ndarray, jax.Array]:
+        """Return ``(fidelities, opt_angles, rng_key)``.
+
+        ``opt_angles`` has shape ``(B, max_gates)`` — optimised angle per
+        position for rows with parametric gates, and the input initial angles
+        (all zeros for NOOP / SX-only rows) elsewhere.
+        """
         has_params = np.asarray(
             np.any(np.asarray(gate_type_ids_batch) < _GATE_TYPE_TO_ID["SX"], axis=1),
             dtype=bool,
         )
-        fidelities = np.zeros((initial_angles_batch.shape[0],), dtype=np.float64)
+        batch_size = initial_angles_batch.shape[0]
+        fidelities = np.zeros((batch_size,), dtype=np.float64)
+        opt_angles = np.asarray(initial_angles_batch, dtype=self._np_real_dtype).copy()
 
         no_param_indices = np.flatnonzero(~has_params)
         if no_param_indices.size > 0:
@@ -628,7 +640,7 @@ class ContinuousOptimizer:
 
         param_indices = np.flatnonzero(has_params)
         if param_indices.size == 0:
-            return fidelities, rng_key
+            return fidelities, opt_angles, rng_key
 
         opt_fidelities, full_params_batch, rng_key = self._optimize_angles_batch(
             jnp.take(initial_angles_batch, param_indices, axis=0),
@@ -639,8 +651,9 @@ class ContinuousOptimizer:
             num_restarts=self.num_restarts,
         )
         fidelities[param_indices] = np.asarray(opt_fidelities, dtype=np.float64)
+        opt_angles[param_indices] = np.asarray(full_params_batch, dtype=self._np_real_dtype)
 
-        return fidelities, rng_key
+        return fidelities, opt_angles, rng_key
 
     def optimize_circuit(self, token_names: list[str], rng_key: jax.Array) -> tuple[float, jax.Array]:
         fidelity, _, _, rng_key = self.optimize_circuit_with_params(token_names, rng_key)
@@ -650,9 +663,13 @@ class ContinuousOptimizer:
         self,
         token_names_batch: list[list[str]],
         rng_key: jax.Array,
-    ) -> tuple[np.ndarray, jax.Array]:
+    ) -> tuple[np.ndarray, np.ndarray, jax.Array]:
         if not token_names_batch:
-            return np.zeros((0,), dtype=np.float64), rng_key
+            return (
+                np.zeros((0,), dtype=np.float64),
+                np.zeros((0, self.max_gates), dtype=self._np_real_dtype),
+                rng_key,
+            )
 
         gate_specs_batch = [
             [parse_gate_spec(name) for name in token_names] for token_names in token_names_batch
@@ -669,22 +686,36 @@ class ContinuousOptimizer:
             rng_key,
         )
 
-    def optimize_token_index_batch(
+    def optimize_token_id_batch(
         self,
         token_ids_batch: np.ndarray | jax.Array,
         rng_key: jax.Array,
-    ) -> tuple[np.ndarray, jax.Array]:
+    ) -> tuple[np.ndarray, np.ndarray, jax.Array]:
+        """Optimise angles for a batch of circuits indexed by vocab token id.
+
+        ``token_ids_batch`` has shape ``(B, max_gates)`` and may contain BOS /
+        STOP / padding tokens — those map to NOOP via the vocab encoding tables
+        set up at construction, contributing identity to the composed unitary.
+
+        Returns ``(fidelities, opt_angles, rng_key)`` where ``opt_angles`` is
+        a ``(B, max_gates)`` array of the optimised angle for each position
+        (zero where the position holds a non-parametric or NOOP token).
+        """
         if (
             self._pool_gate_type_ids is None
             or self._pool_qubit0 is None
             or self._pool_cnot_pair is None
             or self._pool_initial_angles is None
         ):
-            raise ValueError("optimize_token_index_batch requires pool_token_names at construction")
+            raise ValueError("optimize_token_id_batch requires pool_token_names at construction")
 
         token_ids_batch = np.asarray(token_ids_batch, dtype=np.int32)
         if token_ids_batch.size == 0:
-            return np.zeros((0,), dtype=np.float64), rng_key
+            return (
+                np.zeros((0,), dtype=np.float64),
+                np.zeros((0, self.max_gates), dtype=self._np_real_dtype),
+                rng_key,
+            )
 
         token_ids_batch_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)
         initial_angles_batch = jnp.take(self._pool_initial_angles, token_ids_batch_jax, axis=0)

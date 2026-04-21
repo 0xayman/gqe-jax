@@ -25,12 +25,13 @@ from cost import build_cost_fn, process_fidelity
 from data import BufferDataset, ReplayBuffer
 from factory import Factory
 from gqe import gqe
+from kv_rollout import compute_lengths_from_tokens
+from loss import reduce_sequence_log_probs
 from main import _basis_gates, _build_qiskit_circuit, _select_report_token_sequence
 from model import GPT2
 from operator_pool import build_operator_pool
 from pareto import ParetoArchive, ParetoPoint
 from pipeline import Pipeline, _sequence_structure_metrics
-from loss import reduce_sequence_log_probs
 from scheduler import FixedScheduler, LinearScheduler
 from target import build_target
 
@@ -61,7 +62,7 @@ def _tiny_cfg(
             min_value=0.1,
             max_value=1.0,
         ),
-        buffer=BufferConfig(max_size=16, warmup_size=4, steps_per_epoch=1),
+        buffer=BufferConfig(max_size=16, steps_per_epoch=1),
         logging=LoggingConfig(verbose=False, wandb=False),
         continuous_opt=ContinuousOptConfig(
             enabled=continuous_opt_enabled,
@@ -73,14 +74,10 @@ def _tiny_cfg(
         ),
         reward=RewardConfig(
             enabled=pareto_enabled,
+            lambda_structure=0.3,
+            gamma_depth=1.0,
             fidelity_floor=0.0,
-            fidelity_floor_late=0.0,
-            floor_ramp_epoch=10,
             max_archive_size=16,
-            lambda_d=0.35,
-            lambda_c=0.65,
-            eps_phi=1.0e-8,
-            reference_ema=0.0,
             fidelity_threshold=0.99,
         ),
     )
@@ -100,9 +97,10 @@ def _build_pipeline(
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
-    model = GPT2(cfg.model.size, len(pool) + 1)
+    model = GPT2(cfg.model.size, len(pool) + 2)
     pipeline = Pipeline(cfg, cost_fn, pool, model, Factory(), u_target=u_target)
     return pipeline, pool
+
 
 def test_discrete_gqe_smoke():
     cfg = _tiny_cfg(continuous_opt_enabled=False)
@@ -110,12 +108,11 @@ def test_discrete_gqe_smoke():
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
-    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
+    best_cost, best_indices, _best_angles, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
 
     assert 0.0 <= best_cost <= 1.0
     assert isinstance(best_indices, list)
     assert len(best_indices) == cfg.model.max_gates_count + 1
-    # Pareto disabled in tiny cfg (RewardConfig constructed with enabled=False)
     assert pareto_archive is None
 
 
@@ -125,7 +122,7 @@ def test_continuous_gqe_smoke():
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
-    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
+    best_cost, best_indices, _best_angles, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
 
     assert 0.0 <= best_cost <= 1.0
     assert isinstance(best_indices, list)
@@ -133,13 +130,13 @@ def test_continuous_gqe_smoke():
     assert pareto_archive is None
 
 
-def test_pareto_qaser_gqe_smoke():
+def test_pareto_gqe_smoke():
     cfg = _tiny_cfg(continuous_opt_enabled=False, pareto_enabled=True)
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     cost_fn = build_cost_fn(u_target)
 
-    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
+    best_cost, best_indices, _best_angles, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target)
 
     assert 0.0 <= best_cost <= 1.0
     assert isinstance(best_indices, list)
@@ -148,8 +145,8 @@ def test_pareto_qaser_gqe_smoke():
 
 
 def test_report_selection_prefers_pareto_depth_threshold():
-    raw_best = np.asarray([0, 1, 1, 1], dtype=np.int32)
-    shallower = np.asarray([0, 2, 2, 2], dtype=np.int32)
+    raw_best = np.asarray([0, 2, 2, 2], dtype=np.int32)
+    shallower = np.asarray([0, 3, 3, 3], dtype=np.int32)
     archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
     archive.update(
         ParetoPoint(
@@ -172,14 +169,16 @@ def test_report_selection_prefers_pareto_depth_threshold():
         )
     )
 
-    selected, source = _select_report_token_sequence(
+    selected, _angles, _stored_f, source = _select_report_token_sequence(
         raw_best,
+        None,
         archive,
         min_fidelity=0.99,
     )
 
     np.testing.assert_array_equal(selected, shallower)
-    assert source == "Pareto best depth (F≥0.990)"
+    assert source.startswith("Pareto best depth")
+    assert "F≥0.990" in source
 
 
 def test_continuous_optimizer_smoke():
@@ -227,7 +226,7 @@ def test_continuous_optimizer_batch_matches_single():
         ["RX_q1", "RY_q0"],
     ]
 
-    batch_fidelities, _ = optimizer.optimize_batch(circuits, jax.random.PRNGKey(cfg.training.seed))
+    batch_fidelities, _, _ = optimizer.optimize_batch(circuits, jax.random.PRNGKey(cfg.training.seed))
 
     expected = []
     rng_key = jax.random.PRNGKey(cfg.training.seed)
@@ -243,10 +242,12 @@ def test_continuous_optimizer_batch_matches_single():
     )
 
 
-def test_continuous_optimizer_index_batch_matches_name_batch():
+def test_continuous_optimizer_token_id_batch_matches_name_batch():
+    """When padded with STOP, the token-id interface matches the name interface."""
     cfg = _tiny_cfg(continuous_opt_enabled=True)
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
+    vocab_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
     optimizer = ContinuousOptimizer(
         u_target=u_target,
         num_qubits=cfg.target.num_qubits,
@@ -256,20 +257,20 @@ def test_continuous_optimizer_index_batch_matches_name_batch():
         top_k=0,
         max_gates=cfg.model.max_gates_count,
         num_restarts=2,
-        pool_token_names=[name for name, _ in pool],
+        pool_token_names=vocab_names,
     )
     circuits = [
         ["RZ_q0", "SX_q1", "CNOT_q0_q1", "RZ_q1"],
         ["SX_q0", "CNOT_q1_q0", "RZ_q1", "SX_q1"],
     ]
-    name_to_idx = {name: idx for idx, (name, _) in enumerate(pool)}
+    name_to_token = {name: idx for idx, name in enumerate(vocab_names)}
     token_ids = np.asarray(
-        [[name_to_idx[name] for name in circuit] for circuit in circuits],
+        [[name_to_token[name] for name in circuit] for circuit in circuits],
         dtype=np.int32,
     )
 
-    by_name, _ = optimizer.optimize_batch(circuits, jax.random.PRNGKey(cfg.training.seed))
-    by_index, _ = optimizer.optimize_token_index_batch(
+    by_name, _, _ = optimizer.optimize_batch(circuits, jax.random.PRNGKey(cfg.training.seed))
+    by_index, _, _ = optimizer.optimize_token_id_batch(
         token_ids,
         jax.random.PRNGKey(cfg.training.seed),
     )
@@ -282,12 +283,52 @@ def test_continuous_optimizer_index_batch_matches_name_batch():
     )
 
 
-def test_sequence_structure_metrics_reports_depth_and_gate_counts():
+def test_continuous_optimizer_token_id_batch_treats_stop_as_identity():
+    """STOP-padded positions should not affect the fidelity of the real prefix."""
+    cfg = _tiny_cfg(continuous_opt_enabled=True)
+    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
+    u_target, _ = build_target(pool, cfg)
+    vocab_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
+    optimizer = ContinuousOptimizer(
+        u_target=u_target,
+        num_qubits=cfg.target.num_qubits,
+        steps=2,
+        lr=0.1,
+        optimizer_type="lbfgs",
+        top_k=0,
+        max_gates=cfg.model.max_gates_count,
+        num_restarts=1,
+        pool_token_names=vocab_names,
+    )
+    name_to_token = {name: idx for idx, name in enumerate(vocab_names)}
+    short_circuit = ["RZ_q0", "SX_q1"]
+    short_tokens = [name_to_token[n] for n in short_circuit] + [1, 1]  # 1 == STOP
+    padded_tokens = np.asarray([short_tokens], dtype=np.int32)
+
+    by_padded, _, _ = optimizer.optimize_token_id_batch(
+        padded_tokens,
+        jax.random.PRNGKey(cfg.training.seed),
+    )
+    by_name, _, _ = optimizer.optimize_batch(
+        [short_circuit],
+        jax.random.PRNGKey(cfg.training.seed),
+    )
+
+    np.testing.assert_allclose(by_padded, by_name, rtol=1e-6, atol=1e-6)
+
+
+def test_sequence_structure_metrics_skips_noop_tokens():
+    # vocab: BOS=0, STOP=1, gates start at 2
+    token_qubit0 = np.asarray([0, 0, 0, 1, 0, 1], dtype=np.int32)
+    token_qubit1 = np.asarray([-1, -1, -1, -1, 1, -1], dtype=np.int32)
+    token_is_noop = np.asarray([True, True, False, False, False, False], dtype=bool)
+    # sequence (without BOS): gate@q0, gate@q1, CNOT(0,1), gate@q1, STOP
     depth, total_gates, cnot_count = _sequence_structure_metrics(
-        np.asarray([0, 1, 2, 3], dtype=np.int32),
+        np.asarray([2, 3, 4, 5, 1], dtype=np.int32),
         num_qubits=2,
-        token_qubit0=np.asarray([0, 1, 0, 1], dtype=np.int32),
-        token_qubit1=np.asarray([-1, -1, 1, -1], dtype=np.int32),
+        token_qubit0=token_qubit0,
+        token_qubit1=token_qubit1,
+        token_is_noop=token_is_noop,
     )
 
     assert depth == 3
@@ -295,10 +336,24 @@ def test_sequence_structure_metrics_reports_depth_and_gate_counts():
     assert cnot_count == 1
 
 
+def test_compute_lengths_from_tokens_handles_stop_and_no_stop():
+    # row 0: STOP at position 2 → length 3
+    # row 1: no STOP → length = seq_len = 4
+    tokens = jnp.asarray(
+        [
+            [2, 3, 1, 1],
+            [2, 3, 4, 5],
+        ],
+        dtype=jnp.int32,
+    )
+    lengths = compute_lengths_from_tokens(tokens, stop_token_id=1)
+    np.testing.assert_array_equal(np.asarray(lengths), np.asarray([3, 4], dtype=np.int32))
+
+
 def test_replay_buffer_batches_include_behavior_log_probs():
     buffer = ReplayBuffer(size=8)
     for idx, old_log_prob in enumerate([-1.5, -0.5, -2.0, -1.0]):
-        buffer.push([0, idx + 1], 0.1 * idx, old_log_prob)
+        buffer.push([0, idx + 2], 0.1 * idx, old_log_prob)
 
     dataset = BufferDataset(buffer, repetition=1)
     batch = next(
@@ -316,33 +371,34 @@ def test_replay_buffer_batches_include_behavior_log_probs():
     assert np.isfinite(batch["old_log_prob"]).all()
 
 
-def test_replay_buffer_legacy_entries_get_nan_old_log_prob():
-    buffer = ReplayBuffer(size=1)
-    buffer.buf.append((np.asarray([0, 1], dtype=np.int32), np.float32(0.25)))
-
-    item = buffer[0]
-
-    assert np.isnan(item["old_log_prob"])
-
-
-def test_pipeline_rollout_uses_distinct_bos_token():
+def test_pipeline_rollout_uses_distinct_bos_and_stop_tokens():
     pipeline, pool = _build_pipeline(continuous_opt_enabled=False)
 
     rollout = pipeline.generate()
 
     assert rollout.shape == (pipeline.num_samples, pipeline.ngates + 1)
+    # Every sequence starts with BOS.
     assert np.all(rollout[:, 0] == pipeline.bos_token_id)
-    assert np.all(rollout[:, 1:] >= pipeline.gate_token_offset)
-    assert np.all(rollout[:, 1:] < len(pool) + pipeline.gate_token_offset)
+    # Position 1 (first real decision) must not be STOP — min 1 gate.
+    assert np.all(rollout[:, 1] != pipeline.stop_token_id)
+    # Once STOP appears, every subsequent token is also STOP (forced padding).
+    for row in rollout:
+        sub = row[1:]
+        stop_positions = np.where(sub == pipeline.stop_token_id)[0]
+        if stop_positions.size > 0:
+            first = stop_positions[0]
+            assert np.all(sub[first:] == pipeline.stop_token_id)
 
 
 def test_grpo_loss_is_zero_when_batch_costs_are_identical():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False)
     beta = jnp.asarray(pipeline.scheduler.get_inverse_temperature(), dtype=jnp.float32)
+    # Use token ids >= gate_token_offset so STOP doesn't end the sequence early.
+    offset = pipeline.gate_token_offset
     idx = jnp.asarray(
         [
-            [0, 1, 2, 3, 4],
-            [0, 4, 3, 2, 1],
+            [0, offset + 0, offset + 1, offset + 2, offset + 0],
+            [0, offset + 2, offset + 1, offset + 0, offset + 0],
         ],
         dtype=jnp.int32,
     )
@@ -364,39 +420,54 @@ def test_grpo_loss_is_zero_when_batch_costs_are_identical():
     assert float(np.asarray(loss)) == 0.0
 
 
-def test_reduce_sequence_log_probs_is_length_invariant_for_repeated_tokens():
-    short = jnp.asarray([[-0.2, -0.4, -0.6, -0.8]], dtype=jnp.float32)
-    long = jnp.tile(short, (1, 4))
+def test_reduce_sequence_log_probs_length_masks_padding():
+    # Two samples: first has length 2 (padding beyond), second has length 4.
+    lp = jnp.asarray(
+        [
+            [-0.2, -0.4, -5.0, -5.0],  # padding should not count
+            [-0.2, -0.4, -0.6, -0.8],
+        ],
+        dtype=jnp.float32,
+    )
+    lengths = jnp.asarray([2, 4], dtype=jnp.int32)
 
-    short_score = reduce_sequence_log_probs(short)
-    long_score = reduce_sequence_log_probs(long)
+    scores = reduce_sequence_log_probs(lp, lengths)
+    expected = np.asarray(
+        [
+            (-0.2 + -0.4) / 2,
+            (-0.2 + -0.4 + -0.6 + -0.8) / 4,
+        ],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(np.asarray(scores), expected, rtol=0.0, atol=1e-6)
 
-    np.testing.assert_allclose(short_score, long_score, rtol=0.0, atol=1e-7)
+
+def test_reduce_sequence_log_probs_without_lengths_is_plain_mean():
+    lp = jnp.asarray([[-0.2, -0.4, -0.6, -0.8]], dtype=jnp.float32)
+    score = reduce_sequence_log_probs(lp)
+    np.testing.assert_allclose(np.asarray(score), np.asarray([-0.5]), rtol=0.0, atol=1e-6)
 
 
 def test_fixed_scheduler_keeps_inverse_temperature_constant():
     scheduler = FixedScheduler(0.5)
-
     scheduler.update(costs=np.asarray([0.1, 0.2], dtype=np.float32))
-
     assert scheduler.get_inverse_temperature() == 0.5
 
 
 def test_linear_scheduler_matches_previous_annealing_behavior():
     scheduler = LinearScheduler(start=0.5, delta=0.2, minimum=0.1, maximum=0.8)
-
     scheduler.update()
     scheduler.update()
-
     assert scheduler.get_inverse_temperature() == 0.8
 
 
 def test_train_batch_updates_params_with_behavior_log_probs():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False)
+    offset = pipeline.gate_token_offset
     idx = np.asarray(
         [
-            [0, 1, 2, 3, 4],
-            [0, 4, 3, 2, 1],
+            [0, offset + 0, offset + 1, offset + 2, offset + 0],
+            [0, offset + 2, offset + 1, offset + 0, offset + 0],
         ],
         dtype=np.int32,
     )
@@ -427,84 +498,8 @@ def test_train_batch_updates_params_with_behavior_log_probs():
     )
 
 
-def test_qaser_reward_references_initialize_from_best_fidelity_candidate():
-    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-
-    pipeline._update_reward_references(
-        np.asarray([0.70, 0.92, 0.81], dtype=np.float32),
-        np.asarray([3, 7, 2], dtype=np.int32),
-        np.asarray([2, 4, 1], dtype=np.int32),
-    )
-
-    assert pipeline._reward_ref_depth == 7.0
-    assert pipeline._reward_ref_cnot == 4.0
-    assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
-
-
-def test_qaser_reward_references_break_fidelity_ties_by_structure_during_warmup():
-    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-
-    pipeline._update_reward_references(
-        np.asarray([0.92], dtype=np.float32),
-        np.asarray([9], dtype=np.int32),
-        np.asarray([5], dtype=np.int32),
-    )
-    pipeline._update_reward_references(
-        np.asarray([0.92], dtype=np.float32),
-        np.asarray([7], dtype=np.int32),
-        np.asarray([4], dtype=np.int32),
-    )
-
-    assert pipeline._reward_ref_depth == 7.0
-    assert pipeline._reward_ref_cnot == 4.0
-    assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
-
-
-def test_qaser_reward_references_break_fidelity_ties_by_structure_after_warmup():
-    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-    pipeline._warmup_mode = False
-    pipeline._reward_ref_depth = 9.0
-    pipeline._reward_ref_cnot = 5.0
-    pipeline._reward_ref_fidelity = 0.92
-
-    pipeline._update_reward_references(
-        np.asarray([0.92], dtype=np.float32),
-        np.asarray([7], dtype=np.int32),
-        np.asarray([4], dtype=np.int32),
-    )
-
-    assert pipeline._reward_ref_depth == 7.0
-    assert pipeline._reward_ref_cnot == 4.0
-    assert np.isclose(pipeline._reward_ref_fidelity, 0.92)
-
-
-def test_fidelity_gate_is_nonzero_and_increases_with_fidelity():
-    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-
-    gates = pipeline.fidelity_gate(
-        np.asarray([0.10, 0.95, 0.99], dtype=np.float32)
-    )
-
-    assert gates[0] > 0.0
-    assert gates[0] < gates[1] < gates[2]
-
-
-def test_fidelity_gate_is_small_far_below_threshold():
-    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-
-    gates = pipeline.fidelity_gate(
-        np.asarray([0.10, 0.50], dtype=np.float32)
-    )
-
-    # Far below f_gate=0.90, the sigmoid gate is near zero
-    assert all(float(g) < 0.01 for g in gates)
-
-
 def test_reward_prefers_higher_fidelity_at_same_structure():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-    pipeline._reward_ref_depth = 10.0
-    pipeline._reward_ref_cnot = 5.0
-    pipeline._reward_ref_fidelity = 0.90
 
     costs = pipeline._compute_reward(
         np.asarray([0.95, 0.99], dtype=np.float32),
@@ -512,38 +507,12 @@ def test_reward_prefers_higher_fidelity_at_same_structure():
         np.asarray([5, 5], dtype=np.int32),
     )
 
+    # Cost = -reward; higher-fidelity circuit has lower cost.
     assert costs[1] < costs[0]
-
-
-def test_reward_structure_gap_matters_more_at_high_fidelity():
-    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-    pipeline._reward_ref_depth = 10.0
-    pipeline._reward_ref_cnot = 5.0
-    pipeline._reward_ref_fidelity = 0.40
-
-    low_costs = pipeline._compute_reward(
-        np.asarray([0.50, 0.50], dtype=np.float32),
-        np.asarray([12, 8], dtype=np.int32),
-        np.asarray([6, 4], dtype=np.int32),
-    )
-    high_costs = pipeline._compute_reward(
-        np.asarray([0.99, 0.99], dtype=np.float32),
-        np.asarray([12, 8], dtype=np.int32),
-        np.asarray([6, 4], dtype=np.int32),
-    )
-
-    low_gap = float(low_costs[0] - low_costs[1])
-    high_gap = float(high_costs[0] - high_costs[1])
-
-    assert low_gap > 0.0
-    assert high_gap > low_gap
 
 
 def test_reward_prefers_better_structure_at_same_fidelity():
     pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
-    pipeline._reward_ref_depth = 10.0
-    pipeline._reward_ref_cnot = 5.0
-    pipeline._reward_ref_fidelity = 0.90
 
     costs = pipeline._compute_reward(
         np.asarray([0.99, 0.99], dtype=np.float32),
@@ -551,7 +520,23 @@ def test_reward_prefers_better_structure_at_same_fidelity():
         np.asarray([6, 4], dtype=np.int32),
     )
 
+    # Cost = -reward; lower (C+gamma*D) has lower cost.
     assert costs[1] < costs[0]
+
+
+def test_reward_is_simple_linear_formula():
+    pipeline, _ = _build_pipeline(continuous_opt_enabled=False, pareto_enabled=True)
+
+    lam = pipeline.cfg.reward.lambda_structure
+    gamma = pipeline.cfg.reward.gamma_depth
+    L_max = pipeline.ngates
+
+    F = np.asarray([0.5, 0.9], dtype=np.float32)
+    D = np.asarray([2, 4], dtype=np.int32)
+    C = np.asarray([1, 3], dtype=np.int32)
+    costs = pipeline._compute_reward(F, D, C)
+    expected = -(F - lam * (C.astype(np.float32) + gamma * D.astype(np.float32)) / L_max)
+    np.testing.assert_allclose(costs, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_qiskit_reconstruction_matches_internal_optimizer_unitary():
@@ -600,43 +585,6 @@ def test_qiskit_reconstruction_matches_internal_optimizer_unitary():
     assert qc_fidelity > fidelity_threshold
 
 
-def test_continuous_optimizer_index_batch_with_remaining_params():
-    cfg = _tiny_cfg(continuous_opt_enabled=True)
-    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
-    u_target, _ = build_target(pool, cfg)
-    optimizer = ContinuousOptimizer(
-        u_target=u_target,
-        num_qubits=cfg.target.num_qubits,
-        steps=2,
-        lr=0.1,
-        optimizer_type="lbfgs",
-        top_k=0,
-        max_gates=cfg.model.max_gates_count,
-        num_restarts=1,
-        pool_token_names=[name for name, _ in pool],
-    )
-    name_to_idx = {name: idx for idx, (name, _) in enumerate(pool)}
-    token_ids = np.asarray(
-        [
-            [
-                name_to_idx["RZ_q0"],
-                name_to_idx["RZ_q0"],
-                name_to_idx["RZ_q1"],
-                name_to_idx["SX_q1"],
-            ]
-        ],
-        dtype=np.int32,
-    )
-
-    fidelities, _ = optimizer.optimize_token_index_batch(
-        token_ids,
-        jax.random.PRNGKey(cfg.training.seed),
-    )
-
-    assert fidelities.shape == (1,)
-    assert 0.0 <= float(fidelities[0]) <= 1.0
-
-
 def test_build_operator_pool_uses_configured_rotation_gate_order():
     pool = build_operator_pool(num_qubits=1, rotation_gates=("ry", "rx"))
 
@@ -682,7 +630,6 @@ def test_load_config_reads_pool_rotation_gates(tmp_path):
 
             buffer:
               max_size: 4
-              warmup_size: 2
               steps_per_epoch: 1
 
             logging:

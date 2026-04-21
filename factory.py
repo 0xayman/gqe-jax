@@ -35,7 +35,13 @@ class Factory:
             )
         return scheduler_builders[scheduler_type]()
 
-    def create_continuous_optimizer(self, cfg, u_target, pool) -> ContinuousOptimizer | None:
+    def create_continuous_optimizer(
+        self,
+        cfg,
+        u_target,
+        pool,
+        vocab_token_names,
+    ) -> ContinuousOptimizer | None:
         co_cfg = getattr(cfg, "continuous_opt", None)
         if co_cfg is None or not co_cfg.enabled:
             return None
@@ -48,6 +54,6 @@ class Factory:
             top_k=co_cfg.top_k,
             max_gates=cfg.model.max_gates_count,
             num_restarts=co_cfg.num_restarts,
-            pool_token_names=[name for name, _ in pool],
+            pool_token_names=list(vocab_token_names),
             fast_runtime=True,
         )

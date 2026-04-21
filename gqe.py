@@ -10,6 +10,7 @@ import numpy as np
 from config import GQEConfig
 from factory import Factory
 from model import GPT2
+from pareto import ParetoArchive, ParetoPoint
 from pipeline import Pipeline
 
 
@@ -27,6 +28,8 @@ class _WandbLogger:
                 "model_size": cfg.model.size,
                 "max_gates_count": cfg.model.max_gates_count,
                 "max_epochs": cfg.training.max_epochs,
+                "lambda_structure": cfg.reward.lambda_structure,
+                "gamma_depth": cfg.reward.gamma_depth,
             },
         )
 
@@ -57,20 +60,84 @@ def _update_best_from_latest_rollout(
     best_indices,
     best_raw_fidelity: float | None,
     best_cnot_count: int | None,
+    best_angles,
 ):
     if pipeline._last_rollout_costs.size == 0:
-        return best_cost, best_indices, best_raw_fidelity, best_cnot_count
+        return best_cost, best_indices, best_raw_fidelity, best_cnot_count, best_angles
 
     best_idx = int(np.argmin(pipeline._last_rollout_costs))
     rollout_best_cost = float(pipeline._last_rollout_costs[best_idx])
     if rollout_best_cost < best_cost:
+        angles = (
+            np.asarray(pipeline._last_rollout_opt_angles[best_idx], dtype=np.float32)
+            if pipeline._last_rollout_opt_angles.size
+            else None
+        )
         return (
             rollout_best_cost,
             np.asarray(pipeline._last_rollout_indices[best_idx], dtype=np.int32),
             float(pipeline._last_rollout_fidelities[best_idx]),
             int(pipeline._last_rollout_cnot_counts[best_idx]),
+            angles,
         )
-    return best_cost, best_indices, best_raw_fidelity, best_cnot_count
+    return best_cost, best_indices, best_raw_fidelity, best_cnot_count, best_angles
+
+
+def _refine_pareto_archive(pipeline: Pipeline, refine_restarts: int = 16) -> None:
+    """Re-optimise angles for every surviving Pareto entry with more restarts.
+
+    Each archive entry's structure is kept intact; only angles (and thus
+    fidelity) can change. Entries that reach a higher fidelity may dominate
+    previously-kept entries, so the refined points are funnelled through a
+    fresh :class:`ParetoArchive` to let dominance filtering evict redundant
+    circuits.
+    """
+    archive = pipeline.pareto_archive
+    optimizer = pipeline.continuous_optimizer
+    if archive is None or optimizer is None or len(archive) == 0:
+        return
+
+    entries = list(archive._archive)
+    # token_sequence is BOS-prefixed; the optimiser consumes (B, max_gates).
+    token_batch = np.stack(
+        [np.asarray(p.token_sequence, dtype=np.int32)[1:] for p in entries],
+        axis=0,
+    )
+
+    original_restarts = optimizer.num_restarts
+    optimizer.num_restarts = max(refine_restarts, original_restarts)
+    try:
+        new_fidelities, new_angles, pipeline.rng_key = (
+            optimizer.optimize_token_id_batch(token_batch, pipeline.rng_key)
+        )
+    finally:
+        optimizer.num_restarts = original_restarts
+
+    refined = ParetoArchive(
+        max_size=archive.max_size,
+        fidelity_floor=archive.fidelity_floor,
+        fidelity_tol=archive.fidelity_tol,
+    )
+    for p, new_f, new_ang in zip(entries, new_fidelities, new_angles):
+        improved = float(new_f) >= float(p.fidelity)
+        fidelity = max(float(new_f), float(p.fidelity))
+        angles = (
+            np.asarray(new_ang, dtype=np.float32)
+            if improved
+            else p.opt_angles
+        )
+        refined.update(
+            ParetoPoint(
+                fidelity=fidelity,
+                depth=p.depth,
+                total_gates=p.total_gates,
+                cnot_count=p.cnot_count,
+                token_sequence=np.asarray(p.token_sequence, dtype=np.int32).copy(),
+                epoch=p.epoch,
+                opt_angles=angles,
+            )
+        )
+    pipeline.pareto_archive = refined
 
 
 def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None, pool=None):
@@ -81,61 +148,36 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
     best_indices = None
     best_raw_fidelity = None
     best_cnot_count = None
+    best_angles = None
     pipeline._starting_idx = pipeline._make_starting_idx(pipeline.num_samples)
     run_start = time.perf_counter()
 
-    if cfg.logging.verbose:
-        print("Warming up buffer...")
-    while len(pipeline.buffer) < cfg.buffer.warmup_size:
-        pipeline.collect_rollout()
-        best_cost, best_indices, best_raw_fidelity, best_cnot_count = _update_best_from_latest_rollout(
-            pipeline,
-            best_cost,
-            best_indices,
-            best_raw_fidelity,
-            best_cnot_count,
-        )
-
-    # Warmup is fidelity-only. After it ends, replay is rescored with the
-    # full reward using the frozen warmup references.
-    pipeline._warmup_mode = False
-    if pipeline.pareto_archive is not None:
-        pipeline._rescore_replay_buffer()
-
     for epoch in range(cfg.training.max_epochs):
         pipeline._current_epoch = epoch
-
-        # Raise the Pareto fidelity floor once training has matured
-        if (
-            pipeline.pareto_archive is not None
-            and epoch == cfg.reward.floor_ramp_epoch
-        ):
-            pipeline.pareto_archive.set_fidelity_floor(cfg.reward.fidelity_floor_late)
-            if cfg.logging.verbose:
-                print(
-                    f"  [Pareto] Epoch {epoch + 1}: "
-                    f"fidelity floor raised to {cfg.reward.fidelity_floor_late}"
-                )
         epoch_start = time.perf_counter()
 
         pipeline.collect_rollout()
-        best_cost, best_indices, best_raw_fidelity, best_cnot_count = _update_best_from_latest_rollout(
+        (
+            best_cost,
+            best_indices,
+            best_raw_fidelity,
+            best_cnot_count,
+            best_angles,
+        ) = _update_best_from_latest_rollout(
             pipeline,
             best_cost,
             best_indices,
             best_raw_fidelity,
             best_cnot_count,
+            best_angles,
         )
         epoch_best_idx = int(np.argmin(pipeline._last_rollout_costs))
         epoch_best_cost = float(pipeline._last_rollout_costs[epoch_best_idx])
         epoch_best_fidelity = float(pipeline._last_rollout_fidelities[epoch_best_idx])
-        (
-            epoch_best_depth,
-            epoch_best_total_gates,
-            epoch_best_cnot_count,
-        ) = pipeline.sequence_structure_metrics(
-            pipeline._last_rollout_indices[epoch_best_idx, 1:]
-        )
+        epoch_best_depth = int(pipeline._last_rollout_depths[epoch_best_idx])
+        epoch_best_total_gates = int(pipeline._last_rollout_total_gates[epoch_best_idx])
+        epoch_best_cnot_count = int(pipeline._last_rollout_cnot_counts[epoch_best_idx])
+        epoch_mean_length = float(pipeline._last_rollout_lengths.mean()) if pipeline._last_rollout_lengths.size else float("nan")
 
         epoch_losses = []
         dataloader = pipeline.train_dataloader()
@@ -170,31 +212,13 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
                 pipeline.sequence_structure_metrics(np.asarray(best_indices, dtype=np.int32)[1:])
             )
 
-        # ── Pareto metrics for this epoch ───────────────────────────────────
         pareto_size = 0
         pareto_hv = 0.0
         pareto_best_f = float("nan")
         pareto_min_cnot = -1
         pareto_min_depth = -1
+        pareto_min_gates = -1
         pareto_threshold = float(cfg.reward.fidelity_threshold)
-        epoch_fidelity_gate = (
-            float(
-                pipeline.fidelity_gate(
-                    np.asarray([epoch_best_fidelity], dtype=np.float32)
-                )[0]
-            )
-            if pipeline.pareto_archive is not None
-            else float("nan")
-        )
-        run_fidelity_gate = (
-            float(
-                pipeline.fidelity_gate(
-                    np.asarray([run_best_fidelity], dtype=np.float32)
-                )[0]
-            )
-            if pipeline.pareto_archive is not None and np.isfinite(run_best_fidelity)
-            else float("nan")
-        )
         if pipeline.pareto_archive is not None:
             archive = pipeline.pareto_archive
             pareto_size = len(archive)
@@ -205,39 +229,31 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
             pareto_min_cnot = efficient.cnot_count if efficient is not None else -1
             shallow = archive.best_by_depth(min_fidelity=pareto_threshold)
             pareto_min_depth = shallow.depth if shallow is not None else -1
+            fewest = archive.best_by_total_gates(min_fidelity=pareto_threshold)
+            pareto_min_gates = fewest.total_gates if fewest is not None else -1
 
         if cfg.logging.verbose:
-            ref_depth = (
-                float(pipeline._reward_ref_depth)
-                if pipeline._reward_ref_depth is not None
-                else float("nan")
-            )
-            ref_cnot = (
-                float(pipeline._reward_ref_cnot)
-                if pipeline._reward_ref_cnot is not None
-                else float("nan")
-            )
-            ref_fidelity = float(pipeline._reward_ref_fidelity)
             pareto_str = (
                 f" | pareto_size={pareto_size}"
                 f" | hv={pareto_hv:.4f}"
-                f" | lambda=[{cfg.reward.lambda_d:.2f},{cfg.reward.lambda_c:.2f}]"
-                f" | gate=[{epoch_fidelity_gate:.2f},{run_fidelity_gate:.2f}]"
-                f" | ref=[{ref_depth:.2f},{ref_cnot:.2f},{ref_fidelity:.6f}]"
+                f" | pareto_best_F={pareto_best_f:.4f}"
+                f" | best_cnot@{pareto_threshold:.2f}={pareto_min_cnot}"
+                f" | best_depth@{pareto_threshold:.2f}={pareto_min_depth}"
+                f" | best_gates@{pareto_threshold:.2f}={pareto_min_gates}"
                 if pipeline.pareto_archive is not None
                 else ""
             )
             print(
                 f"Epoch {epoch + 1:03d}/{cfg.training.max_epochs:03d}"
                 f" | cost_epoch_best={epoch_best_cost:.6f}"
-                f" | raw_fidelity_epoch_best={epoch_best_fidelity:.6f}"
+                f" | F_epoch_best={epoch_best_fidelity:.6f}"
                 f" | depth_epoch_best={epoch_best_depth}"
-                f" | total_gates_epoch_best={epoch_best_total_gates}"
+                f" | gates_epoch_best={epoch_best_total_gates}"
                 f" | cnot_epoch_best={epoch_best_cnot_count}"
+                f" | mean_len={epoch_mean_length:.1f}"
                 f" | cost_run_best={best_cost:.6f}"
-                f" | raw_fidelity_run_best={run_best_fidelity:.6f}"
+                f" | F_run_best={run_best_fidelity:.6f}"
                 f" | depth_run_best={run_best_depth}"
-                f" | total_gates_run_best={run_best_total_gates}"
                 f" | cnot_run_best={run_best_cnot_count}"
                 f"{pareto_str}"
                 f" | epoch_time={_format_elapsed(epoch_time)}"
@@ -254,21 +270,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
                     "pareto_fidelity_threshold": pareto_threshold,
                     "pareto_min_cnot_at_threshold": float(pareto_min_cnot),
                     "pareto_min_depth_at_threshold": float(pareto_min_depth),
-                    "reward_lambda_d": float(cfg.reward.lambda_d),
-                    "reward_lambda_c": float(cfg.reward.lambda_c),
-                    "reward_fidelity_gate_epoch_best": epoch_fidelity_gate,
-                    "reward_fidelity_gate_run_best": run_fidelity_gate,
-                    "reward_ref_depth": (
-                        float(pipeline._reward_ref_depth)
-                        if pipeline._reward_ref_depth is not None
-                        else float("nan")
-                    ),
-                    "reward_ref_cnot": (
-                        float(pipeline._reward_ref_cnot)
-                        if pipeline._reward_ref_cnot is not None
-                        else float("nan")
-                    ),
-                    "reward_ref_fidelity": float(pipeline._reward_ref_fidelity),
+                    "pareto_min_gates_at_threshold": float(pareto_min_gates),
                 }
             logger.log_metrics(
                 {
@@ -283,6 +285,7 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
                     "total_gates_epoch_best": epoch_best_total_gates,
                     "cnot_count_best": run_best_cnot_count,
                     "cnot_count_epoch_best": epoch_best_cnot_count,
+                    "mean_sampled_length": epoch_mean_length,
                     "inverse_temperature": pipeline.scheduler.get_inverse_temperature(),
                     "epoch_time_sec": epoch_time,
                     "elapsed_time_sec": elapsed,
@@ -302,15 +305,30 @@ def _run_training(cfg: GQEConfig, pipeline: Pipeline, logger=None, u_target=None
     if best_indices is not None:
         best_indices = np.asarray(best_indices, dtype=np.int32).tolist()
 
+    if cfg.logging.verbose and pipeline.pareto_archive is not None and len(pipeline.pareto_archive) > 0:
+        print(
+            f"\nRefining {len(pipeline.pareto_archive)} Pareto entries "
+            f"with extra L-BFGS restarts..."
+        )
+    refine_start = time.perf_counter()
+    _refine_pareto_archive(pipeline)
+    if cfg.logging.verbose and pipeline.pareto_archive is not None:
+        print(
+            f"Pareto refinement done in "
+            f"{_format_elapsed(time.perf_counter() - refine_start)}"
+            f" | surviving entries: {len(pipeline.pareto_archive)}"
+        )
+
     pipeline.set_cost(None)
     if logger:
         logger.finalize("success")
-    return best_cost, best_indices, pipeline.pareto_archive
+    return best_cost, best_indices, best_angles, pipeline.pareto_archive
 
 
 def gqe(cost_fn, pool, cfg: GQEConfig, model=None, u_target=None, logger=None):
     factory = Factory()
     if model is None:
-        model = GPT2(cfg.model.size, len(pool) + 1)
+        # BOS (0) + STOP (1) + len(pool) gate tokens
+        model = GPT2(cfg.model.size, len(pool) + 2)
     pipeline = Pipeline(cfg, cost_fn, pool, model, factory, u_target=u_target)
     return _run_training(cfg, pipeline, logger=logger, u_target=u_target, pool=pool)

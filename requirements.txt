@@ -10,3 +10,4 @@ wandb
 python-dotenv
 pyyaml
 pytest
+pyzx

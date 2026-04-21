@@ -10,7 +10,11 @@ pool:
 
 model:
   size: "small" # tiny | small | medium | large
-  max_gates_count: 96 # Sequence length N
+  # max_gates_count is optional; if omitted it defaults to
+  # config.default_max_gates_count(num_qubits) ~ 2 * 4^n (16 for n=1, 32 for n=2,
+  # 128 for n=3, 512 for n=4, capped at 1023). Override below if you want a
+  # different ceiling; the STOP token lets the transformer end circuits early.
+  # max_gates_count: 128
 
 training:
   max_epochs: 200
@@ -31,65 +35,29 @@ temperature:
 
 buffer:
   max_size: 500
-  warmup_size: 400 # keep warmup > num_samples so structure refs are not set by one rollout
   steps_per_epoch: 4
 
 logging:
   verbose: true
-  wandb: true # Disabled for local single-process runs in this environment
+  wandb: true
 
 continuous_opt:
   enabled: true
   optimizer: lbfgs # lbfgs | adam
-  steps: 80 # lbfgs: max L-BFGS iterations | adam: gradient steps
-  lr: 0.1 # lbfgs is ~10x faster than adam for small param counts
-  top_k: 0 # optimize all circuits; set to e.g. 20 to only optimize top-20% by discrete fidelity
+  steps: 80
+  lr: 0.1
+  top_k: 0
   num_restarts: 2
 
 reward:
   enabled: true
-  # ── Pareto archive ───────────────────────────────────────────────────────
-  fidelity_floor: 0.5 # circuits below this fidelity are not archived
-  fidelity_floor_late: 0.9 # floor raised to this after floor_ramp_epoch
-  floor_ramp_epoch: 100 # epoch at which the fidelity floor is raised
+  # ── Reward: R = F - lambda_structure * (C + gamma_depth * D) / max_gates_count
+  # F is process fidelity, C is CNOT count, D is circuit depth.
+  # Two hyperparameters: lambda_structure and gamma_depth.
+  # Fidelity dominates when far from 1; structure savings matter as F approaches 1.
+  lambda_structure: 0.3 # trade-off weight between fidelity and structure
+  gamma_depth: 1.0 # depth-vs-CNOT relative weight (CNOT-only at 0)
+  # ── Pareto archive (reporting only; does not feed back into reward) ───────
+  fidelity_floor: 0.95 # archive only circuits with F >= 0.95
   max_archive_size: 500
-  fidelity_threshold: 0.99 # archive query threshold for depth/CNOT reporting
-  # ── Log-infidelity utility ───────────────────────────────────────────────
-  eps_phi: 1.0e-8 # ε_φ in Φ(F) = -log(1 - F + ε_φ)
-  # ── Soft fidelity gate ───────────────────────────────────────────────────
-  f_gate: 0.75 # F_gate: sigmoid centre; structure matters above this
-  tau: 0.05 # τ: gate temperature (smaller = sharper transition)
-  # ── Bad-drop threshold ───────────────────────────────────────────────────
-  delta_bad: 0.5 # δ_bad in log-infidelity units; separates mild from bad drops
-  # ── Penalty / reward scales and steepnesses ─────────────────────────────
-  alpha_bad: 2.0 # α_bad: scale of severe fidelity-drop penalty
-  kappa_bad: 1.0 # κ_bad: steepness of severe penalty
-  alpha_soft: 0.5 # α_soft: scale of mild fidelity-drop penalty
-  kappa_soft: 1.0 # κ_soft: steepness of mild penalty
-  alpha_good: 1.0 # α_good: scale of fidelity-improvement reward
-  kappa_good: 1.0 # κ_good: steepness of fidelity reward
-  # ── Structure terms ──────────────────────────────────────────────────────
-  lambda_d: 0.4 # λ_D: depth-improvement bonus weight
-  lambda_c: 1.0 # λ_C: CNOT-improvement bonus weight (CNOT more costly on HW)
-  mu_d: 0.1 # μ_D: depth-regression penalty (set 0 to disable)
-  mu_c: 0.4 # μ_C: CNOT-regression penalty (set 0 to disable)
-  eta: 0.3 # η ∈ [0,1]: structure-reward fraction in mild-drop regime
-  # ── Pareto proxy bonus ───────────────────────────────────────────────────
-  beta_1: 0.5 # β_1: bonus for entering the non-dominated front
-  beta_2: 0.05 # β_2: extra bonus per archive point dominated
-  # ── Reference update ─────────────────────────────────────────────────────
-  reference_ema: 0.05 # EMA blend for structure refs; 0 = hard update
-  # ── Absolute fidelity bonus ──────────────────────────────────────────────
-  # Adds α_abs·Φ(F) to every reward, independent of reference. With
-  # eps_phi=1e-8, Φ(1.0)≈18.4. Keep α_abs small so it's a gentle universal
-  # pull toward F=1 without overpowering the per-bucket CNOT-reduction signal
-  # (earlier runs at α_abs=0.1 pulled the policy away from low-CNOT territory).
-  alpha_abs: 0.03
-  # ── Reference mode ───────────────────────────────────────────────────────
-  # global     — single best-fidelity ref (legacy; pushes to F=1 at any CNOT)
-  # per_bucket — per-CNOT-bucket ref for everything (best CNOT reduction;
-  #              tends to drift below F=1 at every bucket)
-  # hybrid     — global ref for fidelity (ΔΦ, gate), per-bucket ref for
-  #              structure (D, C). Pushes each bucket toward F=1 while
-  #              rewarding low-CNOT progress.
-  reference_mode: "per_bucket"
+  fidelity_threshold: 0.99 # "best by CNOT/depth at F >= threshold" reporting queries

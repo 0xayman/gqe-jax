@@ -53,7 +53,6 @@ def _compile_target_with_qiskit(
         f"  Basis gates: {', '.join(basis_gates)}"
         f"  |  Depth: {compiled.depth()}  |  Gates: {compiled.count_ops()}"
     )
-    print(compiled.draw("text", fold=-1))
     return compiled
 
 def _circuit_stats(qc) -> tuple[int, int, int]:
@@ -92,12 +91,19 @@ def _build_qiskit_circuit_from_names(gate_names: list[str], num_qubits: int):
     return qc
 
 
+_GATE_TOKEN_OFFSET = 2  # BOS=0, STOP=1, gates start at 2
+
+
 def _gate_names_from_token_sequence(token_sequence, pool) -> list[str]:
-    """Decode a BOS-prefixed token sequence into pool gate names."""
+    """Decode a BOS-prefixed token sequence into pool gate names.
+
+    Strips the leading BOS and filters any STOP / padding tokens so the result
+    contains only real gate names in emission order.
+    """
     gate_indices = [
-        int(token_id) - 1
+        int(token_id) - _GATE_TOKEN_OFFSET
         for token_id in np.asarray(token_sequence, dtype=np.int32)[1:].tolist()
-        if int(token_id) > 0
+        if int(token_id) >= _GATE_TOKEN_OFFSET
     ]
     return [pool[i][0] for i in gate_indices]
 
@@ -105,62 +111,61 @@ def _gate_names_from_token_sequence(token_sequence, pool) -> list[str]:
 def _gate_indices_from_token_sequence(token_sequence) -> list[int]:
     """Decode a BOS-prefixed token sequence into zero-based pool indices."""
     return [
-        int(token_id) - 1
+        int(token_id) - _GATE_TOKEN_OFFSET
         for token_id in np.asarray(token_sequence, dtype=np.int32)[1:].tolist()
-        if int(token_id) > 0
+        if int(token_id) >= _GATE_TOKEN_OFFSET
     ]
 
 
-def _select_report_token_sequence(best_indices, pareto_archive, min_fidelity: float):
+def _select_report_token_sequence(
+    best_indices,
+    best_angles,
+    pareto_archive,
+    min_fidelity: float,
+):
     """Select the circuit to report at the end of training.
 
     When Pareto mode is enabled, depth-focused reporting should come from the
     archive rather than the raw-fidelity tracker so the selected circuit is
     consistent with the reported Pareto trade-offs.
+
+    Returns ``(token_sequence, opt_angles, stored_fidelity, source)`` where
+    ``opt_angles`` and ``stored_fidelity`` come from the archive entry when
+    available (so reporting can reproduce the stored fidelity exactly without
+    re-running the angle optimiser).
     """
     if pareto_archive is not None and len(pareto_archive) > 0:
+        entries = pareto_archive.to_sorted_list()
+        index_by_id = {id(p): i for i, p in enumerate(entries)}
+
         best_depth = pareto_archive.best_by_depth(min_fidelity=min_fidelity)
         if best_depth is not None:
+            i = index_by_id.get(id(best_depth), -1)
             return (
                 np.asarray(best_depth.token_sequence, dtype=np.int32),
-                f"Pareto best depth (F≥{min_fidelity:.3f})",
+                best_depth.opt_angles,
+                float(best_depth.fidelity),
+                f"Pareto best depth [{i}]BD (F≥{min_fidelity:.3f})",
             )
         best_fidelity = pareto_archive.best_by_fidelity()
         if best_fidelity is not None:
+            i = index_by_id.get(id(best_fidelity), -1)
             return (
                 np.asarray(best_fidelity.token_sequence, dtype=np.int32),
-                f"Pareto best fidelity (no circuit reached F≥{min_fidelity:.3f})",
+                best_fidelity.opt_angles,
+                float(best_fidelity.fidelity),
+                f"Pareto best fidelity [{i}]BF "
+                f"(no circuit reached F≥{min_fidelity:.3f})",
             )
 
     if best_indices is None:
-        return None, "No circuit available"
-    return np.asarray(best_indices, dtype=np.int32), "Raw-fidelity best"
-
-
-def _print_comparison_table(rows) -> None:
-    """Print a side-by-side comparison table for compiled circuits."""
-    col_w = [10, 12, 9, 15, 17]
-    header = ["", "Fidelity", "Depth", "Total gates", "2-qubit gates"]
-    sep = "+" + "+".join("-" * w for w in col_w) + "+"
-
-    def row(label, fidelity, depth, total, two_q):
-        fid_str = f"{fidelity:.6f}" if fidelity is not None else "1.000000"
-        return (
-            f"| {label:<{col_w[0]-2}} "
-            f"| {fid_str:>{col_w[1]-2}} "
-            f"| {depth:>{col_w[2]-2}} "
-            f"| {total:>{col_w[3]-2}} "
-            f"| {two_q:>{col_w[4]-2}} |"
-        )
-
-    print(f"\n{'=' * 55}")
-    print("Compilation Comparison")
-    print(sep)
-    print(f"| {'':>{col_w[0]-2}} | {header[1]:>{col_w[1]-2}} | {header[2]:>{col_w[2]-2}} | {header[3]:>{col_w[3]-2}} | {header[4]:>{col_w[4]-2}} |")
-    print(sep)
-    for label, fidelity, depth, total, two_q in rows:
-        print(row(label, fidelity, depth, total, two_q))
-    print(sep)
+        return None, None, None, "No circuit available"
+    return (
+        np.asarray(best_indices, dtype=np.int32),
+        best_angles,
+        None,
+        "Raw-fidelity best",
+    )
 
 
 def _build_qiskit_circuit(gate_specs, opt_params, num_qubits):
@@ -311,17 +316,22 @@ def main():
 
     # ── Run GQE training ────────────────────────────────────────────────────
     print("\nStarting GQE training...\n")
-    best_cost, best_indices, pareto_archive = gqe(cost_fn, pool, cfg, u_target=u_target, logger=logger)
+    best_cost, best_indices, best_angles, pareto_archive = gqe(
+        cost_fn, pool, cfg, u_target=u_target, logger=logger
+    )
 
     # ── Report results ───────────────────────────────────────────────────────
     print(f"\n{'=' * 55}")
     print("Training complete!")
     print(f"  Best raw cost (1 - F): {best_cost:.6f}")
 
-    report_indices, report_source = _select_report_token_sequence(
-        best_indices,
-        pareto_archive,
-        cfg.reward.fidelity_threshold,
+    report_indices, report_angles, report_fidelity, report_source = (
+        _select_report_token_sequence(
+            best_indices,
+            best_angles,
+            pareto_archive,
+            cfg.reward.fidelity_threshold,
+        )
     )
     print(f"  Reported circuit source: {report_source}")
 
@@ -335,8 +345,36 @@ def main():
 
         from qiskit.quantum_info import Operator
 
-        # Independently verify by re-running the optimizer on the best gate structure
-        if cfg.continuous_opt.enabled:
+        if cfg.continuous_opt.enabled and report_angles is not None:
+            # Use the angles that achieved ``report_fidelity`` during training.
+            # ``report_angles`` is aligned with ``report_indices[1:]`` (same
+            # length as max_gates, with zeros at BOS/STOP/non-parametric
+            # positions). Walk the token sequence and pick out the angle at
+            # each surviving parametric-gate position, in emission order.
+            from continuous_optimizer import parse_gate_spec
+
+            gate_specs = [parse_gate_spec(name) for name in gate_names]
+            tokens_no_bos = (
+                np.asarray(report_indices, dtype=np.int32)[1:].tolist()
+            )
+            angles_full = np.asarray(report_angles, dtype=np.float64)
+            compact_params = []
+            name_idx = 0
+            for pos, tok in enumerate(tokens_no_bos):
+                if tok < _GATE_TOKEN_OFFSET:
+                    continue
+                spec = gate_specs[name_idx]
+                if spec.is_parametric:
+                    compact_params.append(float(angles_full[pos]))
+                name_idx += 1
+            opt_params = np.asarray(compact_params, dtype=np.float64)
+            verified_f = (
+                report_fidelity if report_fidelity is not None else float("nan")
+            )
+            gqe_qc = _build_qiskit_circuit(gate_specs, opt_params, cfg.target.num_qubits)
+        elif cfg.continuous_opt.enabled:
+            # Fallback: no stored angles (e.g. raw-fidelity best without an
+            # active archive). Re-optimise to report a coherent fidelity.
             verifier = ContinuousOptimizer(
                 u_target=u_target,
                 num_qubits=cfg.target.num_qubits,
@@ -368,20 +406,6 @@ def main():
         print(f"  Reported GQE fidelity: {gqe_fidelity:.6f}")
         print(f"  Reported raw CNOTs:    {selected_cnot_count}")
         print(f"  Reported GQE CNOTs:    {int(gqe_qc.count_ops().get('cx', 0))}")
-
-        # ── Draw the optimized circuit ───────────────────────────────────────
-        print(f"\n{'=' * 55}")
-        print("Reported GQE circuit (Qiskit draw):")
-        print(gqe_qc.draw("text", fold=-1))
-
-        # ── Comparison table ─────────────────────────────────────────────────
-        gqe_depth, gqe_total, gqe_two_q = _circuit_stats(gqe_qc)
-        _print_comparison_table(
-            [
-                ("GQE", gqe_fidelity, gqe_depth, gqe_total, gqe_two_q),
-                ("Qiskit", 1.0, qiskit_depth, qiskit_total, qiskit_two_q),
-            ]
-        )
 
     # ── Pareto front summary ─────────────────────────────────────────────────
     _print_pareto_summary(

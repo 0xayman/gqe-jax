@@ -27,6 +27,18 @@ class ModelConfig:
     max_gates_count: int
 
 
+def default_max_gates_count(num_qubits: int) -> int:
+    """Upper bound on circuit length, scaling ~2 * 4^n with qubit count.
+
+    Slightly over-estimates a Qiskit-level compilation (~4^n gates in the
+    worst case) so the STOP token has room to terminate naturally. Floored
+    at 16 for trivial problems; capped at 1023 to stay within the
+    transformer's positional-embedding limit
+    (``model._N_POSITIONS = 1024``, minus the BOS slot).
+    """
+    return min(1023, max(16, 2 * (4 ** num_qubits)))
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     max_epochs: int
@@ -51,7 +63,6 @@ class TemperatureConfig:
 @dataclass(frozen=True)
 class BufferConfig:
     max_size: int
-    warmup_size: int
     steps_per_epoch: int
 
 
@@ -64,102 +75,37 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class ContinuousOptConfig:
     enabled: bool = False
-    steps: int = 50  # gradient steps per circuit; 50 is enough for L-BFGS
-    lr: float = 0.1  # learning rate; higher is fine for L-BFGS
-    optimizer: str = "lbfgs"  # "lbfgs" (recommended) or "adam"
-    top_k: int = 0  # 0 = optimize all circuits; N = optimize only top-N per rollout
-    num_restarts: int = 1  # independent random restarts for angle optimization (≥1)
+    steps: int = 50
+    lr: float = 0.1
+    optimizer: str = "lbfgs"
+    top_k: int = 0
+    num_restarts: int = 1
 
 
 @dataclass(frozen=True)
 class RewardConfig:
-    """Configuration for the GQE reward function (see docs/gqe_reward_design.tex).
+    """Clean, two-hyperparameter reward for variable-length circuit synthesis.
 
-    Total reward:
-        R_total(x) = R_local(x | x_ref) + R_pareto(x; A_t)
+    R(F, C, D) = F - lambda_structure * (C + gamma_depth * D) / max_gates_count
 
-    Local comparison reward (piecewise in ΔΦ = Φ(F) - Φ(F_ref)):
-        Φ(F) = -log(1 - F + ε_φ)    [log-infidelity utility]
-        w(F) = σ((F - F_gate) / τ)   [soft fidelity gate]
-        G_D  = [log((D_ref+1)/(D+1))]+    [positive depth gain]
-        G_C  = [log((C_ref+1)/(C+1))]+    [positive CNOT gain]
-        P_D  = [log((D+1)/(D_ref+1))]+    [depth regression]
-        P_C  = [log((C+1)/(C_ref+1))]+    [CNOT regression]
+    - F: process fidelity (after continuous angle optimisation, if enabled).
+    - C: CNOT count. D: circuit depth. max_gates_count: model.max_gates_count.
+    - lambda_structure: trade-off weight; structure penalty only matters once F
+      is close enough to 1 that the fidelity term stops dominating.
+    - gamma_depth: relative weight of depth vs CNOT; set to 1.0 by default.
 
-        Regime 1 (ΔΦ < -δ_bad):
-            R_local = -α_bad * (exp(κ_bad * (-ΔΦ - δ_bad)) - 1)
-        Regime 2 (-δ_bad ≤ ΔΦ < 0):
-            R_local = -α_soft * (exp(κ_soft * (-ΔΦ)) - 1)
-                    + η * w(F_ref) * (exp(λ_D*G_D + λ_C*G_C) - 1)
-        Regime 3 (ΔΦ ≥ 0):
-            R_local = α_good * (exp(κ_good * ΔΦ) - 1)
-                    + w(F) * (exp(λ_D*G_D + λ_C*G_C) - 1)
-                    - w(F) * (μ_D*P_D + μ_C*P_C)
-
-    Pareto proxy bonus:
-        R_pareto = β_1 * [non-dominated w.r.t. archive] + β_2 * N_dom
-
-    The archive tracks non-dominated circuits over (fidelity↑, depth↓, cnot↓).
+    Pareto archive is retained for reporting and best-circuit selection only;
+    it does not feed back into the reward.
     """
 
-    # ── Pareto archive ────────────────────────────────────────────────────────
     enabled: bool = True
-    fidelity_floor: float = 0.5
-    fidelity_floor_late: float = 0.9
-    floor_ramp_epoch: int = 100
+    lambda_structure: float = 0.3
+    gamma_depth: float = 1.0
+
+    # Pareto archive (reporting-only)
+    fidelity_floor: float = 0.0
     max_archive_size: int = 500
-    fidelity_threshold: float = 0.99   # used for archive queries and logging
-
-    # ── Log-infidelity utility ────────────────────────────────────────────────
-    eps_phi: float = 1.0e-8            # ε_φ in Φ(F) = -log(1 - F + ε_φ)
-
-    # ── Soft fidelity gate ────────────────────────────────────────────────────
-    f_gate: float = 0.90               # F_gate: centre of sigmoid gate
-    tau: float = 0.05                  # τ: gate temperature (smaller = sharper)
-
-    # ── Bad-drop threshold ────────────────────────────────────────────────────
-    delta_bad: float = 0.5             # δ_bad: separates mild from clearly bad drops
-
-    # ── Penalty / reward magnitudes and steepnesses ───────────────────────────
-    alpha_bad: float = 2.0             # α_bad
-    kappa_bad: float = 1.0             # κ_bad
-    alpha_soft: float = 0.5            # α_soft
-    kappa_soft: float = 1.0            # κ_soft
-    alpha_good: float = 1.0            # α_good
-    kappa_good: float = 1.0            # κ_good
-
-    # ── Structure terms ───────────────────────────────────────────────────────
-    lambda_d: float = 0.4              # λ_D: depth-improvement bonus weight
-    lambda_c: float = 0.6              # λ_C: CNOT-improvement bonus weight
-    mu_d: float = 0.1                  # μ_D: depth-regression penalty (0 = off)
-    mu_c: float = 0.2                  # μ_C: CNOT-regression penalty (0 = off)
-    eta: float = 0.3                   # η ∈ [0,1]: structure-reward fraction in mild-drop regime
-
-    # ── Pareto proxy bonus ────────────────────────────────────────────────────
-    beta_1: float = 0.5                # β_1: bonus for entering the non-dominated front
-    beta_2: float = 0.05               # β_2: bonus per archive point dominated
-
-    # ── Reference update ──────────────────────────────────────────────────────
-    reference_ema: float = 0.0         # 0 = hard update; >0 = EMA blend
-
-    # ── Absolute fidelity bonus ───────────────────────────────────────────────
-    # Adds α_abs * Φ(F) to every circuit's reward, unconditionally (independent
-    # of reference comparison). Creates a universal pull toward F=1 that
-    # complements the per-bucket relative signal — without it, a circuit at the
-    # bucket ceiling has ΔΦ=0 and gets no fidelity reward for pushing higher.
-    # Default 0 preserves the legacy purely-relative reward.
-    alpha_abs: float = 0.0
-
-    # ── Reference mode ────────────────────────────────────────────────────────
-    # "global":     single (F_ref, D_ref, C_ref) = current best-fidelity (legacy).
-    # "per_bucket": all refs come from the archive entry with cnot ≤ candidate
-    #               that has the highest fidelity. Best CNOT reduction; tends to
-    #               drift away from F=1.
-    # "hybrid":     fidelity terms (ΔΦ, w_F_ref) use the global best-fidelity
-    #               reference; structure terms (D_ref, C_ref) use the per-bucket
-    #               best. Pushes each CNOT bucket toward F=1 while rewarding
-    #               progress at low-CNOT budgets.
-    reference_mode: str = "global"
+    fidelity_threshold: float = 0.99
 
 
 @dataclass(frozen=True)
@@ -224,8 +170,8 @@ def validate_config(raw: dict) -> None:
 
     if raw["model"]["size"] not in VALID_MODEL_SIZES:
         raise ValueError(f"Invalid model size: {raw['model']['size']}")
-    if raw["model"]["max_gates_count"] <= 0:
-        raise ValueError("max_gates_count must be positive")
+    if "max_gates_count" in raw["model"] and raw["model"]["max_gates_count"] <= 0:
+        raise ValueError("max_gates_count must be positive when provided")
 
     normalize_rotation_gates(raw.get("pool", {}).get("rotation_gates"))
 
@@ -253,8 +199,6 @@ def validate_config(raw: dict) -> None:
     b = raw["buffer"]
     if b["max_size"] <= 0:
         raise ValueError("buffer.max_size must be positive")
-    if b["warmup_size"] <= 0:
-        raise ValueError("buffer.warmup_size must be positive")
     if b["steps_per_epoch"] <= 0:
         raise ValueError("buffer.steps_per_epoch must be positive")
 
@@ -281,57 +225,16 @@ def validate_config(raw: dict) -> None:
     r = raw.get("reward", {})
     if r:
         _require_bool("reward.enabled", r.get("enabled", True))
-        if not (0.0 <= r.get("fidelity_floor", 0.5) <= 1.0):
+        if r.get("lambda_structure", 0.3) < 0.0:
+            raise ValueError("reward.lambda_structure must be >= 0")
+        if r.get("gamma_depth", 1.0) < 0.0:
+            raise ValueError("reward.gamma_depth must be >= 0")
+        if not (0.0 <= r.get("fidelity_floor", 0.0) <= 1.0):
             raise ValueError("reward.fidelity_floor must be in [0, 1]")
-        if not (0.0 <= r.get("fidelity_floor_late", 0.9) <= 1.0):
-            raise ValueError("reward.fidelity_floor_late must be in [0, 1]")
-        if r.get("fidelity_floor", 0.5) > r.get("fidelity_floor_late", 0.9):
-            raise ValueError("reward.fidelity_floor must be <= reward.fidelity_floor_late")
-        if r.get("floor_ramp_epoch", 100) < 0:
-            raise ValueError("reward.floor_ramp_epoch must be >= 0")
         if r.get("max_archive_size", 500) <= 0:
             raise ValueError("reward.max_archive_size must be positive")
         if not (0.0 < r.get("fidelity_threshold", 0.99) <= 1.0):
             raise ValueError("reward.fidelity_threshold must be in (0, 1]")
-        if r.get("eps_phi", 1e-8) <= 0.0:
-            raise ValueError("reward.eps_phi must be positive")
-        if not (0.0 <= r.get("f_gate", 0.90) < 1.0):
-            raise ValueError("reward.f_gate must be in [0, 1)")
-        if r.get("tau", 0.05) <= 0.0:
-            raise ValueError("reward.tau must be positive")
-        if r.get("delta_bad", 0.5) < 0.0:
-            raise ValueError("reward.delta_bad must be >= 0")
-        for _field in ("alpha_bad", "kappa_bad", "alpha_soft", "kappa_soft",
-                       "alpha_good", "kappa_good"):
-            if r.get(_field, 1.0) <= 0.0:
-                raise ValueError(f"reward.{_field} must be positive")
-        if r.get("lambda_d", 0.4) < 0.0:
-            raise ValueError("reward.lambda_d must be >= 0")
-        if r.get("lambda_c", 0.6) < 0.0:
-            raise ValueError("reward.lambda_c must be >= 0")
-        if r.get("lambda_d", 0.4) + r.get("lambda_c", 0.6) <= 0.0:
-            raise ValueError("reward.lambda_d + reward.lambda_c must be > 0")
-        if r.get("mu_d", 0.1) < 0.0:
-            raise ValueError("reward.mu_d must be >= 0")
-        if r.get("mu_c", 0.2) < 0.0:
-            raise ValueError("reward.mu_c must be >= 0")
-        if not (0.0 <= r.get("eta", 0.3) <= 1.0):
-            raise ValueError("reward.eta must be in [0, 1]")
-        if r.get("beta_1", 0.5) < 0.0:
-            raise ValueError("reward.beta_1 must be >= 0")
-        if r.get("beta_2", 0.05) < 0.0:
-            raise ValueError("reward.beta_2 must be >= 0")
-        if not (0.0 <= r.get("reference_ema", 0.0) <= 1.0):
-            raise ValueError("reward.reference_ema must be in [0, 1]")
-        if r.get("alpha_abs", 0.0) < 0.0:
-            raise ValueError("reward.alpha_abs must be >= 0")
-        if "reference_mode" in r:
-            valid_modes = {"global", "per_bucket", "hybrid"}
-            if r["reference_mode"] not in valid_modes:
-                raise ValueError(
-                    f"reward.reference_mode must be one of {sorted(valid_modes)}, "
-                    f"got {r['reference_mode']!r}"
-                )
 
 
 def load_config(path: str) -> GQEConfig:
@@ -354,12 +257,16 @@ def load_config(path: str) -> GQEConfig:
     pool_raw = raw.get("pool", {})
     co_raw = raw.get("continuous_opt", {})
     reward_raw = raw.get("reward", {})
+    num_qubits = int(raw["target"]["num_qubits"])
+    model_raw = dict(raw["model"])
+    if model_raw.get("max_gates_count") is None:
+        model_raw["max_gates_count"] = default_max_gates_count(num_qubits)
     return GQEConfig(
         target=TargetConfig(**raw["target"]),
         pool=PoolConfig(
             rotation_gates=normalize_rotation_gates(pool_raw.get("rotation_gates")),
         ),
-        model=ModelConfig(**raw["model"]),
+        model=ModelConfig(**model_raw),
         training=TrainingConfig(**raw["training"]),
         temperature=TemperatureConfig(**raw["temperature"]),
         buffer=BufferConfig(**raw["buffer"]),

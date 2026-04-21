@@ -19,6 +19,14 @@ refactor required. Params layout must match `model.GPT2`:
         "h_{L-1}": ...,
         "ln_f": {scale, bias},
     }
+
+Variable-length sampling:
+- BOS (``bos_token_id``) is masked at every step (never a valid action).
+- STOP (``stop_token_id``) is masked at the very first sampled step so the
+  minimum circuit length is one gate; afterwards STOP is a valid action.
+- Once a sample emits STOP, every subsequent emitted token is forced to STOP
+  so the tail of the sequence is clean padding. The per-token log-probabilities
+  at those forced positions are masked out in the loss.
 """
 
 from __future__ import annotations
@@ -51,12 +59,15 @@ def build_kv_rollout_fn(
     batch_size: int,
     total_len: int,
     bos_token_id: int = 0,
+    stop_token_id: int = 1,
 ):
     """Return a JIT-compiled rollout function using a KV cache.
 
     The returned function signature is ``(params, rng_key, beta) -> tokens``
     where ``tokens`` has shape ``(batch_size, total_len)`` with the BOS token
-    at position 0.
+    at position 0 and STOP-padding in any tail positions after a sample emits
+    STOP. Use :func:`compute_lengths_from_tokens` to derive the per-sample
+    valid length (STOP inclusive, max = total_len - 1).
     """
     head_dim = n_embd // n_head
     assert head_dim * n_head == n_embd
@@ -88,24 +99,20 @@ def build_kv_rollout_fn(
         for i in range(n_layer):
             block = params[f"h_{i}"]
 
-            # Pre-attention LayerNorm
             attn_in = _layernorm(
                 x,
                 block["ln_1"]["scale"],
                 block["ln_1"]["bias"],
             )
 
-            # QKV projection: (B, 1, 3D)
             c_attn = block["attn"]["c_attn"]
             qkv = attn_in @ c_attn["kernel"] + c_attn["bias"]
-            q, k, v = jnp.split(qkv, 3, axis=-1)  # each (B, 1, D)
+            q, k, v = jnp.split(qkv, 3, axis=-1)
 
-            # Split heads: (B, 1, H, Dh) -> (B, H, 1, Dh)
             q = q.reshape(batch_size, 1, n_head, head_dim).transpose(0, 2, 1, 3)
             k = k.reshape(batch_size, 1, n_head, head_dim).transpose(0, 2, 1, 3)
             v = v.reshape(batch_size, 1, n_head, head_dim).transpose(0, 2, 1, 3)
 
-            # Update cache: write (B, H, 1, Dh) slice at index step_idx along T.
             k_c = jax.lax.dynamic_update_slice_in_dim(
                 k_cache[i], k, step_idx, axis=2
             )
@@ -115,11 +122,9 @@ def build_kv_rollout_fn(
             k_cache = k_cache.at[i].set(k_c)
             v_cache = v_cache.at[i].set(v_c)
 
-            # Scaled dot-product attention with cache: scores (B, H, 1, T)
             scale = jnp.asarray(head_dim, dtype=x.dtype) ** -0.5
             scores = jnp.einsum("bhqd,bhkd->bhqk", q, k_c) * scale
 
-            # Mask out positions beyond step_idx.
             min_val = jnp.finfo(scores.dtype).min
             scores = jnp.where(
                 key_mask[None, None, None, :],
@@ -128,16 +133,13 @@ def build_kv_rollout_fn(
             )
             attn = jax.nn.softmax(scores, axis=-1)
 
-            # Combine with V: (B, H, 1, Dh) -> (B, 1, D)
             out = jnp.einsum("bhqk,bhkd->bhqd", attn, v_c)
             out = out.transpose(0, 2, 1, 3).reshape(batch_size, 1, n_embd)
 
-            # Output projection + residual
             c_proj = block["attn"]["c_proj"]
             out = out @ c_proj["kernel"] + c_proj["bias"]
             x = x + out
 
-            # MLP
             mlp_in = _layernorm(
                 x,
                 block["ln_2"]["scale"],
@@ -150,7 +152,6 @@ def build_kv_rollout_fn(
             h = h @ c_mlp_proj["kernel"] + c_mlp_proj["bias"]
             x = x + h
 
-        # Final LN and token projection (tied with wte)
         x = _layernorm(
             x,
             params["ln_f"]["scale"],
@@ -162,8 +163,8 @@ def build_kv_rollout_fn(
     def rollout(params, rng_key, beta):
         """Generate ``total_len`` tokens starting from BOS.
 
-        Uses a scan over ``total_len - 1`` decode steps, each consuming the
-        previous token and emitting the next one.
+        Sampling convention: ``softmax(-beta * logits)``. Adding ``+inf`` to
+        a token's logit makes it unsamplable.
         """
         dtype = params["wte"]["embedding"].dtype
         k_cache = jnp.zeros(
@@ -174,34 +175,66 @@ def build_kv_rollout_fn(
         init_token = jnp.full(
             (batch_size,), bos_token_id, dtype=jnp.int32
         )
+        init_stopped = jnp.zeros((batch_size,), dtype=bool)
 
-        # Produce (total_len - 1) tokens after the BOS. At step t we consume
-        # token at position t and emit token at position t+1.
-        n_steps = total_len - 1
+        n_steps = total_len - 1  # tokens emitted after BOS
 
         def body(carry, step_idx):
-            k_cache, v_cache, prev_token, rng = carry
+            k_cache, v_cache, prev_token, stopped, rng = carry
             rng, sample_key = jax.random.split(rng)
             k_cache, v_cache, logits = decode_step(
                 params, k_cache, v_cache, prev_token, step_idx
             )
-            # Mask BOS so it cannot be sampled.
+            # BOS: always unsamplable.
             logits = logits.at[:, bos_token_id].set(
                 jnp.asarray(jnp.inf, dtype=logits.dtype)
             )
-            idx_next = jax.random.categorical(
+            # STOP: unsamplable at step_idx == 0 so circuits have >= 1 gate.
+            stop_bias = jnp.where(
+                step_idx == 0,
+                jnp.asarray(jnp.inf, dtype=logits.dtype),
+                jnp.asarray(0.0, dtype=logits.dtype),
+            )
+            logits = logits.at[:, stop_token_id].add(stop_bias)
+
+            sampled = jax.random.categorical(
                 sample_key, -beta * logits, axis=-1
             ).astype(jnp.int32)
-            return (k_cache, v_cache, idx_next, rng), idx_next
+            # Force STOP once a sample has already stopped.
+            idx_next = jnp.where(stopped, stop_token_id, sampled)
+            new_stopped = stopped | (idx_next == stop_token_id)
+            return (k_cache, v_cache, idx_next, new_stopped, rng), idx_next
 
-        (_, _, _, _), tokens_out = jax.lax.scan(
+        (_, _, _, _, _), tokens_out = jax.lax.scan(
             body,
-            (k_cache, v_cache, init_token, rng_key),
+            (k_cache, v_cache, init_token, init_stopped, rng_key),
             jnp.arange(n_steps, dtype=jnp.int32),
         )
-        # tokens_out: (n_steps, B) -> (B, n_steps); prepend BOS column.
-        tokens_out = tokens_out.T
+        tokens_out = tokens_out.T  # (B, n_steps)
         bos_col = jnp.full((batch_size, 1), bos_token_id, dtype=jnp.int32)
         return jnp.concatenate([bos_col, tokens_out], axis=1)
 
     return jax.jit(rollout)
+
+
+def compute_lengths_from_tokens(
+    token_ids: jax.Array,
+    stop_token_id: int,
+) -> jax.Array:
+    """Return per-sample circuit length (in gates, STOP inclusive).
+
+    ``token_ids`` has shape ``(B, N)`` and excludes BOS. For each sample, the
+    length is the position of the first STOP plus one, or ``N`` if no STOP
+    is present (sample ran to max length).
+    """
+    b, n = token_ids.shape
+    is_stop = (token_ids == stop_token_id).astype(jnp.int32)
+    # Append a sentinel STOP at position N so argmax finds a hit even when no
+    # real STOP was emitted.
+    padded = jnp.concatenate(
+        [is_stop, jnp.ones((b, 1), dtype=jnp.int32)],
+        axis=1,
+    )
+    first_stop = jnp.argmax(padded, axis=1)
+    length = jnp.minimum(first_stop + 1, n)
+    return length.astype(jnp.int32)

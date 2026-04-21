@@ -1,4 +1,21 @@
-"""JAX-based GQE pipeline for transformer-guided circuit generation."""
+"""JAX-based GQE pipeline for transformer-guided circuit generation.
+
+The transformer emits a variable-length circuit by autoregressively sampling
+tokens over a vocabulary of ``{BOS, STOP, gate_1, ..., gate_V}``. BOS sits at
+sequence position 0 and is never a valid action. STOP ends the circuit and is
+forbidden at position 1 (the first real decision), so every sampled circuit has
+at least one gate. Positions after STOP are forced-STOP padding and masked out
+of the policy gradient.
+
+The reward is deliberately simple:
+
+    R = F - lambda_structure * (C + gamma_depth * D) / max_gates_count
+
+F is process fidelity, C is CNOT count, D is circuit depth. Fidelity dominates
+while it is far from 1; structure savings only move the needle as F approaches 1.
+The Pareto archive is kept for reporting and best-circuit selection but does not
+feed back into the reward.
+"""
 
 from __future__ import annotations
 
@@ -11,10 +28,11 @@ from flax.training import train_state
 
 from cost import _unbiased_std, compilation_cost_batch_jax, process_fidelity
 from data import BufferDataset, ReplayBuffer
-from kv_rollout import build_kv_rollout_fn
-from loss import reduce_sequence_log_probs
+from kv_rollout import build_kv_rollout_fn, compute_lengths_from_tokens
+from loss import apply_action_masks, reduce_sequence_log_probs
 from model import _SIZES as _MODEL_SIZES
 from pareto import ParetoArchive, ParetoPoint
+from simplify import build_token_axis, simplify_token_batch
 
 
 def _sequence_structure_metrics(
@@ -22,7 +40,13 @@ def _sequence_structure_metrics(
     num_qubits: int,
     token_qubit0: np.ndarray,
     token_qubit1: np.ndarray,
+    token_is_noop: np.ndarray,
 ) -> tuple[int, int, int]:
+    """Return (depth, total_gates, cnot_count) for a single token sequence.
+
+    Tokens marked as NOOP (BOS / STOP / padding) are skipped entirely so the
+    caller can pass the full fixed-length sequence without pre-trimming.
+    """
     token_ids = np.asarray(token_ids, dtype=np.int32)
     if token_ids.size == 0:
         return 0, 0, 0
@@ -31,6 +55,9 @@ def _sequence_structure_metrics(
     total_gates = 0
     cnot_count = 0
     for token_id in token_ids:
+        token_id = int(token_id)
+        if bool(token_is_noop[token_id]):
+            continue
         q0 = int(token_qubit0[token_id])
         q1 = int(token_qubit1[token_id])
         total_gates += 1
@@ -56,39 +83,66 @@ class Pipeline:
         self.scheduler = self.factory.create_temperature_scheduler(cfg)
         self.ngates = cfg.model.max_gates_count
         self.num_samples = cfg.training.num_samples
+
+        # ── Token layout ────────────────────────────────────────────────────
         self.bos_token_id = 0
-        self.gate_token_offset = 1
+        self.stop_token_id = 1
+        self.gate_token_offset = 2
         self.vocab_size = len(pool) + self.gate_token_offset
         model_vocab_size = getattr(self.model, "vocab_size", None)
         if model_vocab_size is not None and int(model_vocab_size) != self.vocab_size:
             raise ValueError(
                 f"Model vocab_size={model_vocab_size} does not match "
-                f"expected {self.vocab_size} (pool size + BOS token)"
+                f"expected {self.vocab_size} (BOS + STOP + pool)"
             )
+
         self.buffer = ReplayBuffer(size=cfg.buffer.max_size)
         self._starting_idx = self._make_starting_idx(self.num_samples)
         self._last_rollout_costs = np.zeros((0,), dtype=np.float32)
         self._last_rollout_fidelities = np.zeros((0,), dtype=np.float32)
         self._last_rollout_cnot_counts = np.zeros((0,), dtype=np.int32)
+        self._last_rollout_depths = np.zeros((0,), dtype=np.int32)
+        self._last_rollout_total_gates = np.zeros((0,), dtype=np.int32)
+        self._last_rollout_lengths = np.zeros((0,), dtype=np.int32)
         self._last_rollout_old_log_probs = np.zeros((0,), dtype=np.float32)
         self._last_rollout_indices = np.zeros((0, self.ngates + 1), dtype=np.int32)
+        self._last_rollout_opt_angles = np.zeros((0, self.ngates), dtype=np.float32)
         self.batch_rng = np.random.default_rng(cfg.training.seed)
 
-        self.pool_names = ["<BOS>", *[name for name, _ in pool]]
+        # ── Token metadata tables (vocab-sized) ─────────────────────────────
+        self.pool_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
         self.two_qubit_token_mask = np.zeros((self.vocab_size,), dtype=bool)
         self.token_qubit0 = np.zeros((self.vocab_size,), dtype=np.int32)
         self.token_qubit1 = np.full((self.vocab_size,), -1, dtype=np.int32)
-        for idx, name in enumerate(self.pool_names[1:], start=self.gate_token_offset):
+        self.token_is_noop = np.zeros((self.vocab_size,), dtype=bool)
+        self.token_is_noop[self.bos_token_id] = True
+        self.token_is_noop[self.stop_token_id] = True
+        for idx, name in enumerate(self.pool_names[self.gate_token_offset:], start=self.gate_token_offset):
             parts = name.split("_")
             self.token_qubit0[idx] = int(parts[1][1:])
             if name.startswith("CNOT"):
                 self.token_qubit1[idx] = int(parts[2][1:])
                 self.two_qubit_token_mask[idx] = True
-        self.pool_matrices = np.stack([matrix for _, matrix in pool], axis=0)
+        self.token_axis = build_token_axis(self.pool_names)
+
+        # ── Gate matrices indexed by token id ───────────────────────────────
+        # Index 0 (BOS) and 1 (STOP) map to identity so variable-length circuits
+        # can be composed from a fixed-shape ``(B, max_gates, d, d)`` tensor.
+        pool_matrices = np.stack([matrix for _, matrix in pool], axis=0)
+        d = 2 ** cfg.target.num_qubits
+        identity = np.eye(d, dtype=pool_matrices.dtype)
+        token_matrices = np.concatenate(
+            [
+                np.broadcast_to(identity, (self.gate_token_offset, d, d)),
+                pool_matrices,
+            ],
+            axis=0,
+        )
+
         backend = jax.default_backend()
         is_gpu = backend in ('gpu', 'cuda')
         target_dtype = jnp.complex64 if is_gpu else jnp.complex128
-        self.pool_matrices_jax = jnp.asarray(self.pool_matrices, dtype=target_dtype)
+        self.token_matrices_jax = jnp.asarray(token_matrices, dtype=target_dtype)
         self.u_target_jax = (
             jnp.asarray(u_target, dtype=target_dtype) if u_target is not None else None
         )
@@ -117,12 +171,12 @@ class Pipeline:
         )
 
         self.continuous_optimizer = (
-            self.factory.create_continuous_optimizer(cfg, u_target, pool)
+            self.factory.create_continuous_optimizer(cfg, u_target, pool, self.pool_names)
             if u_target is not None
             else None
         )
 
-        # ── Pareto archive ──────────────────────────────────────────────────
+        # ── Pareto archive (reporting only; decoupled from reward) ──────────
         reward_cfg = cfg.reward
         if reward_cfg.enabled:
             self.pareto_archive: ParetoArchive | None = ParetoArchive(
@@ -131,11 +185,7 @@ class Pipeline:
             )
         else:
             self.pareto_archive = None
-        self._warmup_mode: bool = True
         self._current_epoch: int = 0
-        self._reward_ref_depth: float | None = None
-        self._reward_ref_cnot: float | None = None
-        self._reward_ref_fidelity: float = float("-inf")
 
         self._compile_functions()
 
@@ -147,63 +197,57 @@ class Pipeline:
         num_qubits: int,
         token_qubit0: jax.Array,
         token_qubit1: jax.Array,
+        token_is_noop: jax.Array,
     ):
         """Build a JIT function computing (depth, total_gates) for a batch.
 
-        ``token_qubit1`` uses ``-1`` for single-qubit gates. BOS tokens
-        (id ``0``) map to a sentinel that does not advance any qubit's depth.
+        Tokens with ``token_is_noop=True`` (BOS, STOP, padding) are skipped: they
+        neither advance per-qubit depth nor count toward total_gates.
         """
 
         def fn(token_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-            # token_ids: (B, T) int32 — without BOS.
+            # token_ids: (B, T) int32 — without BOS; STOP/padding may appear.
             q0 = token_qubit0[token_ids]                          # (B, T)
-            q1 = token_qubit1[token_ids]                          # (B, T)  -1 for single-qubit
+            q1 = token_qubit1[token_ids]                          # (B, T)
             is_cnot = q1 >= 0
+            is_noop = token_is_noop[token_ids]                    # (B, T)
             q1_safe = jnp.where(is_cnot, q1, 0)
-            total_gates = jnp.full(
-                (token_ids.shape[0],), token_ids.shape[1], dtype=jnp.int32
-            )
+            total_gates = jnp.sum(jnp.where(is_noop, 0, 1), axis=1).astype(jnp.int32)
 
             def step(depths, xs):
-                q0_t, q1_t, is_cnot_t, q1_safe_t = xs          # each (B,)
+                q0_t, q1_t, is_cnot_t, q1_safe_t, is_noop_t = xs      # each (B,)
                 batch_idx = jnp.arange(depths.shape[0])
                 d0 = depths[batch_idx, q0_t]
                 d1 = depths[batch_idx, q1_safe_t]
                 new_d = jnp.where(is_cnot_t, jnp.maximum(d0, d1) + 1, d0 + 1)
-                depths = depths.at[batch_idx, q0_t].set(new_d)
-                depths = depths.at[batch_idx, q1_safe_t].set(
-                    jnp.where(is_cnot_t, new_d, depths[batch_idx, q1_safe_t])
-                )
+                update_q0 = jnp.where(is_noop_t, d0, new_d)
+                depths = depths.at[batch_idx, q0_t].set(update_q0)
+                update_q1 = jnp.where(is_cnot_t & ~is_noop_t, new_d, depths[batch_idx, q1_safe_t])
+                depths = depths.at[batch_idx, q1_safe_t].set(update_q1)
                 return depths, None
 
-            B, T = token_ids.shape
+            B = token_ids.shape[0]
             init = jnp.zeros((B, num_qubits), dtype=jnp.int32)
-            # scan over time axis
             q0_T = jnp.transpose(q0, (1, 0))
             q1_T = jnp.transpose(q1, (1, 0))
             is_cnot_T = jnp.transpose(is_cnot, (1, 0))
             q1_safe_T = jnp.transpose(q1_safe, (1, 0))
+            is_noop_T = jnp.transpose(is_noop, (1, 0))
             final_depths, _ = jax.lax.scan(
-                step, init, (q0_T, q1_T, is_cnot_T, q1_safe_T)
+                step, init, (q0_T, q1_T, is_cnot_T, q1_safe_T, is_noop_T)
             )
             depths_max = jnp.max(final_depths, axis=1)
             return depths_max, total_gates
 
         return fn
 
-    def _decode_gate_token_ids(self, token_ids: np.ndarray) -> np.ndarray:
-        token_ids = np.asarray(token_ids, dtype=np.int32)
-        if token_ids.size == 0:
-            return token_ids
-        if np.any(token_ids < self.gate_token_offset) or np.any(token_ids >= self.vocab_size):
-            raise ValueError("Gate token ids must be shifted by +1 and exclude the BOS token")
-        return token_ids - self.gate_token_offset
-
     def _compile_functions(self) -> None:
         apply_fn = self.state.apply_fn
         clip_ratio = self.loss.clip_ratio
         batch_size = self.num_samples
         total_len = self.ngates + 1
+        bos_id = self.bos_token_id
+        stop_id = self.stop_token_id
 
         def model_logits(params, input_ids, attention_mask):
             return apply_fn(
@@ -213,16 +257,18 @@ class Pipeline:
                 deterministic=True,
             )
 
-        def mask_invalid_action_logits(logits):
-            return logits.at[..., self.bos_token_id].set(jnp.asarray(jnp.inf, dtype=logits.dtype))
-
         def selected_log_probs(logits, gate_indices, beta):
-            aligned_logits = mask_invalid_action_logits(logits[:, : gate_indices.shape[1], :])
+            aligned_logits = apply_action_masks(
+                logits[:, : gate_indices.shape[1], :],
+                bos_token_id=bos_id,
+                stop_token_id=stop_id,
+            )
             log_probs = jax.nn.log_softmax(-beta * aligned_logits, axis=-1)
             return jnp.take_along_axis(log_probs, gate_indices[..., None], axis=-1).squeeze(-1)
 
-        def sequence_log_probs(logits, gate_indices, beta):
-            return reduce_sequence_log_probs(selected_log_probs(logits, gate_indices, beta))
+        def sequence_log_probs(logits, gate_indices, beta, lengths):
+            token_log_probs = selected_log_probs(logits, gate_indices, beta)
+            return reduce_sequence_log_probs(token_log_probs, lengths)
 
         def calc_advantage(costs):
             return (jnp.mean(costs) - costs) / (_unbiased_std(costs) + 1e-8)
@@ -230,11 +276,18 @@ class Pipeline:
         def rollout_sequence_log_probs(params, idx, beta):
             attention_mask = jnp.ones_like(idx, dtype=bool)
             gate_indices = idx[:, 1:]
+            lengths = compute_lengths_from_tokens(gate_indices, stop_id)
             current_logits = model_logits(params, idx, attention_mask)
-            return sequence_log_probs(current_logits, gate_indices, beta)
+            return sequence_log_probs(current_logits, gate_indices, beta, lengths)
 
         def grpo_loss(params, idx, costs, beta, old_sequence_log_probs):
-            current_sequence_log_probs = rollout_sequence_log_probs(params, idx, beta)
+            attention_mask = jnp.ones_like(idx, dtype=bool)
+            gate_indices = idx[:, 1:]
+            lengths = compute_lengths_from_tokens(gate_indices, stop_id)
+            current_logits = model_logits(params, idx, attention_mask)
+            current_sequence_log_probs = sequence_log_probs(
+                current_logits, gate_indices, beta, lengths
+            )
             advantages = jax.lax.stop_gradient(calc_advantage(costs))
             ratio = jnp.exp(current_sequence_log_probs - old_sequence_log_probs)
             clipped_ratio = jnp.clip(
@@ -257,27 +310,40 @@ class Pipeline:
             return state, loss_value
 
         def generate_rollout(params, rng_key, beta):
-            tokens = jnp.full((batch_size, total_len), self.bos_token_id, dtype=jnp.int32)
+            """Fallback O(N^2) sampler with variable-length STOP handling."""
+            tokens = jnp.full((batch_size, total_len), bos_id, dtype=jnp.int32)
             active_mask = jnp.zeros((batch_size, total_len), dtype=bool)
             active_mask = active_mask.at[:, 0].set(True)
+            stopped = jnp.zeros((batch_size,), dtype=bool)
 
             def body(carry, step_idx):
-                tokens, active_mask, rng = carry
+                tokens, active_mask, stopped, rng = carry
                 rng, sample_key = jax.random.split(rng)
                 logits = model_logits(params, tokens, active_mask)
-                step_logits = mask_invalid_action_logits(logits[:, step_idx, :])
-                idx_next = jax.random.categorical(
+                step_logits = logits[:, step_idx, :]
+                step_logits = step_logits.at[:, bos_id].set(
+                    jnp.asarray(jnp.inf, dtype=step_logits.dtype)
+                )
+                stop_bias = jnp.where(
+                    step_idx == 0,
+                    jnp.asarray(jnp.inf, dtype=step_logits.dtype),
+                    jnp.asarray(0.0, dtype=step_logits.dtype),
+                )
+                step_logits = step_logits.at[:, stop_id].add(stop_bias)
+                sampled = jax.random.categorical(
                     sample_key,
                     -beta * step_logits,
                     axis=-1,
                 ).astype(jnp.int32)
+                idx_next = jnp.where(stopped, stop_id, sampled)
+                new_stopped = stopped | (idx_next == stop_id)
                 tokens = tokens.at[:, step_idx + 1].set(idx_next)
                 active_mask = active_mask.at[:, step_idx + 1].set(True)
-                return (tokens, active_mask, rng), None
+                return (tokens, active_mask, new_stopped, rng), None
 
-            (tokens, _, _), _ = jax.lax.scan(
+            (tokens, _, _, _), _ = jax.lax.scan(
                 body,
-                (tokens, active_mask, rng_key),
+                (tokens, active_mask, stopped, rng_key),
                 jnp.arange(self.ngates, dtype=jnp.int32),
             )
             return tokens
@@ -287,8 +353,7 @@ class Pipeline:
         self._grpo_step = jax.jit(grpo_step)
         self._rollout_sequence_log_probs = jax.jit(rollout_sequence_log_probs)
         self._generate_rollout = jax.jit(generate_rollout)
-        # KV-cache rollout: O(N) decode instead of O(N^2). Same sampling logic
-        # as ``generate_rollout`` (mask BOS, sample from softmax(-beta * logits)).
+
         _arch = _MODEL_SIZES[self.cfg.model.size]
         self._generate_rollout_kv = build_kv_rollout_fn(
             n_layer=_arch.n_layer,
@@ -298,28 +363,31 @@ class Pipeline:
             batch_size=batch_size,
             total_len=total_len,
             bos_token_id=self.bos_token_id,
+            stop_token_id=self.stop_token_id,
         )
         self._batch_structure_jit = jax.jit(
             self._make_batch_structure_fn(
                 num_qubits=self.cfg.target.num_qubits,
                 token_qubit0=jnp.asarray(self.token_qubit0, dtype=jnp.int32),
                 token_qubit1=jnp.asarray(self.token_qubit1, dtype=jnp.int32),
+                token_is_noop=jnp.asarray(self.token_is_noop, dtype=bool),
             )
         )
         if self.u_target_jax is not None:
             self._discrete_cost_batch = jax.jit(
                 lambda token_ids: compilation_cost_batch_jax(
                     self.u_target_jax,
-                    self.pool_matrices_jax[token_ids],
+                    self.token_matrices_jax[token_ids],
                 )
             )
         else:
             self._discrete_cost_batch = None
+        self._lengths_from_tokens_jit = jax.jit(
+            lambda tokens: compute_lengths_from_tokens(tokens, stop_id)
+        )
 
     def on_fit_start(self):
         self._starting_idx = self._make_starting_idx(self.num_samples)
-        while len(self.buffer) < self.cfg.buffer.warmup_size:
-            self.collect_rollout()
 
     def on_train_epoch_start(self):
         self.collect_rollout()
@@ -335,35 +403,57 @@ class Pipeline:
             ),
             dtype=np.float32,
         )
-        # fidelity_costs = 1 − F; used for tracking, best-circuit selection,
-        # and temperature scheduling — always fidelity-only regardless of Pareto mode.
-        fidelity_costs, fidelities, cnot_counts = self.computeCost(idx_output[:, 1:], self.pool)
+        token_gates = idx_output[:, 1:]  # strip BOS
+        # Raw emission length (position of first STOP) feeds the temperature
+        # scheduler's length statistics; simplification may insert interior
+        # STOPs so we compute this before rewriting.
+        lengths = np.asarray(
+            self._lengths_from_tokens_jit(jnp.asarray(token_gates, dtype=jnp.int32)),
+            dtype=np.int32,
+        )
+        # Structurally simplify each circuit before the angle optimiser sees
+        # it: cancelled / merged positions become STOP (identity downstream).
+        # Fidelity is preserved up to reparametrisation; structural metrics
+        # reflect the simplified circuit so reward and Pareto archive count
+        # only the gates that survive simplification.
+        token_gates = simplify_token_batch(
+            np.asarray(token_gates, dtype=np.int32),
+            self.token_axis,
+            self.token_qubit0,
+            self.token_qubit1,
+            self.stop_token_id,
+        )
+        fidelity_costs, fidelities, opt_angles = self.computeCost(token_gates)
+        cnot_counts = self._count_cnot_tokens(token_gates)
+        depths, total_gates = self._batch_compute_structure(token_gates)
 
-        # When the reward archive is active, compute structure metrics and
-        # build the full reward cost that goes into the replay buffer.
-        if self.pareto_archive is not None:
-            depths, total_gates = self._batch_compute_structure(idx_output[:, 1:])
-            self._update_reward_references(fidelities, depths, cnot_counts)
-            if not self._warmup_mode:
-                buffer_costs = self._compute_reward(fidelities, depths, cnot_counts)
-            else:
-                buffer_costs = fidelity_costs
+        if self.cfg.reward.enabled:
+            buffer_costs = self._compute_reward(fidelities, depths, cnot_counts)
         else:
             buffer_costs = fidelity_costs
 
         for seq, cost_val, old_log_prob in zip(idx_output, buffer_costs, old_log_probs):
             self.buffer.push(seq, cost_val, old_log_prob)
 
-        # Scheduler always sees fidelity costs so its annealing is not confused
-        # by the changing scale of scalarized costs.
+        # Scheduler annealing uses fidelity costs so it is not confused by the
+        # changing scale of the scalarised reward.
         self.scheduler.update(costs=fidelity_costs)
         self._last_rollout_costs = np.asarray(fidelity_costs, dtype=np.float32)
         self._last_rollout_fidelities = np.asarray(fidelities, dtype=np.float32)
         self._last_rollout_cnot_counts = np.asarray(cnot_counts, dtype=np.int32)
+        self._last_rollout_depths = np.asarray(depths, dtype=np.int32)
+        self._last_rollout_total_gates = np.asarray(total_gates, dtype=np.int32)
+        self._last_rollout_lengths = lengths
         self._last_rollout_old_log_probs = old_log_probs
-        self._last_rollout_indices = np.asarray(idx_output, dtype=np.int32)
+        # Store the simplified BOS-prefixed sequence so best-of-rollout
+        # reporting agrees with the simplified structural metrics.
+        bos_col = np.full(
+            (token_gates.shape[0], 1), self.bos_token_id, dtype=np.int32
+        )
+        simplified_idx = np.concatenate([bos_col, token_gates], axis=1)
+        self._last_rollout_indices = simplified_idx
+        self._last_rollout_opt_angles = np.asarray(opt_angles, dtype=np.float32)
 
-        # Update the Pareto archive with every circuit from this rollout.
         if self.pareto_archive is not None:
             for i in range(len(idx_output)):
                 self.pareto_archive.update(
@@ -372,8 +462,9 @@ class Pipeline:
                         depth=int(depths[i]),
                         total_gates=int(total_gates[i]),
                         cnot_count=int(cnot_counts[i]),
-                        token_sequence=np.asarray(idx_output[i], dtype=np.int32).copy(),
+                        token_sequence=simplified_idx[i].copy(),
                         epoch=self._current_epoch,
+                        opt_angles=np.asarray(opt_angles[i], dtype=np.float32).copy(),
                     )
                 )
 
@@ -386,6 +477,7 @@ class Pipeline:
             self.cfg.target.num_qubits,
             self.token_qubit0,
             self.token_qubit1,
+            self.token_is_noop,
         )
 
     def _count_cnot_tokens(self, idx_output: np.ndarray) -> np.ndarray:
@@ -396,8 +488,8 @@ class Pipeline:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return (depths, total_gates) for each sequence in the batch.
 
-        token_ids: shape (batch, ngates) — gate tokens without BOS.
-        Both returned arrays have shape (batch,) and dtype int32.
+        token_ids: shape (batch, max_gates) — gate tokens without BOS; STOP /
+        forced-STOP padding counts as NOOP and is skipped.
         """
         if token_ids.shape[0] == 0:
             return (
@@ -411,384 +503,94 @@ class Pipeline:
             np.asarray(totals_j, dtype=np.int32),
         )
 
-    def _select_reward_reference_index(
-        self,
-        fidelities: np.ndarray,
-        depths: np.ndarray,
-        cnot_counts: np.ndarray,
-    ) -> int:
-        order = np.lexsort(
-            (
-                np.asarray(depths, dtype=np.int32),
-                np.asarray(cnot_counts, dtype=np.int32),
-                -np.asarray(fidelities, dtype=np.float64),
-            )
-        )
-        return int(order[0])
-
-    @staticmethod
-    def _is_better_structure(
-        cand_depth: float,
-        cand_cnot: float,
-        ref_depth: float,
-        ref_cnot: float,
-    ) -> bool:
-        return cand_cnot < ref_cnot or (
-            cand_cnot == ref_cnot and cand_depth < ref_depth
-        )
-
-    def _phi(self, F: np.ndarray) -> np.ndarray:
-        """Log-infidelity utility Φ(F) = -log(1 - F + ε_φ)."""
-        eps = np.float32(self.cfg.reward.eps_phi)
-        F_f = np.asarray(F, dtype=np.float32)
-        return -np.log(np.maximum(1.0 - F_f + eps, eps))
-
-    def fidelity_gate(self, fidelities) -> np.ndarray:
-        """Soft fidelity gate w(F) = σ((F - F_gate) / τ)."""
-        F_f = np.asarray(fidelities, dtype=np.float32)
-        f_gate = np.float32(self.cfg.reward.f_gate)
-        tau = np.float32(self.cfg.reward.tau)
-        z = (F_f - f_gate) / tau
-        return (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
-
-    def _update_reward_references(
-        self,
-        fidelities: np.ndarray,
-        depths: np.ndarray,
-        cnot_counts: np.ndarray,
-    ) -> None:
-        if len(fidelities) == 0:
-            return
-
-        idx = self._select_reward_reference_index(fidelities, depths, cnot_counts)
-        cand_fidelity = float(np.asarray(fidelities[idx], dtype=np.float64))
-        cand_depth = float(np.asarray(depths[idx], dtype=np.float64))
-        cand_cnot = float(np.asarray(cnot_counts[idx], dtype=np.float64))
-        tol = 1e-6
-        same_fidelity = abs(cand_fidelity - self._reward_ref_fidelity) <= tol if np.isfinite(
-            self._reward_ref_fidelity
-        ) else False
-        better_structure = False
-        if self._reward_ref_depth is not None and self._reward_ref_cnot is not None:
-            better_structure = self._is_better_structure(
-                cand_depth,
-                cand_cnot,
-                self._reward_ref_depth,
-                self._reward_ref_cnot,
-            )
-
-        if self._reward_ref_depth is None or self._reward_ref_cnot is None:
-            self._reward_ref_depth = cand_depth
-            self._reward_ref_cnot = cand_cnot
-            self._reward_ref_fidelity = cand_fidelity
-            return
-
-        if self._warmup_mode:
-            if cand_fidelity > self._reward_ref_fidelity + tol or (
-                same_fidelity and better_structure
-            ):
-                self._reward_ref_depth = cand_depth
-                self._reward_ref_cnot = cand_cnot
-                self._reward_ref_fidelity = cand_fidelity
-            return
-
-        if same_fidelity and better_structure:
-            self._reward_ref_depth = cand_depth
-            self._reward_ref_cnot = cand_cnot
-            self._reward_ref_fidelity = max(self._reward_ref_fidelity, cand_fidelity)
-            return
-
-        ema = float(self.cfg.reward.reference_ema)
-        if cand_fidelity <= self._reward_ref_fidelity + tol:
-            return
-
-        if ema <= 0.0:
-            self._reward_ref_depth = cand_depth
-            self._reward_ref_cnot = cand_cnot
-            self._reward_ref_fidelity = cand_fidelity
-            return
-
-        self._reward_ref_depth = (1.0 - ema) * self._reward_ref_depth + ema * cand_depth
-        self._reward_ref_cnot = (1.0 - ema) * self._reward_ref_cnot + ema * cand_cnot
-        self._reward_ref_fidelity = cand_fidelity
-
-    def _rescore_replay_buffer(self) -> None:
-        """Rescore all buffer entries with the full reward after warmup ends."""
-        if self.pareto_archive is None or len(self.buffer) == 0:
-            return
-        if self._reward_ref_depth is None or self._reward_ref_cnot is None:
-            return
-
-        raw = list(self.buffer.buf)
-        idx_batch = np.stack([item[0] for item in raw], axis=0).astype(np.int32)
-        old_log_probs = [
-            item[2] if len(item) == 3 else np.float32(np.nan)
-            for item in raw
-        ]
-        token_batch = idx_batch[:, 1:]
-        _, fidelities, cnot_counts = self.computeCost(token_batch, self.pool)
-        depths, _ = self._batch_compute_structure(token_batch)
-        scalar_costs = self._compute_reward(fidelities, depths, cnot_counts)
-
-        rebuilt = ReplayBuffer(size=self.buffer.size)
-        for seq, cost_val, old_log_prob in zip(idx_batch, scalar_costs, old_log_probs):
-            if np.isnan(np.asarray(old_log_prob, dtype=np.float32)):
-                rebuilt.push(seq, cost_val)
-            else:
-                rebuilt.push(seq, cost_val, float(np.asarray(old_log_prob, dtype=np.float32)))
-        self.buffer = rebuilt
-
-    def _compute_pareto_bonus(
-        self,
-        fidelities: np.ndarray,
-        depths: np.ndarray,
-        cnot_counts: np.ndarray,
-    ) -> np.ndarray:
-        """Pareto proxy bonus: β_1 * [non-dominated] + β_2 * N_dom.
-
-        Fully vectorized: O(n_cand * n_archive) NumPy broadcast rather than a
-        Python double loop.
-        """
-        r = self.cfg.reward
-        beta_1 = np.float32(r.beta_1)
-        beta_2 = np.float32(r.beta_2)
-        archive = self.pareto_archive
-
-        is_nd, n_dom = archive.bulk_nondominated_mask_and_dom_count(
-            np.asarray(fidelities, dtype=np.float32),
-            np.asarray(depths, dtype=np.int32),
-            np.asarray(cnot_counts, dtype=np.int32),
-        )
-        bonus = np.where(
-            is_nd,
-            beta_1 + beta_2 * n_dom.astype(np.float32),
-            np.float32(0.0),
-        ).astype(np.float32)
-        return bonus
-
-    def _per_bucket_references(
-        self,
-        cnot_counts: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return per-candidate (F_ref, D_ref, C_ref) arrays from the archive.
-
-        For each candidate C_i, picks the archive entry with cnot ≤ C_i that
-        has the highest fidelity (tie-break: lowest depth, then lowest cnot).
-        Candidates with no qualifying archive entry fall back to the global
-        reference scalars.
-        """
-        n_cand = cnot_counts.shape[0]
-        global_F = np.float32(self._reward_ref_fidelity)
-        global_D = np.float32(self._reward_ref_depth)
-        global_C = np.float32(self._reward_ref_cnot)
-
-        archive = self.pareto_archive
-        if archive is None or archive._fid.size == 0:
-            return (
-                np.full((n_cand,), global_F, dtype=np.float32),
-                np.full((n_cand,), global_D, dtype=np.float32),
-                np.full((n_cand,), global_C, dtype=np.float32),
-            )
-
-        af = archive._fid.astype(np.float32)                  # (A,)
-        ad = archive._depth.astype(np.float32)                # (A,)
-        ac = archive._cnot.astype(np.float32)                 # (A,)
-
-        C = np.asarray(cnot_counts, dtype=np.float32)[:, None]  # (n, 1)
-        bucket_mask = ac[None, :] <= C                          # (n, A)
-
-        # Score favours high F, then low D, then low C (lexicographic via scalar).
-        # Scaling: F dominates (range [0, 1] with coefficient 1e6), D next (1e3),
-        # C last (1). All archive ints are small (depth/cnot ≤ a few hundred) so
-        # this composite ordering is exact for realistic sizes.
-        score = af * 1e6 - ad * 1e3 - ac
-        score_masked = np.where(bucket_mask, score[None, :], -np.inf)   # (n, A)
-        best_idx = np.argmax(score_masked, axis=1)                      # (n,)
-        any_valid = bucket_mask.any(axis=1)                             # (n,)
-
-        F_ref = np.where(any_valid, af[best_idx], global_F).astype(np.float32)
-        D_ref = np.where(any_valid, ad[best_idx], global_D).astype(np.float32)
-        C_ref = np.where(any_valid, ac[best_idx], global_C).astype(np.float32)
-        return F_ref, D_ref, C_ref
-
     def _compute_reward(
         self,
         fidelities: np.ndarray,
         depths: np.ndarray,
         cnot_counts: np.ndarray,
     ) -> np.ndarray:
-        """Compute cost = -R_total for each circuit (gqe_reward_design.tex).
+        """Return costs (= -reward) using R = F - lam * (C + gamma * D) / L_max.
 
-        Falls back to 1-F cost when no reference circuit has been set yet.
+        Two hyperparameters:
+          - lambda_structure (lam): fidelity-vs-structure trade-off weight.
+          - gamma_depth (gamma): depth-vs-CNOT relative weight.
         """
-        if self._reward_ref_depth is None or self._reward_ref_cnot is None:
-            return (1.0 - np.asarray(fidelities, dtype=np.float32))
-
         r = self.cfg.reward
+        lam = np.float32(r.lambda_structure)
+        gamma = np.float32(r.gamma_depth)
+        L_max = np.float32(max(self.ngates, 1))
         F = np.asarray(fidelities, dtype=np.float32)
-        D = np.asarray(depths, dtype=np.float32)
         C = np.asarray(cnot_counts, dtype=np.float32)
-
-        mode = getattr(r, "reference_mode", "global")
-        global_F = np.float32(self._reward_ref_fidelity)
-        global_D = np.float32(self._reward_ref_depth)
-        global_C = np.float32(self._reward_ref_cnot)
-        if mode == "global":
-            F_ref_for_fidelity = global_F
-            D_ref = global_D
-            C_ref = global_C
-        elif mode == "per_bucket":
-            pb_F, pb_D, pb_C = self._per_bucket_references(C.astype(np.int32))
-            F_ref_for_fidelity = pb_F
-            D_ref, C_ref = pb_D, pb_C
-        elif mode == "hybrid":
-            _, pb_D, pb_C = self._per_bucket_references(C.astype(np.int32))
-            F_ref_for_fidelity = global_F
-            D_ref, C_ref = pb_D, pb_C
-        else:
-            raise ValueError(f"Unknown reward.reference_mode: {mode!r}")
-
-        # Log-infidelity difference ΔΦ = Φ(F) - Φ(F_ref)
-        phi_F = self._phi(F)
-        if np.ndim(F_ref_for_fidelity) == 0:
-            phi_F_ref = np.float32(
-                float(self._phi(np.array([F_ref_for_fidelity], dtype=np.float32))[0])
-            )
-        else:
-            phi_F_ref = self._phi(F_ref_for_fidelity)
-        delta_phi = phi_F - phi_F_ref
-
-        # Positive structure gains: G_X = [log((X_ref+1)/(X+1))]+
-        G_D = np.maximum(np.float32(0.0), np.log((D_ref + 1.0) / (D + 1.0)))
-        G_C = np.maximum(np.float32(0.0), np.log((C_ref + 1.0) / (C + 1.0)))
-
-        # Structure regression penalties: P_X = [log((X+1)/(X_ref+1))]+
-        P_D = np.maximum(np.float32(0.0), np.log((D + 1.0) / (D_ref + 1.0)))
-        P_C = np.maximum(np.float32(0.0), np.log((C + 1.0) / (C_ref + 1.0)))
-
-        # Soft fidelity gates (uses the same F_ref source as ΔΦ)
-        w_F = self.fidelity_gate(F)
-        if np.ndim(F_ref_for_fidelity) == 0:
-            w_F_ref = np.float32(
-                float(
-                    self.fidelity_gate(
-                        np.array([F_ref_for_fidelity], dtype=np.float32)
-                    )[0]
-                )
-            )
-        else:
-            w_F_ref = self.fidelity_gate(F_ref_for_fidelity)
-
-        # Exponential structure coupling (shared across regimes 2 & 3).
-        # _MAX_EXP_BAD is tighter than _MAX_EXP: with eps_phi=1e-8, Φ(1.0)≈18.4
-        # so regime-1 excess can reach ~18 and exp(18)≈6.6e7, which dominates
-        # GRPO's advantage normalization and causes policy thrash. Clamping at 5
-        # keeps exp(κ·excess)≤148 — strong penalty, still gradient-friendly.
-        _MAX_EXP = np.float32(30.0)
-        _MAX_EXP_BAD = np.float32(5.0)
-        lam_d = np.float32(r.lambda_d)
-        lam_c = np.float32(r.lambda_c)
-        struct_arg = np.clip(lam_d * G_D + lam_c * G_C, np.float32(0.0), _MAX_EXP)
-        struct_bonus = np.exp(struct_arg) - np.float32(1.0)
-
-        delta_bad = np.float32(r.delta_bad)
-
-        # Regime 1: clearly bad fidelity drop (ΔΦ < -δ_bad)
-        excess = np.clip(-delta_phi - delta_bad, np.float32(0.0), _MAX_EXP_BAD)
-        r_bad = -np.float32(r.alpha_bad) * (
-            np.exp(np.float32(r.kappa_bad) * excess) - np.float32(1.0)
-        )
-
-        # Regime 2: small fidelity drop (-δ_bad ≤ ΔΦ < 0)
-        neg_dp = np.clip(-delta_phi, np.float32(0.0), _MAX_EXP)
-        r_soft = (
-            -np.float32(r.alpha_soft) * (
-                np.exp(np.float32(r.kappa_soft) * neg_dp) - np.float32(1.0)
-            )
-            + np.float32(r.eta) * np.asarray(w_F_ref, dtype=np.float32) * struct_bonus
-        )
-
-        # Regime 3: non-worse fidelity (ΔΦ ≥ 0)
-        pos_dp = np.clip(delta_phi, np.float32(0.0), _MAX_EXP)
-        r_good = (
-            np.float32(r.alpha_good) * (
-                np.exp(np.float32(r.kappa_good) * pos_dp) - np.float32(1.0)
-            )
-            + w_F * struct_bonus
-            - w_F * (np.float32(r.mu_d) * P_D + np.float32(r.mu_c) * P_C)
-        )
-
-        # Select regime
-        reward = np.where(
-            delta_phi < -delta_bad,
-            r_bad,
-            np.where(delta_phi < np.float32(0.0), r_soft, r_good),
-        ).astype(np.float32)
-
-        # Add absolute fidelity bonus (ungated; applies to every candidate)
-        alpha_abs = np.float32(getattr(r, "alpha_abs", 0.0))
-        if alpha_abs > 0.0:
-            reward = reward + alpha_abs * phi_F
-
-        # Add Pareto proxy bonus
-        if self.pareto_archive is not None and (r.beta_1 > 0.0 or r.beta_2 > 0.0):
-            reward = reward + self._compute_pareto_bonus(fidelities, depths, cnot_counts)
-
+        D = np.asarray(depths, dtype=np.float32)
+        reward = F - lam * (C + gamma * D) / L_max
         return (-reward).astype(np.float32)
 
     def _compute_discrete_metrics(
         self,
-        pool_idx_output: np.ndarray,
-        cnot_counts: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        token_ids: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self._discrete_cost_batch is None:
             raise RuntimeError("Discrete metric evaluation requires a target unitary")
-
-        costs = self._discrete_cost_batch(jnp.asarray(pool_idx_output, dtype=jnp.int32))
+        costs = self._discrete_cost_batch(jnp.asarray(token_ids, dtype=jnp.int32))
         fidelities = 1.0 - costs
         return (
             np.asarray(costs, dtype=np.float32),
             np.asarray(fidelities, dtype=np.float32),
-            cnot_counts,
         )
 
-    def computeCost(self, idx_output, pool, **kwargs):
+    def computeCost(self, token_ids, *, pool=None, **kwargs):
+        """Return ``(costs, fidelities, opt_angles)`` for a batch of circuits.
+
+        ``token_ids`` shape ``(B, max_gates)`` excludes BOS and may contain
+        STOP / forced-STOP padding; both are treated as identity for the
+        purposes of fidelity evaluation. ``opt_angles`` has shape
+        ``(B, max_gates)`` — zeros when no continuous optimiser is active,
+        otherwise the angles that achieved ``fidelities``.
+        """
         del pool, kwargs
-        idx_output = np.asarray(idx_output, dtype=np.int32)
-        cnot_counts = self._count_cnot_tokens(idx_output)
-        pool_idx_output = self._decode_gate_token_ids(idx_output)
+        token_ids = np.asarray(token_ids, dtype=np.int32)
+        batch_size, max_gates = token_ids.shape
 
         if self.continuous_optimizer is None:
-            return self._compute_discrete_metrics(pool_idx_output, cnot_counts)
+            costs, fidelities = self._compute_discrete_metrics(token_ids)
+            opt_angles = np.zeros((batch_size, max_gates), dtype=np.float32)
+            return costs, fidelities, opt_angles
 
+        opt_angles = np.zeros((batch_size, max_gates), dtype=np.float32)
         if self.continuous_optimizer.top_k > 0:
-            discrete_costs, discrete_fidelities, _ = self._compute_discrete_metrics(
-                pool_idx_output,
-                cnot_counts,
-            )
+            discrete_costs, discrete_fidelities = self._compute_discrete_metrics(token_ids)
             top_indices = np.argsort(discrete_costs)[: self.continuous_optimizer.top_k]
             results = discrete_costs.astype(np.float64)
             fidelities = discrete_fidelities.astype(np.float64)
-            selected_idx = pool_idx_output[top_indices]
-            optimized_fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
-                selected_idx,
-                self.rng_key,
+            selected_tokens = token_ids[top_indices]
+            optimized_fidelities, selected_angles, self.rng_key = (
+                self.continuous_optimizer.optimize_token_id_batch(
+                    selected_tokens,
+                    self.rng_key,
+                )
             )
-            for sample_idx, fidelity in zip(top_indices.tolist(), optimized_fidelities.tolist()):
+            for local_idx, sample_idx in enumerate(top_indices.tolist()):
+                fidelity = float(optimized_fidelities[local_idx])
                 fidelities[sample_idx] = fidelity
                 results[sample_idx] = 1.0 - fidelity
+                opt_angles[sample_idx] = np.asarray(
+                    selected_angles[local_idx], dtype=np.float32
+                )
         else:
-            fidelities, self.rng_key = self.continuous_optimizer.optimize_token_index_batch(
-                pool_idx_output,
-                self.rng_key,
+            fidelities, all_angles, self.rng_key = (
+                self.continuous_optimizer.optimize_token_id_batch(
+                    token_ids,
+                    self.rng_key,
+                )
             )
             fidelities = np.asarray(fidelities, dtype=np.float64)
             results = 1.0 - fidelities
+            opt_angles = np.asarray(all_angles, dtype=np.float32)
 
         return (
             np.asarray(results, dtype=np.float32),
             np.asarray(fidelities, dtype=np.float32),
-            cnot_counts,
+            opt_angles,
         )
 
     def train_dataloader(self):
@@ -823,27 +625,34 @@ class Pipeline:
         if idx is None and (ngates is None or ngates == self.ngates):
             beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
             self.rng_key, rollout_key = jax.random.split(self.rng_key)
-            # KV-cache rollout: O(N) instead of O(N^2) over the transformer.
             return np.asarray(
                 self._generate_rollout_kv(self.state.params, rollout_key, beta),
                 dtype=np.int32,
             )
 
+        # Arbitrary-prefix / arbitrary-length generation (used mainly for tests).
         idx = np.asarray(idx if idx is not None else self._starting_idx, dtype=np.int32)
         ngates = self.ngates if ngates is None else ngates
         beta = float(self.scheduler.get_inverse_temperature())
         idx_jax = jnp.asarray(idx, dtype=jnp.int32)
+        stopped = jnp.zeros((idx_jax.shape[0],), dtype=bool)
 
-        for _ in range(ngates):
+        for step_idx in range(ngates):
             attention_mask = jnp.ones_like(idx_jax, dtype=bool)
             self.rng_key, sample_key = jax.random.split(self.rng_key)
             logits = self._model_logits(self.state.params, idx_jax, attention_mask)
             step_logits = logits[:, -1, :].at[:, self.bos_token_id].set(
                 jnp.asarray(jnp.inf, dtype=logits.dtype)
             )
-            idx_next = jax.random.categorical(sample_key, -beta * step_logits, axis=-1).astype(
+            if step_idx == 0 and idx_jax.shape[1] == 1:
+                step_logits = step_logits.at[:, self.stop_token_id].set(
+                    jnp.asarray(jnp.inf, dtype=logits.dtype)
+                )
+            sampled = jax.random.categorical(sample_key, -beta * step_logits, axis=-1).astype(
                 jnp.int32
             )
+            idx_next = jnp.where(stopped, self.stop_token_id, sampled)
+            stopped = stopped | (idx_next == self.stop_token_id)
             idx_jax = jnp.concatenate((idx_jax, idx_next[:, None]), axis=1)
         return np.asarray(idx_jax, dtype=np.int32)
 
