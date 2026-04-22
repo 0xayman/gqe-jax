@@ -439,12 +439,28 @@ class ContinuousOptimizer:
         )
         qubit0 = np.zeros((batch_size, self.max_gates), dtype=np.int32)
         cnot_pair = np.zeros((batch_size, self.max_gates), dtype=np.int32)
+        cnot_id = _GATE_TYPE_TO_ID["CNOT"]
         for batch_idx, gate_specs in enumerate(gate_specs_batch):
-            for gate_idx, spec in enumerate(gate_specs):
-                gate_type_ids[batch_idx, gate_idx] = _GATE_TYPE_TO_ID[spec.gate_type]
-                qubit0[batch_idx, gate_idx] = spec.qubits[0]
-                if spec.gate_type == "CNOT":
-                    cnot_pair[batch_idx, gate_idx] = self._cnot_pair_to_idx[spec.qubits]
+            n = len(gate_specs)
+            if n == 0:
+                continue
+            # Flatten per-spec extraction into numpy assignment in one shot.
+            type_row = np.fromiter(
+                (_GATE_TYPE_TO_ID[s.gate_type] for s in gate_specs),
+                dtype=np.int32, count=n,
+            )
+            q0_row = np.fromiter(
+                (s.qubits[0] for s in gate_specs),
+                dtype=np.int32, count=n,
+            )
+            gate_type_ids[batch_idx, :n] = type_row
+            qubit0[batch_idx, :n] = q0_row
+            cnot_mask = type_row == cnot_id
+            if cnot_mask.any():
+                for gate_idx in np.flatnonzero(cnot_mask):
+                    cnot_pair[batch_idx, gate_idx] = self._cnot_pair_to_idx[
+                        gate_specs[gate_idx].qubits
+                    ]
         return (
             jnp.asarray(gate_type_ids, dtype=jnp.int32),
             jnp.asarray(qubit0, dtype=jnp.int32),
@@ -475,9 +491,14 @@ class ContinuousOptimizer:
     def _build_full_angle_vector_batch(self, gate_specs_batch: list[list]) -> jax.Array:
         angles = np.zeros((len(gate_specs_batch), self.max_gates), dtype=self._np_real_dtype)
         for batch_idx, gate_specs in enumerate(gate_specs_batch):
-            for gate_idx, spec in enumerate(gate_specs):
-                if spec.is_parametric:
-                    angles[batch_idx, gate_idx] = spec.initial_angle
+            n = len(gate_specs)
+            if n == 0:
+                continue
+            row = np.fromiter(
+                (s.initial_angle if s.is_parametric else 0.0 for s in gate_specs),
+                dtype=self._np_real_dtype, count=n,
+            )
+            angles[batch_idx, :n] = row
         return jnp.asarray(angles, dtype=self._real_dtype)
 
     def _compact_param_angles(self, gate_specs: list, full_angles: jax.Array) -> jax.Array:
@@ -614,45 +635,25 @@ class ContinuousOptimizer:
     ) -> tuple[np.ndarray, np.ndarray, jax.Array]:
         """Return ``(fidelities, opt_angles, rng_key)``.
 
-        ``opt_angles`` has shape ``(B, max_gates)`` — optimised angle per
-        position for rows with parametric gates, and the input initial angles
-        (all zeros for NOOP / SX-only rows) elsewhere.
+        The full batch is always routed through the vmapped L-BFGS / Adam path
+        even when some rows contain no parametric gates. Splitting into
+        sub-batches based on a has_params mask (the previous behaviour) (a)
+        forced a device→host sync to materialise the mask and (b) made the
+        downstream JIT specialise to a variable sub-batch size, retriggering
+        compilation every rollout. For circuits with no parametric gates the
+        optimiser is a cheap no-op — grads are identically zero — so the
+        steady-state cost of a single fixed-shape JIT dwarfs the saved work.
         """
-        has_params = np.asarray(
-            np.any(np.asarray(gate_type_ids_batch) < _GATE_TYPE_TO_ID["SX"], axis=1),
-            dtype=bool,
-        )
-        batch_size = initial_angles_batch.shape[0]
-        fidelities = np.zeros((batch_size,), dtype=np.float64)
-        opt_angles = np.asarray(initial_angles_batch, dtype=self._np_real_dtype).copy()
-
-        no_param_indices = np.flatnonzero(~has_params)
-        if no_param_indices.size > 0:
-            fidelities[no_param_indices] = np.asarray(
-                self._fidelity_batch_fn(
-                    jnp.take(initial_angles_batch, no_param_indices, axis=0),
-                    jnp.take(gate_type_ids_batch, no_param_indices, axis=0),
-                    jnp.take(qubit0_batch, no_param_indices, axis=0),
-                    jnp.take(cnot_pair_batch, no_param_indices, axis=0),
-                ),
-                dtype=np.float64,
-            )
-
-        param_indices = np.flatnonzero(has_params)
-        if param_indices.size == 0:
-            return fidelities, opt_angles, rng_key
-
         opt_fidelities, full_params_batch, rng_key = self._optimize_angles_batch(
-            jnp.take(initial_angles_batch, param_indices, axis=0),
-            jnp.take(gate_type_ids_batch, param_indices, axis=0),
-            jnp.take(qubit0_batch, param_indices, axis=0),
-            jnp.take(cnot_pair_batch, param_indices, axis=0),
+            initial_angles_batch,
+            gate_type_ids_batch,
+            qubit0_batch,
+            cnot_pair_batch,
             rng_key,
             num_restarts=self.num_restarts,
         )
-        fidelities[param_indices] = np.asarray(opt_fidelities, dtype=np.float64)
-        opt_angles[param_indices] = np.asarray(full_params_batch, dtype=self._np_real_dtype)
-
+        fidelities = np.asarray(opt_fidelities, dtype=np.float64)
+        opt_angles = np.asarray(full_params_batch, dtype=self._np_real_dtype)
         return fidelities, opt_angles, rng_key
 
     def optimize_circuit(self, token_names: list[str], rng_key: jax.Array) -> tuple[float, jax.Array]:

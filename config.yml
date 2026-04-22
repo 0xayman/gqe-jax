@@ -19,7 +19,7 @@ model:
 training:
   max_epochs: 50
   num_samples: 500 # Circuits generated per epoch (rollout size)
-  batch_size: 32 # Gradient-step batch size (drawn from replay buffer)
+  batch_size: 128 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
   grad_norm_clip: 1.0
   seed: 42
@@ -55,7 +55,7 @@ reward:
   # F is process fidelity, C is CNOT count, D is circuit depth.
   # Two hyperparameters: lambda_structure and gamma_depth.
   # Fidelity dominates when far from 1; structure savings matter as F approaches 1.
-  lambda_structure: 0.3 # trade-off weight between fidelity and structure
+  lambda_structure: 1.0 # trade-off weight between fidelity and structure
   gamma_depth: 1.0 # depth-vs-CNOT relative weight (CNOT-only at 0)
   # ── Pareto archive (reporting only; does not feed back into reward) ───────
   fidelity_floor: 0.95 # archive only circuits with F >= 0.95

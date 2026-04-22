@@ -158,6 +158,53 @@ class ParetoArchive:
 
         return True
 
+    def update_batch(self, points: List[ParetoPoint]) -> None:
+        """Insert many points in one vectorised pass.
+
+        Equivalent to calling :meth:`update` for each point but avoids the
+        per-insert ``np.append`` + re-scan that made ``update`` O(B × A) per
+        rollout. The combined (archive ∪ accepted-candidates) set is filtered
+        in one O((B+A)²) numpy broadcast and then crowding-pruned to ``max_size``.
+        """
+        if not points:
+            return
+        floor = self.fidelity_floor
+        candidates = [p for p in points if p.fidelity >= floor]
+        if not candidates:
+            return
+
+        combined = list(self._archive) + candidates
+        n = len(combined)
+        fids = np.fromiter((p.fidelity for p in combined), dtype=np.float32, count=n)
+        depths = np.fromiter((p.depth for p in combined), dtype=np.int32, count=n)
+        cnots = np.fromiter((p.cnot_count for p in combined), dtype=np.int32, count=n)
+        tol = np.float32(self.fidelity_tol)
+
+        f_i = fids[:, None]
+        d_i = depths[:, None]
+        c_i = cnots[:, None]
+        f_j = fids[None, :]
+        d_j = depths[None, :]
+        c_j = cnots[None, :]
+        be = (f_j + tol >= f_i) & (d_j <= d_i) & (c_j <= c_i)
+        sb = (f_j > f_i + tol) | (d_j < d_i) | (c_j < c_i)
+        dominates = be & sb
+        # A row i is dominated iff some j ≠ i dominates it. The strict-better
+        # mask already excludes equal-on-all-axes pairs, so the diagonal is
+        # naturally False and no fill_diagonal is needed.
+        keep_mask = ~dominates.any(axis=1)
+
+        # Preserve original archive-insertion order among survivors so
+        # dominance ties are resolved deterministically.
+        keep_idx = np.flatnonzero(keep_mask)
+        self._archive = [combined[i] for i in keep_idx]
+        self._fid = fids[keep_idx]
+        self._depth = depths[keep_idx]
+        self._cnot = cnots[keep_idx]
+
+        while self.max_size > 0 and len(self._archive) > self.max_size:
+            self._prune_by_crowding()
+
     # ------------------------------------------------------------------
     # Pruning
     # ------------------------------------------------------------------

@@ -455,18 +455,28 @@ class Pipeline:
         self._last_rollout_opt_angles = np.asarray(opt_angles, dtype=np.float32)
 
         if self.pareto_archive is not None:
-            for i in range(len(idx_output)):
-                self.pareto_archive.update(
+            # Pre-filter by fidelity floor in numpy so we only wrap survivors
+            # in ParetoPoint objects, then insert the whole batch in one
+            # vectorised dominance sweep.
+            fid_np = np.asarray(fidelities, dtype=np.float32)
+            floor = np.float32(self.pareto_archive.fidelity_floor)
+            keep = np.flatnonzero(fid_np >= floor)
+            if keep.size:
+                epoch = self._current_epoch
+                opt_angles_np = np.asarray(opt_angles, dtype=np.float32)
+                new_points = [
                     ParetoPoint(
-                        fidelity=float(fidelities[i]),
+                        fidelity=float(fid_np[i]),
                         depth=int(depths[i]),
                         total_gates=int(total_gates[i]),
                         cnot_count=int(cnot_counts[i]),
                         token_sequence=simplified_idx[i].copy(),
-                        epoch=self._current_epoch,
-                        opt_angles=np.asarray(opt_angles[i], dtype=np.float32).copy(),
+                        epoch=epoch,
+                        opt_angles=opt_angles_np[i].copy(),
                     )
-                )
+                    for i in keep.tolist()
+                ]
+                self.pareto_archive.update_batch(new_points)
 
     def set_cost(self, cost):
         self._cost = cost

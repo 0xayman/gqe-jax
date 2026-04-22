@@ -8,8 +8,8 @@ The JSONL is appended one line per unitary. Re-running the script resumes:
 completed seeds are skipped so long runs can be interrupted safely.
 
 Usage:
-    python benchmark.py [--num-unitaries 50] [--base-seed 1000]
-                        [--output results/benchmark_2q.jsonl]
+    python benchmark.py [--qubits 2] [--circuits 50] [--base-seed 1000]
+                        [--output results/benchmark_<N>q.jsonl]
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 
-from config import TargetConfig, load_config
+from config import TargetConfig, default_max_gates_count, load_config
 from cost import build_cost_fn
 from gqe import gqe
 from main import _compile_target_with_qiskit
@@ -37,9 +37,6 @@ from reporting import (
 )
 
 
-NUM_QUBITS = 2
-
-
 def haar_unitary(num_qubits: int, seed: int) -> np.ndarray:
     """Haar-uniform unitary on ``num_qubits`` qubits (QR-on-ginibre method)."""
     d = 2 ** num_qubits
@@ -50,15 +47,18 @@ def haar_unitary(num_qubits: int, seed: int) -> np.ndarray:
     return q * phase[np.newaxis, :]
 
 
-def build_benchmark_cfg(base_cfg):
-    """Return a copy of ``base_cfg`` forced to 2 qubits with W&B disabled.
+def build_benchmark_cfg(base_cfg, num_qubits: int):
+    """Return a copy of ``base_cfg`` forced to ``num_qubits`` qubits with W&B disabled.
 
     The target section is set to a placeholder; we never call ``build_target``
     in the benchmark because the unitary is constructed in-process per seed.
     """
-    target = TargetConfig(num_qubits=NUM_QUBITS, type="haar_random", path=None)
+    target = TargetConfig(num_qubits=num_qubits, type="haar_random", path=None)
     logging = dataclasses.replace(base_cfg.logging, wandb=False)
-    return dataclasses.replace(base_cfg, target=target, logging=logging)
+    model = dataclasses.replace(
+        base_cfg.model, max_gates_count=default_max_gates_count(num_qubits)
+    )
+    return dataclasses.replace(base_cfg, target=target, logging=logging, model=model)
 
 
 def already_completed_seeds(output_path: Path) -> set[int]:
@@ -80,12 +80,12 @@ def already_completed_seeds(output_path: Path) -> set[int]:
     return seeds
 
 
-def run_one(cfg, pool, u_target: np.ndarray, seed: int) -> dict:
+def run_one(cfg, pool, u_target: np.ndarray, seed: int, num_qubits: int) -> dict:
     """Run GQE + Qiskit on one unitary. Returns a row dict ready for JSONL."""
     cost_fn = build_cost_fn(u_target)
 
     # ── Qiskit reference ───────────────────────────────────────────────────
-    qiskit_qc = _compile_target_with_qiskit(u_target, NUM_QUBITS, cfg.pool.rotation_gates)
+    qiskit_qc = _compile_target_with_qiskit(u_target, num_qubits, cfg.pool.rotation_gates)
     q_depth, q_total, q_two_q = circuit_stats(qiskit_qc)
 
     # ── GQE training ────────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ def run_one(cfg, pool, u_target: np.ndarray, seed: int) -> dict:
 
     row: dict = {
         "seed": seed,
-        "num_qubits": NUM_QUBITS,
+        "num_qubits": num_qubits,
         "qiskit_cnot": int(qiskit_qc.count_ops().get("cx", 0)),
         "qiskit_depth": q_depth,
         "qiskit_total_gates": q_total,
@@ -170,26 +170,34 @@ def format_eta(remaining: int, mean_sec: float) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-unitaries", type=int, default=50)
+    parser.add_argument("--qubits", type=int, default=2, help="Number of qubits")
+    parser.add_argument(
+        "--circuits", "--num-unitaries", dest="circuits", type=int, default=50,
+        help="Number of Haar-random circuits to benchmark",
+    )
     parser.add_argument("--base-seed", type=int, default=1000)
     parser.add_argument("--config", default="config.yml")
-    parser.add_argument("--output", default="results/benchmark_2q.jsonl")
+    parser.add_argument(
+        "--output", default=None,
+        help="Output JSONL path (default: results/benchmark_<qubits>q.jsonl)",
+    )
     args = parser.parse_args()
 
+    num_qubits = args.qubits
     load_dotenv()
 
     base_cfg = load_config(args.config)
-    cfg = build_benchmark_cfg(base_cfg)
-    pool = build_operator_pool(num_qubits=NUM_QUBITS, rotation_gates=cfg.pool.rotation_gates)
+    cfg = build_benchmark_cfg(base_cfg, num_qubits)
+    pool = build_operator_pool(num_qubits=num_qubits, rotation_gates=cfg.pool.rotation_gates)
 
-    output_path = Path(args.output)
+    output_path = Path(args.output or f"results/benchmark_{num_qubits}q.jsonl")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     done = already_completed_seeds(output_path)
 
-    all_seeds = [args.base_seed + i for i in range(args.num_unitaries)]
+    all_seeds = [args.base_seed + i for i in range(args.circuits)]
     pending = [s for s in all_seeds if s not in done]
 
-    print(f"Benchmark config: {NUM_QUBITS}q, {args.num_unitaries} unitaries")
+    print(f"Benchmark config: {num_qubits}q, {args.circuits} unitaries")
     print(f"  Output: {output_path}")
     print(f"  Completed (resume): {len(done)} / {len(all_seeds)}")
     print(f"  Pending: {len(pending)}")
@@ -199,10 +207,10 @@ def main():
 
     durations: list[float] = []
     for i, seed in enumerate(pending, start=1):
-        u_target = haar_unitary(NUM_QUBITS, seed=seed)
+        u_target = haar_unitary(num_qubits, seed=seed)
         print(f"\n[{i}/{len(pending)}] seed={seed}")
         t0 = time.time()
-        row = run_one(cfg, pool, u_target, seed)
+        row = run_one(cfg, pool, u_target, seed, num_qubits)
         dt = time.time() - t0
         durations.append(dt)
 

@@ -83,19 +83,98 @@ def _update_best_from_latest_rollout(
     return best_cost, best_indices, best_raw_fidelity, best_cnot_count, best_angles
 
 
-def _refine_pareto_archive(pipeline: Pipeline, refine_restarts: int = 16) -> None:
-    """Re-optimise angles for every surviving Pareto entry with more restarts.
+def _greedy_gate_drop(
+    pipeline: Pipeline,
+    tokens_no_bos: np.ndarray,
+    base_fidelity: float,
+    base_angles: np.ndarray | None,
+    fid_floor: float,
+    fid_tol: float,
+) -> tuple[np.ndarray, float, np.ndarray | None]:
+    """Greedily delete gates while preserving fidelity.
 
-    Each archive entry's structure is kept intact; only angles (and thus
-    fidelity) can change. Entries that reach a higher fidelity may dominate
-    previously-kept entries, so the refined points are funnelled through a
-    fresh :class:`ParetoArchive` to let dominance filtering evict redundant
-    circuits.
+    For the current token sequence, build one drop candidate per non-NOOP
+    position (that position overwritten with STOP) and re-optimise angles for
+    all candidates as one batch. Accept the drop that yields the highest
+    fidelity as long as it stays within ``fid_tol`` of the pre-drop fidelity
+    and above ``fid_floor``. Prefer dropping CNOTs first — only try rotation
+    drops when no CNOT can be removed in the current round. Repeat until no
+    drop succeeds.
+    """
+    optimizer = pipeline.continuous_optimizer
+    stop_id = int(pipeline.stop_token_id)
+    is_noop = pipeline.token_is_noop
+    two_q_mask = pipeline.two_qubit_token_mask
+
+    current = np.asarray(tokens_no_bos, dtype=np.int32).copy()
+    current_fid = float(base_fidelity)
+    current_angles = (
+        np.asarray(base_angles, dtype=np.float32).copy()
+        if base_angles is not None
+        else None
+    )
+
+    while True:
+        non_noop = [i for i, t in enumerate(current) if not bool(is_noop[int(t)])]
+        if not non_noop:
+            break
+        cnot_pos = [p for p in non_noop if bool(two_q_mask[int(current[p])])]
+        rot_pos = [p for p in non_noop if not bool(two_q_mask[int(current[p])])]
+
+        def evaluate(positions: list[int]):
+            if not positions:
+                return None
+            batch = np.tile(current, (len(positions), 1))
+            for row, pos in enumerate(positions):
+                batch[row, pos] = stop_id
+            fids, angs, pipeline.rng_key = optimizer.optimize_token_id_batch(
+                batch, pipeline.rng_key
+            )
+            fids = np.asarray(fids, dtype=np.float64)
+            angs = np.asarray(angs)
+            keep = (fids >= current_fid - fid_tol) & (fids >= fid_floor)
+            if not keep.any():
+                return None
+            scored = np.where(keep, fids, -np.inf)
+            best = int(np.argmax(scored))
+            return (
+                batch[best].copy(),
+                float(fids[best]),
+                np.asarray(angs[best], dtype=np.float32).copy(),
+            )
+
+        chosen = evaluate(cnot_pos)
+        if chosen is None:
+            chosen = evaluate(rot_pos)
+        if chosen is None:
+            break
+        current, current_fid, current_angles = chosen
+
+    return current, current_fid, current_angles
+
+
+def _refine_pareto_archive(
+    pipeline: Pipeline,
+    refine_restarts: int = 16,
+    drop_fid_floor: float | None = None,
+    drop_fid_tol: float = 1e-4,
+) -> None:
+    """Re-optimise angles then greedily drop redundant gates.
+
+    Phase 1 re-runs L-BFGS on each archive entry with more restarts to tighten
+    the angle fit; phase 2 attempts to delete gates while keeping fidelity
+    within ``drop_fid_tol`` of the post-phase-1 value and above ``drop_fid_floor``
+    (defaults to ``cfg.reward.fidelity_threshold``). Refined points are
+    re-inserted through a fresh :class:`ParetoArchive` so dominance filtering
+    evicts any entries that the reduced circuits now supersede.
     """
     archive = pipeline.pareto_archive
     optimizer = pipeline.continuous_optimizer
     if archive is None or optimizer is None or len(archive) == 0:
         return
+
+    if drop_fid_floor is None:
+        drop_fid_floor = float(pipeline.cfg.reward.fidelity_threshold)
 
     entries = list(archive._archive)
     # token_sequence is BOS-prefixed; the optimiser consumes (B, max_gates).
@@ -118,21 +197,57 @@ def _refine_pareto_archive(pipeline: Pipeline, refine_restarts: int = 16) -> Non
         fidelity_floor=archive.fidelity_floor,
         fidelity_tol=archive.fidelity_tol,
     )
+    ngates = pipeline.ngates
+    bos_id = int(pipeline.bos_token_id)
     for p, new_f, new_ang in zip(entries, new_fidelities, new_angles):
+        tokens_no_bos = np.asarray(p.token_sequence, dtype=np.int32)[1:].copy()
         improved = float(new_f) >= float(p.fidelity)
         fidelity = max(float(new_f), float(p.fidelity))
-        angles = (
-            np.asarray(new_ang, dtype=np.float32)
-            if improved
-            else p.opt_angles
-        )
+        if improved:
+            angles = np.asarray(new_ang, dtype=np.float32)
+        else:
+            angles = (
+                np.asarray(p.opt_angles, dtype=np.float32)
+                if p.opt_angles is not None
+                else None
+            )
+
+        depth = p.depth
+        total_gates = p.total_gates
+        cnot_count = p.cnot_count
+
+        # Phase 2: structural reduction — only worth attempting once the
+        # circuit already meets the reporting fidelity threshold.
+        if fidelity >= drop_fid_floor:
+            reduced_tokens, reduced_fid, reduced_angles = _greedy_gate_drop(
+                pipeline,
+                tokens_no_bos,
+                fidelity,
+                angles,
+                fid_floor=drop_fid_floor,
+                fid_tol=drop_fid_tol,
+            )
+            if reduced_angles is not None and not np.array_equal(
+                reduced_tokens, tokens_no_bos
+            ):
+                tokens_no_bos = reduced_tokens
+                fidelity = reduced_fid
+                angles = reduced_angles
+                depth, total_gates, cnot_count = pipeline.sequence_structure_metrics(
+                    tokens_no_bos
+                )
+
+        token_sequence_full = np.empty((ngates + 1,), dtype=np.int32)
+        token_sequence_full[0] = bos_id
+        token_sequence_full[1:] = tokens_no_bos
+
         refined.update(
             ParetoPoint(
                 fidelity=fidelity,
-                depth=p.depth,
-                total_gates=p.total_gates,
-                cnot_count=p.cnot_count,
-                token_sequence=np.asarray(p.token_sequence, dtype=np.int32).copy(),
+                depth=int(depth),
+                total_gates=int(total_gates),
+                cnot_count=int(cnot_count),
+                token_sequence=token_sequence_full,
                 epoch=p.epoch,
                 opt_angles=angles,
             )
