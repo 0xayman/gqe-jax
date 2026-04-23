@@ -28,6 +28,7 @@ Commutation model (conservative — never claim commutation where it fails):
 from __future__ import annotations
 
 import numpy as np
+import numba
 
 TOKEN_AXIS_NOOP = 0
 TOKEN_AXIS_RX = 1
@@ -35,6 +36,132 @@ TOKEN_AXIS_RY = 2
 TOKEN_AXIS_RZ = 3
 TOKEN_AXIS_SX = 4
 TOKEN_AXIS_CNOT = 5
+
+
+@numba.njit(cache=True, inline="always")
+def _commutes_nb(axis_a, q0_a, q1_a, axis_b, q0_b, q1_b):
+    a_is_two = q1_a >= 0
+    b_is_two = q1_b >= 0
+
+    # Disjoint supports always commute.
+    if a_is_two:
+        if b_is_two:
+            disjoint = (q0_a != q0_b and q0_a != q1_b
+                        and q1_a != q0_b and q1_a != q1_b)
+        else:
+            disjoint = (q0_b != q0_a and q0_b != q1_a)
+    else:
+        if b_is_two:
+            disjoint = (q0_a != q0_b and q0_a != q1_b)
+        else:
+            disjoint = q0_a != q0_b
+    if disjoint:
+        return True
+
+    # Both single-qubit, shared qubit.
+    if (not a_is_two) and (not b_is_two):
+        return axis_a == axis_b and q0_a == q0_b
+
+    # Single-qubit vs CNOT, overlapping support.
+    if (not a_is_two) and b_is_two:
+        if axis_a == TOKEN_AXIS_RZ and q0_a == q0_b:
+            return True
+        if (axis_a == TOKEN_AXIS_RX or axis_a == TOKEN_AXIS_SX) and q0_a == q1_b:
+            return True
+        return False
+    if (not b_is_two) and a_is_two:
+        if axis_b == TOKEN_AXIS_RZ and q0_b == q0_a:
+            return True
+        if (axis_b == TOKEN_AXIS_RX or axis_b == TOKEN_AXIS_SX) and q0_b == q1_a:
+            return True
+        return False
+
+    # CNOT vs CNOT on overlapping supports.
+    if q0_a == q0_b and q1_a == q1_b:
+        return True
+    cross = (q0_a == q1_b) or (q1_a == q0_b)
+    return not cross
+
+
+@numba.njit(cache=True, parallel=True)
+def _simplify_batch_nb(rows, axis_tbl, q0_tbl, q1_tbl, stop_id):
+    """Vectorised batch simplification; runs each row in parallel across cores.
+
+    Exactly mirrors _simplify_row_pylists: rule 1 (merge same-axis same-qubit
+    rotations), rule 2 (cancel identical adjacent CNOTs), commute-then-merge
+    across commuting runs on overlapping support.
+    """
+    B, n = rows.shape
+    out = rows.copy()
+    for b in numba.prange(B):
+        for i in range(n):
+            tok_i = out[b, i]
+            axis_i = axis_tbl[tok_i]
+            if axis_i == TOKEN_AXIS_NOOP:
+                continue
+            q0_i = q0_tbl[tok_i]
+            q1_i = q1_tbl[tok_i]
+            a_is_two = q1_i >= 0
+            i_is_rot = (
+                axis_i == TOKEN_AXIS_RX
+                or axis_i == TOKEN_AXIS_RY
+                or axis_i == TOKEN_AXIS_RZ
+            )
+
+            j = i + 1
+            while j < n:
+                tok_j = out[b, j]
+                axis_j = axis_tbl[tok_j]
+                if axis_j == TOKEN_AXIS_NOOP:
+                    j += 1
+                    continue
+                q0_j = q0_tbl[tok_j]
+                q1_j = q1_tbl[tok_j]
+                b_is_two = q1_j >= 0
+
+                # Rule 1: same-axis single-qubit rotation on same qubit.
+                if (
+                    i_is_rot
+                    and axis_i == axis_j
+                    and (not a_is_two)
+                    and (not b_is_two)
+                    and q0_i == q0_j
+                ):
+                    out[b, j] = stop_id
+                    j += 1
+                    continue
+
+                # Rule 2: identical adjacent CNOTs cancel.
+                if (
+                    axis_i == TOKEN_AXIS_CNOT
+                    and axis_j == TOKEN_AXIS_CNOT
+                    and q0_i == q0_j
+                    and q1_i == q1_j
+                ):
+                    out[b, i] = stop_id
+                    out[b, j] = stop_id
+                    break
+
+                # Inline disjoint-support fast path.
+                if a_is_two:
+                    if b_is_two:
+                        disjoint = (q0_i != q0_j and q0_i != q1_j
+                                    and q1_i != q0_j and q1_i != q1_j)
+                    else:
+                        disjoint = (q0_j != q0_i and q0_j != q1_i)
+                else:
+                    if b_is_two:
+                        disjoint = (q0_i != q0_j and q0_i != q1_j)
+                    else:
+                        disjoint = q0_i != q0_j
+                if disjoint:
+                    j += 1
+                    continue
+
+                if not _commutes_nb(axis_i, q0_i, q1_i, axis_j, q0_j, q1_j):
+                    break
+                j += 1
+    return out
 
 
 def build_token_axis(pool_names: list[str]) -> np.ndarray:
@@ -209,19 +336,16 @@ def simplify_token_batch(
 ) -> np.ndarray:
     """Apply simplification to each row of ``tokens_batch``.
 
-    Metadata tables are converted to Python lists once so the per-row inner
-    loop can use native int arithmetic instead of numpy scalar indexing.
+    Runs rows in parallel via a numba.njit kernel — releases the GIL so the
+    batch fans out across CPU cores instead of serialising one Python row at
+    a time.
     """
-    tokens_batch = np.asarray(tokens_batch, dtype=np.int32)
+    tokens_batch = np.ascontiguousarray(tokens_batch, dtype=np.int32)
     if tokens_batch.size == 0:
         return tokens_batch.copy()
-    axis_tbl = np.asarray(token_axis, dtype=np.int32).tolist()
-    q0_tbl = np.asarray(token_q0, dtype=np.int32).tolist()
-    q1_tbl = np.asarray(token_q1, dtype=np.int32).tolist()
-    stop_id = int(stop_token_id)
-    rows = tokens_batch.tolist()
-    simplified = [
-        _simplify_row_pylists(row, axis_tbl, q0_tbl, q1_tbl, stop_id)
-        for row in rows
-    ]
-    return np.asarray(simplified, dtype=np.int32)
+    axis_tbl = np.ascontiguousarray(token_axis, dtype=np.int32)
+    q0_tbl = np.ascontiguousarray(token_q0, dtype=np.int32)
+    q1_tbl = np.ascontiguousarray(token_q1, dtype=np.int32)
+    return _simplify_batch_nb(
+        tokens_batch, axis_tbl, q0_tbl, q1_tbl, np.int32(stop_token_id)
+    )

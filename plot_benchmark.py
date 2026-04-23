@@ -1,7 +1,7 @@
 """Render the 2-qubit GQE vs Qiskit benchmark as a 3-panel figure.
 
-Reads ``results/benchmark_2q.jsonl`` (produced by ``benchmark.py``) and writes
-``results/benchmark_2q.png`` (+ a ``.pdf``). Re-run anytime; does not touch the
+Reads ``results/benchmark_3q.jsonl`` (produced by ``benchmark.py``) and writes
+``results/benchmark_3q.png`` (+ a ``.pdf``). Re-run anytime; does not touch the
 training pipeline.
 
 Panels (shared x-axis, sorted by GQE fidelity ascending):
@@ -140,8 +140,8 @@ def render(rows: list[dict], output: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="results/benchmark_2q.jsonl")
-    parser.add_argument("--output", default="results/benchmark_2q.png")
+    parser.add_argument("--input", default="results/benchmark_3q.jsonl")
+    parser.add_argument("--output", default="results/benchmark_3q.png")
     args = parser.parse_args()
 
     rows = load_rows(Path(args.input))
