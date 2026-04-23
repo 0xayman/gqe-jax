@@ -1,9 +1,9 @@
 # config.yml — GQE Quantum Compilation Configuration
 
 target:
-  num_qubits: 3
+  num_qubits: 4
   type: "file" # Load a saved target unitary from disk
-  path: "targets/haar_random_q3.npy"
+  path: "targets/haar_random_q4.npy"
 
 pool:
   rotation_gates: ["rz", "ry"] # choose from rz | rx | ry; order is preserved in the pool/Qiskit basis
@@ -17,9 +17,9 @@ model:
   # max_gates_count: 128
 
 training:
-  max_epochs: 50
-  num_samples: 500 # Circuits generated per epoch (rollout size)
-  batch_size: 128 # Gradient-step batch size (drawn from replay buffer)
+  max_epochs: 100
+  num_samples: 512 # Circuits generated per epoch (rollout size)
+  batch_size: 256 # Gradient-step batch size (drawn from replay buffer)
   lr: 1.0e-4
   grad_norm_clip: 1.0
   seed: 42
@@ -34,7 +34,7 @@ temperature:
   max_value: 1.5
 
 buffer:
-  max_size: 1000
+  max_size: 1024
   steps_per_epoch: 4
 
 logging:

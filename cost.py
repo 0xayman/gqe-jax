@@ -40,7 +40,8 @@ def build_cost_fn(u_target: np.ndarray) -> Callable[[List[np.ndarray]], float]:
 
 def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array:
     d = u_target.shape[0]
-    trace = jnp.trace(jnp.conjugate(u_target).T @ u_circuit)
+    # trace(A^H B) == sum_ij conj(A_ij) B_ij — O(d^2) vs the O(d^3) matmul-then-trace.
+    trace = jnp.sum(jnp.conjugate(u_target) * u_circuit)
     return jnp.clip((jnp.abs(trace) ** 2) / (d**2), 0.0, 1.0)
 
 

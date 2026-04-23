@@ -374,6 +374,13 @@ class Pipeline:
             )
         )
         if self.u_target_jax is not None:
+            # NOTE on convention: the CNOT matrices stored in
+            # ``self.token_matrices_jax`` come from ``operator_pool``, which
+            # uses a different embedding convention from
+            # ``ContinuousOptimizer._cnot_matrices``. The two paths can't be
+            # swapped without changing numerical outputs for CNOT tokens.
+            # Keep the original (d,d) scan for the discrete path; it is cold
+            # code under the typical config (top_k=0, continuous enabled).
             self._discrete_cost_batch = jax.jit(
                 lambda token_ids: compilation_cost_batch_jax(
                     self.u_target_jax,

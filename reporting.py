@@ -229,6 +229,84 @@ def build_reported_circuit(
     )
 
 
+def save_pareto_archive_json(
+    *,
+    cfg: GQEConfig,
+    pool,
+    u_target: np.ndarray,
+    pareto_archive,
+    target_desc: str,
+    output_path: str,
+) -> int:
+    """Dump every Pareto-front circuit to a JSON file for later inspection.
+
+    Each entry includes objective values, gate names, optimised angles, and the
+    OpenQASM 2 representation of the reconstructed Qiskit circuit so the user
+    can diff/compare circuits without re-running training.
+    """
+    import json
+    import os
+
+    if pareto_archive is None or len(pareto_archive) == 0:
+        return 0
+
+    try:
+        from qiskit.qasm2 import dumps as qasm2_dumps
+    except ImportError:  # pragma: no cover — qiskit always available here
+        qasm2_dumps = None
+
+    entries = pareto_archive.to_sorted_list()
+    circuits = []
+    for i, p in enumerate(entries):
+        reported = build_reported_circuit(
+            cfg=cfg,
+            pool=pool,
+            u_target=u_target,
+            report_indices=np.asarray(p.token_sequence, dtype=np.int32),
+            report_angles=p.opt_angles,
+            report_fidelity=float(p.fidelity),
+        )
+        qasm = None
+        if qasm2_dumps is not None:
+            try:
+                qasm = qasm2_dumps(reported.qc)
+            except Exception:
+                qasm = None
+        circuits.append({
+            "index": i,
+            "fidelity": float(p.fidelity),
+            "depth": int(p.depth),
+            "total_gates": int(p.total_gates),
+            "cnot_count": int(p.cnot_count),
+            "epoch": int(p.epoch),
+            "gate_names": list(reported.gate_names),
+            "opt_angles": (
+                np.asarray(p.opt_angles, dtype=np.float64).tolist()
+                if p.opt_angles is not None else None
+            ),
+            "token_sequence": np.asarray(p.token_sequence, dtype=np.int32).tolist(),
+            "verified_fidelity": float(reported.verified_fidelity),
+            "qc_fidelity": float(reported.qc_fidelity),
+            "qasm": qasm,
+        })
+
+    payload = {
+        "target_type": cfg.target.type,
+        "target_desc": target_desc,
+        "num_qubits": int(cfg.target.num_qubits),
+        "rotation_gates": list(cfg.pool.rotation_gates),
+        "hypervolume_2d": float(pareto_archive.hypervolume_2d()),
+        "num_circuits": len(circuits),
+        "circuits": circuits,
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    return len(circuits)
+
+
 def circuit_stats(qc) -> tuple[int, int, int]:
     """(depth, total_gates, two_qubit_gates)."""
     depth = qc.depth()

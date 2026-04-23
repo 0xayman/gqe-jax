@@ -10,6 +10,7 @@ from reporting import (
     build_reported_circuit,
     circuit_stats,
     gate_names_from_token_sequence,
+    save_pareto_archive_json,
     select_report_token_sequence,
 )
 from target import build_target
@@ -225,6 +226,22 @@ def main():
         qiskit_two_q,
         cfg.reward.fidelity_threshold,
     )
+
+    # ── Persist every Pareto-front circuit for later inspection ─────────────
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pareto_path = f"results/pareto_front_{cfg.target.num_qubits}q_{cfg.target.type}_{stamp}.json"
+    n_saved = save_pareto_archive_json(
+        cfg=cfg,
+        pool=pool,
+        u_target=u_target,
+        pareto_archive=pareto_archive,
+        target_desc=target_desc,
+        output_path=pareto_path,
+    )
+    if n_saved > 0:
+        print(f"\nSaved {n_saved} Pareto-front circuits to {pareto_path}")
 
 
 if __name__ == "__main__":
