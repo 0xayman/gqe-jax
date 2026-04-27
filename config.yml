@@ -1,30 +1,45 @@
-# config.yml — GQE Quantum Compilation Configuration
+# config.yml — Hybrid-Action GQE Quantum Compilation
+#
+# RL-only training: the policy emits both gate tokens AND initial angles each
+# step. Fidelity is evaluated directly from sampled angles — no GD inner loop.
+# After training, the Pareto archive is refined with a few L-BFGS steps.
 
 target:
   num_qubits: 4
-  type: "file" # Load a saved target unitary from disk
+  type: "brickwork" # random | random_reachable | haar_random | file
   path: "targets/haar_random_q4.npy"
 
 pool:
-  rotation_gates: ["rz", "ry"] # choose from rz | rx | ry; order is preserved in the pool/Qiskit basis
+  rotation_gates: ["rz", "ry"] # any subset of rz | rx | ry; ordering preserved
 
 model:
-  size: "small" # tiny | small | medium | large
-  # max_gates_count is optional; if omitted it defaults to
-  # config.default_max_gates_count(num_qubits) ~ 2 * 4^n (16 for n=1, 32 for n=2,
-  # 128 for n=3, 512 for n=4, capped at 1023). Override below if you want a
-  # different ceiling; the STOP token lets the transformer end circuits early.
-  # max_gates_count: 128
+  size: "tiny" # tiny | small | medium | large
+  # Default = 2 * 4^n  (16 for 1q, 32 for 2q, 128 for 3q, 512 for 4q).
+  # Smaller values force compactness — set to ~1.5× a Qiskit transpile depth
+  # for the target. For 3q Haar (Qiskit ~30 gates), 70 is a tight budget.
+  # max_gates_count: 70
 
 training:
   max_epochs: 100
-  num_samples: 512 # Circuits generated per epoch (rollout size)
-  batch_size: 256 # Gradient-step batch size (drawn from replay buffer)
+  num_samples: 1024 # circuits sampled per epoch
+  batch_size: 256 # gradient-step batch size
   lr: 1.0e-4
   grad_norm_clip: 1.0
   seed: 42
   grpo_clip_ratio: 0.2
-  early_stop: false # Stop training once fidelity reaches 1.0
+  early_stop: false # stop training once fidelity reaches 1.0
+
+policy:
+  entropy_disc: 0.005 # categorical-entropy regularisation weight
+  entropy_cont: 0.005 # Gaussian-entropy regularisation weight
+  # HyRLQAS-style inner refinement: each rollout sample's angles get this many
+  # L-BFGS steps initialised at the RL-suggested angles. The reward then
+  # reflects the post-refinement fidelity, so the policy learns to suggest
+  # *initial* angles that converge fast rather than the optimum directly.
+  # Set to 0 for pure RL (no inner loop). With a tiny model 12-16 helps
+  # compensate for limited capacity; 5-10 is enough for small/medium models.
+  inner_refine_steps: 12
+  inner_refine_lr: 0.1
 
 temperature:
   scheduler: "cosine" # fixed | linear | cosine
@@ -34,30 +49,59 @@ temperature:
   max_value: 1.5
 
 buffer:
-  max_size: 1024
+  max_size: 2048
   steps_per_epoch: 4
 
 logging:
   verbose: true
   wandb: true
 
-continuous_opt:
+refinement:
   enabled: true
-  optimizer: lbfgs # lbfgs | adam
-  steps: 80
+  steps: 100
   lr: 0.1
-  top_k: 0
-  num_restarts: 2
+  # Multi-restart escapes the highly non-convex PQC loss landscape: runs
+  # L-BFGS from the RL angles AND from (num_restarts - 1) random Uniform[-π, π]
+  # initialisations, keeps the best per circuit. Cost scales linearly.
+  # If F is still capped < 1.0 with high num_restarts, the bottleneck is
+  # the agent's discrete topology (not the optimiser) — bump model.size.
+  num_restarts: 16
+  apply_simplify: true # simplify each archive circuit before re-optim
 
 reward:
   enabled: true
-  # ── Reward: R = F - lambda_structure * (C + gamma_depth * D) / max_gates_count
-  # F is process fidelity, C is CNOT count, D is circuit depth.
-  # Two hyperparameters: lambda_structure and gamma_depth.
-  # Fidelity dominates when far from 1; structure savings matter as F approaches 1.
-  lambda_structure: 1.0 # trade-off weight between fidelity and structure
-  gamma_depth: 1.0 # depth-vs-CNOT relative weight (CNOT-only at 0)
-  # ── Pareto archive (reporting only; does not feed back into reward) ───────
-  fidelity_floor: 0.95 # archive only circuits with F >= 0.95
+  # QASER reward: base = w_d * M_D/(D+1) + w_c * M_C/(C+1) + w_g * M_G/(G+1)
+  #               R    = base ** F - 1
+  #               (M_*: running maxima; F as exponent → structure savings count near F=1)
+  # Leave the qaser_init_max_* values at 0 to auto-init the running maxima
+  # from the first rollout's observed worst case.
+  qaser_init_max_depth: 0.0
+  qaser_init_max_cnot: 0.0
+  qaser_init_max_gates: 0.0
+  # Per-axis weights tuned for the tiny model's limited topological capacity:
+  #
+  #   w_c too high (e.g. 3): agent locks onto the first 14-CNOT layout it
+  #     finds and can't escape — non-universal topology caps F at ~0.98.
+  #   w_c too low (e.g. 0): agent uses 30+ CNOTs unnecessarily.
+  #
+  # 1.5 / 1.5 lets the agent use 14-20 CNOTs (much wider topology search)
+  # while w_g=1.5 keeps total rotations from drifting up. With a larger model
+  # (size: small / medium) you can push w_c back up to 2-3 since the model
+  # has the capacity to find universal Cartan-style 14-CNOT decompositions.
+  qaser_w_depth: 1.0
+  qaser_w_cnot: 2.0
+  qaser_w_gates: 1.5
+  # Log-infidelity multiplier: R *= (1 - log(1 - F + eps)).
+  # Set 0 for the paper-faithful QASER form. Setting eps > 0 (1e-3 typical)
+  # gives an unbounded marginal pull as F → 1, escaping the F ≈ 0.98 plateau
+  # observed on harder targets where pure base^F flattens out. Doesn't change
+  # behaviour at low/mid F (multiplier ≈ 1 there).
+  qaser_log_infidelity_eps: 1.0e-3
+  # fidelity_floor must be reachable during training, otherwise the Pareto
+  # archive stays empty and the post-training L-BFGS refinement has nothing
+  # to polish. Setting it too low (e.g. 0.0) floods the front with trivially
+  # short low-fidelity circuits (a depth-1 F=0.08 circuit is "non-dominated
+  # on compactness"). 0.5 keeps the Pareto useful while staying reachable.
+  fidelity_floor: 0.5
   max_archive_size: 500
-  fidelity_threshold: 0.99 # "best by CNOT/depth at F >= threshold" reporting queries
+  fidelity_threshold: 0.99 # "best by CNOT/depth at F >= threshold" reporting

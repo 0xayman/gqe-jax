@@ -19,11 +19,12 @@ That's the entire extension. No other files need to change.
 
 ## Built-in generators
 
-| cfg.target.type    | Strategy                                  | Fidelity 1.0 possible? |
-|--------------------|-------------------------------------------|------------------------|
-| "random_reachable" | random circuit from the pool              | Yes (by construction)  |
-| "haar_random"      | Haar-uniform random unitary               | Unlikely for small N   |
-| "file"             | load a saved unitary from .npy            | Depends on the file    |
+| cfg.target.type    | Strategy                                              | Fidelity 1.0 possible? |
+|--------------------|-------------------------------------------------------|------------------------|
+| "random_reachable" | random circuit from the pool                          | Yes (by construction)  |
+| "haar_random"      | Haar-uniform random unitary                           | Unlikely for small N   |
+| "brickwork"        | brickwork circuit of Haar-random 2-qubit gates        | Possible if depth fits |
+| "file"             | load a saved unitary from .npy                        | Depends on the file    |
 
 Import convention: absolute imports only (flat module structure).
 """
@@ -112,6 +113,79 @@ def haar_random_generator(
     return u_target, desc
 
 
+def _haar_unitary(d: int, rng: np.random.Generator) -> np.ndarray:
+    """Sample a Haar-uniform unitary on dimension ``d`` (QR-on-Ginibre)."""
+    z = (rng.standard_normal((d, d)) + 1j * rng.standard_normal((d, d))) / np.sqrt(2)
+    q, r = np.linalg.qr(z)
+    phase = np.diag(r) / np.abs(np.diag(r))
+    return q * phase[np.newaxis, :]
+
+
+def _embed_adjacent_2q(
+    gate_4x4: np.ndarray,
+    q0: int,
+    num_qubits: int,
+) -> np.ndarray:
+    """Embed a 2-qubit gate acting on adjacent qubits (q0, q0+1) using Qiskit
+    MSB-first convention (qubit 0 is the most-significant bit).
+
+    For adjacent qubits the embedding is a clean Kronecker:
+        I_{2^q0} ⊗ U_{4×4} ⊗ I_{2^(n-q0-2)}
+    """
+    if not (0 <= q0 < num_qubits - 1):
+        raise ValueError(f"adjacent 2q embedding needs 0 ≤ q0 < n-1, got q0={q0}, n={num_qubits}")
+    left = np.eye(2 ** q0, dtype=gate_4x4.dtype)
+    right = np.eye(2 ** (num_qubits - q0 - 2), dtype=gate_4x4.dtype)
+    return np.kron(np.kron(left, gate_4x4), right)
+
+
+def brickwork_haar_generator(
+    pool: List[Tuple[str, np.ndarray]],
+    cfg: GQEConfig,
+) -> Tuple[np.ndarray, str]:
+    """Generate a brickwork circuit of Haar-random 2-qubit gates.
+
+    Brickwork pattern (alternating-offset 2-qubit-gate layers):
+
+        layer 0 (even offset):  (0,1) (2,3) (4,5) ...
+        layer 1 (odd offset):   (1,2) (3,4) (5,6) ...
+        layer 2 (even offset):  (0,1) (2,3) ...
+        ...
+
+    Each 2-qubit gate is sampled independently from the Haar measure on U(4).
+    The resulting unitary is "scrambling" — it converges to an approximate
+    unitary 2-design after O(n) layers (a textbook result; see e.g.
+    Brandao–Harrow–Horodecki 2016) and to an approximate Haar unitary as
+    depth grows.
+
+    The depth (number of brick layers) defaults to ``2 * num_qubits`` if
+    ``cfg.target.brickwork_depth`` is None — enough to scramble small
+    systems (n ≤ 5) without being gratuitously deep. Override via the YAML
+    config or programmatically via ``dataclasses.replace``.
+
+    The ``pool`` argument is unused (kept for interface uniformity).
+    """
+    del pool
+    n = cfg.target.num_qubits
+    if n < 2:
+        raise ValueError("brickwork target requires num_qubits >= 2")
+    d = 2 ** n
+    depth = cfg.target.brickwork_depth
+    if depth is None:
+        depth = 2 * n
+    rng = np.random.default_rng(cfg.training.seed)
+
+    u = np.eye(d, dtype=np.complex128)
+    for layer in range(depth):
+        offset = layer % 2  # 0 → even-pair layer, 1 → odd-pair layer
+        for q0 in range(offset, n - 1, 2):
+            haar_2q = _haar_unitary(4, rng).astype(np.complex128)
+            full_gate = _embed_adjacent_2q(haar_2q, q0, n)
+            u = full_gate @ u
+    desc = f"brickwork_haar n={n} depth={depth} seed={cfg.training.seed}"
+    return u, desc
+
+
 def file_target_generator(
     pool: List[Tuple[str, np.ndarray]],
     cfg: GQEConfig,
@@ -160,6 +234,7 @@ TARGET_REGISTRY: Dict[str, TargetGenerator] = {
     "random": random_reachable_generator,  # backward-compatible alias
     "random_reachable": random_reachable_generator,
     "haar_random": haar_random_generator,
+    "brickwork": brickwork_haar_generator,
     "file": file_target_generator,
 }
 

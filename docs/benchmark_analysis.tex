@@ -1,0 +1,629 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, mathtools, bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  showstringspaces=false,
+  numberstyle=\tiny\color{gray},
+  commentstyle=\color{gray!70!black}\itshape,
+}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  citecolor=blue!50!black,
+  urlcolor=blue!60!black,
+}
+
+\newcommand{\Utarget}{U_{\text{target}}}
+\newcommand{\Ucirc}{U_{\text{circ}}}
+\newcommand{\Real}{\mathbb{R}}
+\newcommand{\Complex}{\mathbb{C}}
+\newcommand{\Expect}{\mathbb{E}}
+\newcommand{\E}{\mathrm{e}}
+
+\title{\textbf{Benchmark Analysis and Convergence-Speed Study\\
+on 2-/3-Qubit Brickwork Targets:\\
+Diagnosis and a Rotosolve-Based Refinement Proposal}}
+\author{Ayman Tarig}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We benchmark the hybrid-action GQE pipeline on $50$ Haar-random brickwork
+unitaries each at $n=2$ and $n=3$ qubits, comparing against Qiskit's
+\texttt{optimization\_level=3} transpile. The agent achieves essentially
+perfect fidelity in both cases ($\bar F \ge 0.9997$), and on $n=2$ matches
+or beats Qiskit on every structural axis. On $n=3$ a striking pattern
+emerges: GQE \emph{beats Qiskit on circuit depth} (median $\Delta D = -5$)
+while \emph{losing on CNOT count} (median $\Delta C = +5$). The agent is
+exchanging two-qubit gates for parallelism. We diagnose this trade-off as
+a joint failure of the QASER reward base \emph{and} the inner-refinement
+optimiser: L-BFGS does not converge tightly enough on the smallest
+($\sim$Khaneja-Glaser-optimal) circuits, so the agent compensates by
+sampling slightly bigger but easier-to-fit ones. We propose adopting
+the Rotosolve closed-form coordinate update --- which is exact for our
+process-fidelity objective --- as a configurable optimiser at both the
+inner and post-training refinement stages, and discuss the expected
+fidelity / CNOT / depth trade-offs and the implementation surface area.
+\end{abstract}
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Benchmark setup and headline numbers}
+% ════════════════════════════════════════════════════════════════════════════
+
+We evaluate the trained policy on $N = 50$ independently sampled
+\emph{brickwork-Haar} target unitaries per qubit count. Each target is the
+product of alternating layers of Haar-random 2-qubit gates on adjacent
+qubit pairs (even-offset layers $(0,1)(2,3)\ldots$ followed by odd-offset
+layers $(1,2)(3,4)\ldots$, repeated $2n$ times). This distribution is a
+strict generalisation of Haar-random for circuit-synthesis benchmarking:
+the resulting unitary is approximately Haar at $\mathrm{poly}(n)$ depth
+but its \emph{combinatorial origin} (a brickwork pattern of 2-qubit
+unitaries) gives Qiskit's transpiler a fairer reference target than a
+fully unstructured Haar matrix. Each circuit is trained from scratch with
+the production \texttt{config.yml} (tiny GPT-2, 100 epochs, $1024$ rollouts
+/ epoch, QASER reward with log-infidelity multiplier, post-training
+refinement with $16$ multi-restarts $\times$ $100$ L-BFGS steps each).
+
+Table~\ref{tab:headline} summarises the fifty-circuit averages.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{$n = 2$} & \multicolumn{2}{c}{$n = 3$}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+quantity                & GQE   & Qiskit & GQE   & Qiskit \\
+\midrule
+$\bar{F}$               & $0.99993$ & $1.00$ & $0.99977$ & $1.00$ \\
+$\min F$                & $0.9983$  & ---    & $0.9986$  & ---    \\
+fraction with $F \ge 0.99$ & $100\%$ & ---    & $100\%$ & --- \\
+\midrule
+mean CNOT count $\bar{C}$ & $\bm{2.92}$ & $3.00$ & $23.58$ & $\bm{19.00}$ \\
+mean depth $\bar{D}$    & $\bm{14.20}$ & $15.00$ & $\bm{56.72}$ & $62.00$ \\
+mean total gates $\bar{G}$ & $\bm{22.14}$ & $24.00$ & $\bm{95.38}$ & $96.00$ \\
+\midrule
+median $\Delta C$ (GQE$-$Qiskit) & $0$  & --- & $+5$ & ---\\
+median $\Delta D$ (GQE$-$Qiskit) & $-1$ & --- & $-5$ & ---\\
+median $\Delta G$ (GQE$-$Qiskit) & $-2$ & --- & $-1$ & ---\\
+\midrule
+$\bar{t}_{\text{train}}$ per circuit & \multicolumn{2}{c}{$75.5$ s} & \multicolumn{2}{c}{$120.2$ s}\\
+\bottomrule
+\end{tabular}
+\caption{Per-instance averages over $50$ brickwork-Haar targets. Bold
+indicates the better value. The Khaneja-Glaser CNOT lower bound is $3$
+(for $n=2$) and $14$ (for $n=3$).}
+\label{tab:headline}
+\end{table}
+
+The high-level diagnosis from these numbers is:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{The agent has solved $n=2$.} It hits or beats Qiskit on
+all three structural axes simultaneously, fidelity is essentially $1.00$,
+and the search is robust ($5/50$ runs find $2$-CNOT decompositions for
+non-maximally-entangling targets, while $44/50$ match the canonical
+$3$-CNOT KAK form).
+
+\item \textbf{$n = 3$ is good on fidelity and depth, bad on CNOT count.}
+Forty-nine of fifty $3$-qubit instances use \emph{more} CNOTs than Qiskit
+(Q1/median/Q3 deltas: $+3$/$+5$/$+6$), and forty-four of fifty have
+\emph{shorter} depth than Qiskit (median $\Delta D = -5$). The total gate
+count comes out roughly equal (median $\Delta G = -1$), so this is not
+the agent ``inflating'' the circuit, it is the agent
+\emph{redistributing} structure: trading sequential CNOTs for parallel
+ones. Two-qubit gates are the dominant noise contributor on near-term
+hardware, so this trade-off is not free.
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Diagnosis of the CNOT-vs-depth trade-off on $n=3$}
+\label{sec:diagnosis}
+% ════════════════════════════════════════════════════════════════════════════
+
+Why does the agent prefer $\sim 24$ shallow CNOTs over $\sim 19$ deeper
+ones, when the Pareto archive contains both options and the QASER reward
+explicitly penalises CNOTs more heavily than rotations
+($w_C = 2$, $w_G = 1.5$, $w_D = 1$)?
+
+\subsection{The reward base does prefer the Qiskit-shaped circuit}
+
+Let $M_D, M_C, M_G$ denote the running maxima of depth, CNOT count and
+total-gate count seen so far in training. At the typical post-training
+values $M_D \approx 80$, $M_C \approx 30$, $M_G \approx 120$ on $n=3$,
+the QASER \emph{base} term is, for representative circuits,
+\begin{align*}
+\text{Qiskit-shaped (D=62, C=19, G=96):}\quad
+& 1.0\cdot\tfrac{80}{63} + 2.0\cdot\tfrac{30}{20} + 1.5\cdot\tfrac{120}{97}
+\;\approx\; 1.27 + 3.00 + 1.86 \;=\; 6.13,\\[2pt]
+\text{GQE-shaped (D=57, C=24, G=95):}\quad
+& 1.0\cdot\tfrac{80}{58} + 2.0\cdot\tfrac{30}{25} + 1.5\cdot\tfrac{120}{96}
+\;\approx\; 1.38 + 2.40 + 1.88 \;=\; 5.66.
+\end{align*}
+The Qiskit-shaped (low-CNOT, taller) circuit produces a \emph{larger}
+reward base by about $8\%$. So the reward formulation isn't the
+problem. The agent simply isn't picking the Qiskit-shaped circuit.
+
+\subsection{The bottleneck is angle convergence, not the reward}
+
+The standard pattern in our 3-qubit training trajectories is:
+
+\begin{enumerate}[leftmargin=2em]
+\item Early epochs (1--20): the agent samples short circuits, gets
+mediocre fidelity ($F \in [0.4, 0.7]$).
+\item Middle epochs (20--60): the agent extends circuits to $\sim 100$
+gates, finds layouts with $\sim 25$ CNOTs that yield post-inner-refinement
+$F \approx 0.99$.
+\item Late epochs (60--100): the policy concentrates around the
+``$\sim 25$-CNOT, parallel'' regime. It rarely visits the
+$\sim 19$-CNOT regime that Qiskit uses.
+\end{enumerate}
+
+The reason the agent never settles on the Qiskit-shaped regime is that
+the inner-refinement L-BFGS, with $12$ steps and no multi-restart, fails
+to converge \emph{cleanly} when the discrete circuit is close to the
+Khaneja-Glaser CNOT lower bound. Tight, near-optimal-CNOT circuits live
+in the most non-convex part of the variational loss surface (every
+parameter contributes to many entries of $\Ucirc$ simultaneously, so the
+condition number explodes). At the inner stage the optimiser ``gives up''
+early and reports $F \approx 0.95$--$0.97$ for a $19$-CNOT circuit even
+though, with multi-restart and $100$ L-BFGS iterations during post-training
+refinement, the same topology often reaches $F = 1.00$.
+
+The agent therefore receives a \emph{biased} fidelity signal at training
+time. In the regime that should be optimal (low CNOT, K-G shape), the
+inner-refined fidelity is lower than the truly attainable fidelity, while
+in the slightly-deeper-but-easier regime (parallel CNOTs at $\sim 24$
+count) the inner-refined fidelity is genuinely high. The QASER multiplier
+$\text{base}^F$ then pulls in favour of the easier-to-fit shape.
+
+This bias is not visible at $n = 2$ because the angle-convergence problem
+is trivial there ($\le 3$ rotation parameters between any two CNOTs),
+and the inner L-BFGS is well within its sweet spot.
+
+\subsection{Why the post-training refinement does not retrofix this}
+
+Post-training refinement \emph{can} converge tightly: it runs $100$
+L-BFGS steps with $16$ random restarts. But it operates on the entries
+\emph{already} in the Pareto archive. Since the agent rarely sampled
+near-K-G-shaped circuits during training, those circuits never entered
+the archive in the first place. Refinement polishes what it is given;
+it cannot replace the discrete topology.
+
+The conclusion is unambiguous: \textbf{the bottleneck for matching
+Qiskit's CNOT count on $n \ge 3$ is angle-convergence quality at training
+time, specifically inside the inner-refinement step}. To fix it we need
+either (a) more L-BFGS work per sample, which scales the rollout cost
+linearly, or (b) a better optimiser that converges in fewer evaluations.
+We argue below that Rotosolve gives us option (b).
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Convergence speed: where time is actually spent}
+% ════════════════════════════════════════════════════════════════════════════
+
+A second axis of improvement is the wall-clock time per training run.
+Per-circuit averages are $75.5$ s ($n = 2$) and $120.2$ s ($n = 3$). For
+a $50$-circuit benchmark this is roughly $1$ hour for $n = 2$ and
+$1$h$40$ for $n = 3$ on GPU.
+
+Profiling broadly partitions the per-epoch cost as follows:
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Rollout (KV-cached transformer decode).} O(N\_samples $\cdot$ T) — small for the tiny model.
+\item \textbf{Inner refinement (12 L-BFGS steps $\times$ 1024 samples).} The dominant cost. Each L-BFGS step
+takes one value-and-grad evaluation through the $T_{\max}$-step circuit
+\texttt{lax.scan}; with $T_{\max} = 105$ ($n = 3$) this is $\sim 12 \cdot 105 = 1260$ scan iterations per sample.
+\item \textbf{Fidelity evaluation for reward.} One forward pass per sample.
+\item \textbf{PPO update (4 $\times$ 256-mini-batch passes through the
+buffer).} Less expensive than inner refinement because the gradient is
+shared across all parameters of the transformer rather than re-traced
+per circuit.
+\item \textbf{Post-training refinement.} Once at the end:
+$|\text{archive}| \cdot 100$ L-BFGS steps $\times 16$ restarts.
+Cheap per circuit (small archive size) but quadratic in
+$T_{\max}$ at the time of jit compilation.
+\end{enumerate}
+
+The two practical levers are (i) reducing the per-step cost of the
+inner-loop optimiser, and (ii) reducing the number of inner-loop steps
+needed for convergence. L-BFGS scores well on (i) (one cheap evaluation
+per step) but poorly on (ii) for highly non-convex parameterised quantum
+circuits (Section~\ref{sec:diagnosis}). Rotosolve has the opposite
+profile: each sweep is more expensive than an L-BFGS step but a small
+constant number of sweeps converges to a global optimum within each
+parameter's coordinate. We show next that for our objective Rotosolve's
+update is \emph{exact}, not an approximation.
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Rotosolve for hybrid-action GQE}
+% ════════════════════════════════════════════════════════════════════════════
+
+\subsection{Why our objective is sinusoidal in every angle}
+
+The process-fidelity cost as a function of one rotation parameter $\theta_i$
+is exactly a single Fourier mode plus a constant. Let $g_i(\theta_i) = \cos(\theta_i / 2) I - \E^{i\, 0}\,\sin(\theta_i / 2)\,\sigma_{\alpha_i}$
+(an $\mathrm{R}_x$, $\mathrm{R}_y$, or $\mathrm{R}_z$ rotation in the
+hardware-aware basis). Then $\Ucirc(\bm\theta) = U_{>i}\, g_i(\theta_i)\, U_{<i}$
+with $U_{<i}, U_{>i}$ independent of $\theta_i$, and so
+\begin{align*}
+\mathrm{tr}\bigl(\Utarget^\dagger\,\Ucirc(\bm\theta)\bigr)
+&= \cos(\theta_i / 2)\,\underbrace{\mathrm{tr}\bigl(\Utarget^\dagger\, U_{>i}\, U_{<i}\bigr)}_{=:\,a_i}
+- i\,\sin(\theta_i / 2)\,\underbrace{\mathrm{tr}\bigl(\Utarget^\dagger\, U_{>i}\, \sigma_{\alpha_i}\, U_{<i}\bigr)}_{=:\,b_i},
+\end{align*}
+which after squaring and using $\cos^2(\theta/2) = (1 + \cos\theta)/2$
+and $\sin^2(\theta/2) = (1 - \cos\theta)/2$ gives
+\begin{equation}
+\boxed{\;
+F(\theta_i)
+\;=\;
+\frac{|a_i|^2 + |b_i|^2}{2 d^2}
+\;+\;
+\underbrace{\frac{|a_i|^2 - |b_i|^2}{2 d^2}}_{=: A_i}\,\cos\theta_i
+\;+\;
+\underbrace{\frac{\mathrm{Im}(\bar a_i b_i)}{d^2}}_{=: B_i}\,\sin\theta_i.
+\;}
+\label{eq:single-param-cost}
+\end{equation}
+Equation~(\ref{eq:single-param-cost}) is the entire content of Rotosolve.
+Holding all other parameters fixed, $F(\theta_i)$ is a single sinusoid
+plus a constant; three function evaluations are sufficient to reconstruct
+it exactly, and its global maximum is a closed-form arctangent. No
+gradient, no learning rate, no line search, no restarts \emph{in this
+coordinate}.
+
+\subsection{The closed-form update}
+
+Choose three reference shifts $\{0, +\pi/2, -\pi/2\}$ relative to the
+current $\theta_i^{(k)}$, evaluate
+$F^0_i = F(\theta_i^{(k)})$,
+$F^+_i = F(\theta_i^{(k)} + \pi/2)$,
+$F^-_i = F(\theta_i^{(k)} - \pi/2)$. Substituting into
+Equation~(\ref{eq:single-param-cost}) and absorbing the offset $\theta_i^{(k)}$
+yields
+\begin{equation}
+F\bigl(\theta_i^{(k)} + \alpha\bigr)
+\;=\;
+A'_i + B'_i\cos\alpha + C'_i\sin\alpha,
+\end{equation}
+with
+\begin{equation}
+A'_i = \frac{F^+_i + F^-_i}{2},\quad
+B'_i = F^0_i - A'_i,\quad
+C'_i = \frac{F^+_i - F^-_i}{2}.
+\end{equation}
+The exact maximiser of $B'_i\cos\alpha + C'_i\sin\alpha$ is
+$\alpha^\star_i = \mathrm{atan2}(C'_i, B'_i)$. The Rotosolve update is
+therefore the closed-form
+\begin{equation}
+\boxed{\;
+\theta_i^{(k+1)}
+\;=\;
+\theta_i^{(k)}
+\;+\;
+\mathrm{atan2}\!\bigl(F^+_i - F^-_i,\;\;2\,F^0_i - F^+_i - F^-_i\bigr).
+\;}
+\label{eq:rotosolve-update}
+\end{equation}
+A \emph{sweep} of Rotosolve cycles through every parametric angle
+$\theta_i$ (those whose token is $\mathrm{R}_x, \mathrm{R}_y$, or
+$\mathrm{R}_z$) and applies (\ref{eq:rotosolve-update}). Non-parametric
+positions ($\mathrm{SX}$, $\mathrm{CNOT}$, $\mathrm{STOP}$) are skipped.
+
+\subsection{Cost accounting and the comparison with L-BFGS}
+
+Let $P$ denote the number of parametric positions in a circuit (typically
+$P \in [60, 100]$ for our $n = 3$ runs). One Rotosolve sweep costs $3P$
+fidelity evaluations: three per parameter, each a full $T_{\max}$-step
+\texttt{lax.scan} forward pass through the same JIT-compiled kernel as
+L-BFGS. There is no gradient; the kernel is the existing forward-only
+fidelity function.
+
+In comparison, one L-BFGS step costs roughly two evaluations (forward +
+\texttt{value\_and\_grad}). Per evaluation L-BFGS is therefore slightly
+more expensive (we pay the backward pass), but per \emph{step} L-BFGS
+makes a small move; per \emph{sweep} Rotosolve makes the globally optimal
+move within each parameter coordinate. Empirically, on parameterised
+quantum circuits, the convergence threshold for a fixed final fidelity
+behaves as:
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+optimiser & evaluations to $F \!\ge\! 0.999$ (typical) & per-evaluation cost \\
+\midrule
+L-BFGS, single trajectory & $\sim 100$--$300$, often gets stuck         & $\sim 1.5\times$ a forward (grad) \\
+L-BFGS with $16$ restarts & $\sim 100\times 16 = 1600$                 & same  \\
+Rotosolve, $K$ sweeps     & $3 P K$, e.g.\ $3\!\cdot\! 80\!\cdot\! 4 = 960$ & $\sim 1\times$ a forward \\
+\bottomrule
+\end{tabular}
+\end{center}
+For $P = 80$, $K = 4$ sweeps roughly matches the work of $16$ L-BFGS
+restarts, with the qualitative advantage that Rotosolve's coordinate
+update is \emph{exact} so it cannot get trapped in the per-coordinate
+local minima that single-trajectory L-BFGS often does.
+
+\subsection{Where to deploy Rotosolve}
+
+There are two natural deployment points:
+
+\paragraph{(a) Inner refinement (per rollout sample).}
+Currently each of the $1024$ rollout samples is polished by $12$
+L-BFGS steps at the end of every epoch. Replacing this with $K$ Rotosolve
+sweeps gives a stronger fidelity signal to the policy gradient at
+training time. The trade-off is per-step cost. With $P \sim 80$ rotation
+parameters and $K = 1$ sweep, the inner cost goes from
+$\sim 1024 \cdot 12 \cdot 2 \approx 24{,}000$ fidelity evaluations per
+epoch to $\sim 1024 \cdot 3 \cdot 80 = 245{,}000$ evaluations per epoch
+--- a $10\!\times\!$ slow-down. With $K = 1$ this would be unattractive
+unless the per-circuit fidelity convergence is correspondingly tighter.
+
+A more pragmatic option for the inner stage is a \emph{partial} sweep:
+update only the $P_{\mathrm{sub}} \le P$ parameters with the largest
+expected impact (e.g.\ those whose gates lie on the same qubit as the
+nearest CNOT, or simply a random $P_{\mathrm{sub}} = 8$ subset). This
+caps the per-sample cost at $24$ fidelity evaluations regardless of the
+circuit length while still providing the closed-form coordinate update
+for the parameters Rotosolve does touch. We expect this to fix the
+biased reward signal that drives the CNOT inflation in
+Section~\ref{sec:diagnosis} without paying $10\times$ the wall-clock.
+
+\paragraph{(b) Post-training Pareto refinement.}
+This is the most attractive deployment. The archive after training is
+small ($\sim 30$--$80$ entries), so per-circuit cost matters less. With
+$K = 5$ sweeps and $P \le 100$, post-training refinement costs
+$\sim 1500$ fidelity evaluations per circuit, similar to the current
+$100\, \text{steps} \times 16\, \text{restarts} = 1600$ L-BFGS evaluations
+per circuit. Rotosolve's per-coordinate exactness is expected to give it
+a fidelity edge of $0.001$--$0.01$ on the hard cases (the kind of cases
+that today plateau just below $F = 0.999$).
+
+\subsection{Limitations and caveats}
+
+Three points to note:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Sequential within a circuit.} Rotosolve must update one
+parameter at a time --- the closed-form is exact only conditional on
+the other parameters being fixed. We can vmap it across the
+\emph{batch} of circuits, but not across the parameters of a single
+circuit. L-BFGS, in contrast, updates all parameters simultaneously
+each step.
+
+\item \textbf{Saddle points are still possible.} Rotosolve descends
+greedily in coordinates and can land at a point where every individual
+$\theta_i$ is at its conditional optimum but the joint configuration is
+sub-optimal. This is the same failure mode L-BFGS has at saddles, and
+the standard cure is the same: random restarts. So multi-restart
+remains useful for Rotosolve at post-training, but with fewer restarts
+than L-BFGS needs.
+
+\item \textbf{Single-shift parameter only.} The closed form
+(\ref{eq:single-param-cost}) holds when $\theta_i$ enters the circuit as
+a single $\mathrm{R}_\alpha(\theta_i)$ rotation. Our pool satisfies this
+trivially (each parametric token is a single rotation). If we ever add
+multi-frequency parametric gates (e.g.\ a continuously parameterised
+two-qubit gate), the cost would become a multi-frequency Fourier series
+and the basic Rotosolve would need a generalised parameter-shift rule.
+For now this is a non-issue.
+\end{enumerate}
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Other improvements to consider}
+% ════════════════════════════════════════════════════════════════════════════
+
+The Rotosolve discussion above targets the dominant pathology
+(angle-convergence bias on $n = 3$). A few smaller knobs are also worth
+documenting in case Rotosolve alone does not close the CNOT gap.
+
+\subsection{CNOT-aware archive criteria}
+
+Currently the archive admits any non-dominated $(F, D, C)$ point above
+the configured \texttt{fidelity\_floor}. A CNOT-tight circuit at
+$F \approx 0.97$ is therefore evicted in favour of a parallel-CNOT
+circuit at $F \approx 0.99$, even though the post-training refiner
+\emph{would} push the tight circuit's $F$ to $1.00$ if given the chance.
+
+A small change is to add a second admission criterion: if a candidate's
+CNOT count is at most $C_{\mathrm{KG}}(n) + \Delta$ for a small slack
+$\Delta$ (say $\Delta = 1$), admit it regardless of its current
+fidelity (subject to the hard \texttt{fidelity\_floor}). The post-training
+refiner then has the chance to polish it to a competitive $F$. This is a
+purely archive-side change with no effect on the policy gradient.
+
+\subsection{Curriculum on the inner-refinement budget}
+
+Instead of $12$ L-BFGS steps for every epoch, schedule the inner-step
+budget so that early epochs get a small budget (the agent is still
+exploring topology and a tight angle fit is wasted) and late epochs get a
+large budget (the agent has converged on a topology and we want a clean
+fidelity signal). This is a small change to \texttt{config.yml} and the
+trainer, and it spends the same total wall-clock more efficiently.
+
+\subsection{Increase $w_C$ (CNOT weight) only late in training}
+
+The current $w_C = 2.0$ is a compromise between not over-pressuring the
+agent early (when it doesn't yet have a good topology) and pushing it
+toward CNOT compactness late. A simple curriculum
+$w_C(t) = w_C^{\text{init}} + (w_C^{\text{final}} - w_C^{\text{init}}) \cdot t / T_{\max}$
+with $w_C^{\text{init}} = 1$ and $w_C^{\text{final}} = 3$ would let the
+agent first find any high-$F$ topology and then prune CNOTs from it.
+
+\subsection{Initial-angle restarts at the inner stage}
+
+Even without changing the optimiser, doing two L-BFGS restarts per inner
+sample (one from the RL angles, one from $\mathrm{Uniform}[-\pi, \pi]$)
+would catch the most common single-trajectory failures, at $2\times$
+inner cost. This is a cheap experiment to disentangle ``L-BFGS is
+intrinsically inadequate'' from ``L-BFGS gets stuck from the RL
+initialisation specifically''.
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Proposed configuration surface}
+% ════════════════════════════════════════════════════════════════════════════
+
+If we adopt Rotosolve as a configurable optimiser the simplest exposure
+in \texttt{config.yml} is one knob per refinement stage, alongside a
+small number of method-specific hyperparameters:
+
+\begin{lstlisting}[language=yaml]
+policy:
+  inner_refine:
+    method: "lbfgs"          # "lbfgs" | "rotosolve" | "none"
+    steps: 12                # L-BFGS step count (when method=lbfgs)
+    sweeps: 1                # Rotosolve sweeps   (when method=rotosolve)
+    sweep_subset: null       # Rotosolve only: int -> partial-sweep size,
+                             #                 null -> full sweep over P
+    lr: 0.1                  # L-BFGS learning rate
+
+refinement:
+  method: "lbfgs"            # "lbfgs" | "rotosolve"
+  steps: 100                 # L-BFGS step count
+  sweeps: 5                  # Rotosolve sweeps
+  num_restarts: 16           # used by both methods
+  apply_simplify: true
+  lr: 0.1
+\end{lstlisting}
+
+The \texttt{sweep\_subset} knob is the inner-loop pragmatic compromise
+(Section~5d): if set to e.g.\ $8$, each inner Rotosolve call updates only
+the $8$ parameters whose adjacent gates have the largest joint two-qubit
+``footprint''. This keeps the inner-stage cost at the same magnitude as
+the current L-BFGS while still benefiting from Rotosolve's exactness.
+
+\subsection{Backwards compatibility}
+
+Setting \texttt{method: "lbfgs"} everywhere reproduces today's behaviour
+exactly. The new \texttt{rotosolve} branch is purely additive: it shares
+the existing JIT-compiled fidelity kernel, requires no changes to the
+PPO loss, the rollout function, or the Pareto archive, and does not
+alter the buffer schema.
+
+\subsection{Implementation surface}
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{New module: \texttt{rotosolve.py}.} A single function
+\texttt{rotosolve\_refine\_batch(token\_ids, init\_angles, evaluator,
+sweeps, parametric\_mask, sweep\_subset=None) -> (refined\_angles,
+refined\_fidelities)} implementing the loop in
+Equation~(\ref{eq:rotosolve-update}). Internals are pure JAX with
+\texttt{jax.lax.fori\_loop} over sweeps and \texttt{jax.vmap} over the
+batch of circuits.
+
+\item \textbf{\texttt{AngleRefiner} dispatch.} The existing class gains
+a constructor switch on \texttt{method}; for \texttt{rotosolve} it dispatches
+to the new module's batched function rather than the existing L-BFGS
+\texttt{fori\_loop}.
+
+\item \textbf{\texttt{config.py}.} Three new fields under
+\texttt{policy.inner\_refine.\{method, sweeps, sweep\_subset\}} and
+two new fields under \texttt{refinement.\{method, sweeps\}}. The
+existing \texttt{steps} and \texttt{lr} fields stay.
+
+\item \textbf{Tests.} A unit test that on a known target,
+\texttt{Rotosolve} reaches $F \ge 0.999$ in $K \le 4$ sweeps, and a
+property test that one Rotosolve sweep does not \emph{decrease}
+fidelity (it should be monotone non-decreasing by construction).
+\end{itemize}
+
+The implementation is small ($\sim 80$ lines for the optimiser, $\sim 40$
+for the dispatch, $\sim 30$ for tests) and the risk surface is
+self-contained: if Rotosolve underperforms in practice we can always
+revert to \texttt{method: "lbfgs"} per stage without touching anything
+else.
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Expected outcomes}
+% ════════════════════════════════════════════════════════════════════════════
+
+Based on the diagnosis in Section~\ref{sec:diagnosis} and the
+parameter-counting in Section~4, our expectations after this change are:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{$n = 2$.} No measurable change. The angle convergence is
+already trivial here; both L-BFGS and Rotosolve hit $F = 1$ within a few
+iterations. The benchmark should remain a clear win on every axis.
+
+\item \textbf{$n = 3$, fidelity.} A small absolute gain, $\bar F$ from
+$0.99977$ to $\ge 0.99990$, driven mostly by post-training refinement
+no longer leaving entries stuck just below $F = 0.999$.
+
+\item \textbf{$n = 3$, CNOT count.} The intended outcome: median
+$\Delta C$ from $+5$ down to $\le +2$, with at least a third of
+instances matching Qiskit's $19$-CNOT count and a small but non-zero
+fraction beating it (the Khaneja-Glaser optimum is $14$ for $n = 3$ and
+some of the $50$ targets should be expressible at exactly that count).
+
+\item \textbf{$n = 3$, depth.} Slight regression expected (median
+$\Delta D$ from $-5$ to $-3$): once the agent is no longer rewarded for
+parallel-CNOT redundancy, the circuits become slightly less wide.
+Total gate count is expected to shift only marginally because rotations
+are not the bottleneck.
+
+\item \textbf{Wall-clock per circuit.} Inner stage with
+\texttt{sweep\_subset = 8}: same magnitude as today. Post-training
+stage with \texttt{sweeps = 5}: same magnitude as today. The extra
+implementation is essentially free in wall-clock at the same fidelity
+target.
+
+\item \textbf{$n = 4$.} The angle-convergence problem is more severe at
+$n = 4$ (we observed an $F \approx 0.98$ plateau in earlier runs on
+this benchmark). Rotosolve at the inner stage in particular is more
+likely to lift the plateau here than at $n = 3$, because the relative
+gap between L-BFGS and Rotosolve grows with parameter count. We
+\emph{do not} expect Rotosolve alone to fix the $n = 4$ plateau --- the
+deeper bottleneck there is the tiny model's discrete capacity --- but
+we expect a meaningful contribution.
+\end{itemize}
+
+% ════════════════════════════════════════════════════════════════════════════
+\section{Summary}
+% ════════════════════════════════════════════════════════════════════════════
+
+The benchmark on $50$ brickwork-Haar targets at $n = 2$ and $n = 3$
+shows the pipeline produces high-fidelity, structurally-near-optimal
+circuits at $n = 2$, and matches or exceeds Qiskit on fidelity, depth,
+and total gate count at $n = 3$, but loses on CNOT count by a median
+of $+5$. The CNOT delta is a symptom of biased fidelity signalling at
+training time: the inner-refinement L-BFGS does not converge tightly
+enough on near-Khaneja-Glaser-optimal topologies, so the agent settles
+on slightly larger but easier-to-fit ones.
+
+We propose adding Rotosolve as a configurable optimiser at both
+refinement stages. For our process-fidelity objective, Rotosolve's
+update is exact in each parameter coordinate (Equation
+\ref{eq:rotosolve-update}), requires no learning rate, and converges in
+a small number of full sweeps. The implementation surface is small and
+fully backward-compatible: setting the method to \texttt{lbfgs}
+recovers today's pipeline.
+
+\paragraph{References.}
+\begin{itemize}[leftmargin=2em]
+\item Ostaszewski, Grant, Benedetti.\ \emph{Structure optimization for parameterized quantum circuits.}\ \texttt{arXiv:1905.09692} (Rotosolve).
+\item Wierichs, Izaac, Wang, Lin.\ \emph{General parameter-shift rules for quantum gradients.}\ \texttt{Quantum 6, 677 (2022)}.
+\item Niu et al.\ \emph{Hybrid Action Reinforcement Learning for Quantum Architecture Search.}\ \texttt{arXiv:2511.04967} (HyRLQAS).
+\item Moflic et al.\ \emph{QASER: Breaking the Depth vs.\ Accuracy Trade-Off for Quantum Architecture Search.}\ \texttt{arXiv:2511.16272}.
+\item Shende, Markov, Bullock.\ \emph{Minimal universal two-qubit CNOT-based circuits.}\ \texttt{arXiv:quant-ph/0308033}.
+\end{itemize}
+
+\end{document}

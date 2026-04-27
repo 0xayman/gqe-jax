@@ -5,8 +5,6 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 
-import numpy as np
-
 
 class TemperatureScheduler(ABC):
     @abstractmethod

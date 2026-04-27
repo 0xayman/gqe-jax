@@ -1,64 +1,55 @@
-"""Replay buffer utilities for JAX-based GQE training."""
+"""Replay buffer for hybrid-action GQE training.
+
+Each entry stores the full sample needed to recompute a PPO update:
+  - ``tokens``     (T+1,) int32  — BOS-prefixed discrete action sequence
+  - ``angles``     (T,)   float  — continuous action sequence (per token)
+  - ``cost``       scalar float  — scalarised reward (negated)
+  - ``log_p_disc`` (T,)   float  — old discrete per-position log-probs
+  - ``log_p_cont`` (T,)   float  — old continuous per-position log-probs
+"""
 
 from __future__ import annotations
 
 import math
-import pickle
-import sys
 from collections import deque
+from dataclasses import dataclass
 from typing import Iterator
 
 import numpy as np
 
 
+@dataclass
+class BufferEntry:
+    tokens: np.ndarray
+    angles: np.ndarray
+    cost: float
+    log_p_disc: np.ndarray
+    log_p_cont: np.ndarray
+
+
 class ReplayBuffer:
-    """FIFO replay buffer storing (sequence, cost) pairs."""
+    """Bounded FIFO buffer of :class:`BufferEntry` rows."""
 
-    def __init__(self, size: int = sys.maxsize):
+    def __init__(self, size: int):
         self.size = size
-        self.buf = deque(maxlen=size)
+        self.buf: deque[BufferEntry] = deque(maxlen=size)
 
-    def push(self, seq, cost, old_log_prob: float | None = None) -> None:
-        item = [np.asarray(seq, dtype=np.int32), np.float32(cost)]
-        if old_log_prob is not None:
-            item.append(np.float32(old_log_prob))
-        self.buf.append(tuple(item))
-
-    def save(self, path: str) -> None:
-        with open(path, "wb") as f:
-            pickle.dump(self.buf, f)
-
-    def load(self, path: str) -> None:
-        with open(path, "rb") as f:
-            self.buf = pickle.load(f)
-
-    def __getitem__(self, idx: int):
-        item = self.buf[idx]
-        if len(item) == 2:
-            seq, cost = item
-            old_log_prob = np.float32(np.nan)
-        else:
-            seq, cost, old_log_prob = item
-        return {"idx": seq, "cost": cost, "old_log_prob": old_log_prob}
+    def push(self, entry: BufferEntry) -> None:
+        self.buf.append(entry)
 
     def __len__(self) -> int:
         return len(self.buf)
 
+    def __getitem__(self, idx: int) -> BufferEntry:
+        return self.buf[idx]
+
 
 class BufferDataset:
-    """Dataset-like view that repeats the replay buffer `repetition` times."""
+    """Repeat-and-shuffle view over a :class:`ReplayBuffer`."""
 
     def __init__(self, buffer: ReplayBuffer, repetition: int):
         self.buffer = buffer
         self.repetition = repetition
-
-    def __getitem__(self, idx: int):
-        item = self.buffer[idx % len(self.buffer)]
-        return {
-            "idx": item["idx"],
-            "cost": item["cost"],
-            "old_log_prob": item["old_log_prob"],
-        }
 
     def __len__(self) -> int:
         return len(self.buffer) * self.repetition
@@ -71,36 +62,36 @@ class BufferDataset:
         shuffle: bool = False,
         rng: np.random.Generator | None = None,
     ) -> Iterator[dict[str, np.ndarray]]:
-        buf_len = len(self.buffer)
-        if buf_len == 0:
+        n = len(self.buffer)
+        if n == 0:
             return
 
-        # Snapshot the entire buffer into arrays once to avoid per-item deque access.
-        raw = list(self.buffer.buf)
-        all_idx = np.stack([item[0] for item in raw], axis=0).astype(np.int32)
-        all_cost = np.asarray([item[1] for item in raw], dtype=np.float32)
-        all_log_prob = np.asarray(
-            [item[2] if len(item) == 3 else np.float32(np.nan) for item in raw],
-            dtype=np.float32,
-        )
+        # One snapshot of all rows so we don't pay deque indexing per item.
+        rows = list(self.buffer.buf)
+        tokens = np.stack([r.tokens for r in rows], axis=0).astype(np.int32)
+        angles = np.stack([r.angles for r in rows], axis=0).astype(np.float32)
+        costs = np.asarray([r.cost for r in rows], dtype=np.float32)
+        log_p_d = np.stack([r.log_p_disc for r in rows], axis=0).astype(np.float32)
+        log_p_c = np.stack([r.log_p_cont for r in rows], axis=0).astype(np.float32)
 
-        length = buf_len * self.repetition
-        indices = np.arange(length, dtype=np.int32)
+        length = n * self.repetition
+        idx = np.arange(length, dtype=np.int32)
         if shuffle:
             if rng is None:
                 rng = np.random.default_rng()
-            indices = rng.permutation(indices)
+            idx = rng.permutation(idx)
 
-        total_batches = length // batch_size if drop_last else math.ceil(length / batch_size)
-        for batch_idx in range(total_batches):
-            start = batch_idx * batch_size
+        total = length // batch_size if drop_last else math.ceil(length / batch_size)
+        for b in range(total):
+            start = b * batch_size
             stop = min(start + batch_size, length)
             if drop_last and stop - start < batch_size:
                 continue
-
-            buf_indices = indices[start:stop] % buf_len
+            sel = idx[start:stop] % n
             yield {
-                "idx": all_idx[buf_indices],
-                "cost": all_cost[buf_indices],
-                "old_log_prob": all_log_prob[buf_indices],
+                "tokens": tokens[sel],
+                "angles": angles[sel],
+                "cost": costs[sel],
+                "log_p_disc": log_p_d[sel],
+                "log_p_cont": log_p_c[sel],
             }

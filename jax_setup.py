@@ -26,8 +26,7 @@ import jax  # noqa: E402
 backend = jax.default_backend()
 is_gpu = backend in ('gpu', 'cuda')
 
-# Persistent compile cache: reuses XLA binaries across runs (huge win for
-# benchmark.py which retraces the same pipeline once per target unitary).
+# Persistent compile cache: reuses XLA binaries across runs.
 _CACHE_DIR = os.environ.get(
     "JAX_COMPILATION_CACHE_DIR",
     os.path.expanduser("~/.cache/jax-compilation-cache"),

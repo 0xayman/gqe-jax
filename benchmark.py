@@ -1,15 +1,32 @@
-"""Benchmark GQE against Qiskit on many Haar-random 2-qubit unitaries.
+"""Benchmark hybrid-action GQE against Qiskit on N random target unitaries.
 
-For each target unitary we record, in ``results/benchmark_2q.jsonl``:
-    - verified GQE fidelity, CNOT count, circuit depth
-    - Qiskit reference CNOT count, circuit depth (fidelity assumed 1.0)
+Usage::
 
-The JSONL is appended one line per unitary. Re-running the script resumes:
-completed seeds are skipped so long runs can be interrupted safely.
+    python benchmark.py -n 50 -q 3                   # 50 targets, 3 qubits
+    python benchmark.py -n 30 -q 4 --base-seed 2000  # custom seed range
+    python benchmark.py -n 50 -q 3 --resume          # skip seeds already in JSONL
 
-Usage:
-    python benchmark.py [--qubits 2] [--circuits 50] [--base-seed 1000]
-                        [--output results/benchmark_<N>q.jsonl]
+The target distribution is read from ``config.yml`` (``target.type`` —
+typically ``haar_random`` or ``brickwork``). For brickwork targets the depth
+is also read from the config (``target.brickwork_depth``).
+
+For each target unitary the benchmark trains the GQE policy from scratch with
+the user's ``config.yml`` (overriding only ``num_qubits`` and
+``training.seed``), records the best Pareto-front circuit found, and compiles
+the same target with Qiskit ``optimization_level=3`` for reference.
+
+Outputs:
+
+* ``results/benchmark_<N>q_<type>_<stamp>.jsonl`` — one JSON row per circuit
+  with both GQE and Qiskit metrics (process fidelity, depth, total gates,
+  CNOT count, training time).
+
+* ``results/benchmark_<N>q_<type>_<stamp>.png`` — three-panel plot:
+
+  - top: per-circuit GQE fidelity (sorted ascending) + Qiskit reference line
+    + F=0.99 threshold line + summary statistics
+  - middle: paired CNOT-count bars (GQE vs Qiskit)
+  - bottom: paired circuit-depth bars (GQE vs Qiskit)
 """
 
 from __future__ import annotations
@@ -18,55 +35,129 @@ import argparse
 import dataclasses
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
 
-from config import TargetConfig, default_max_gates_count, load_config
-from cost import build_cost_fn
-from gqe import gqe
-from main import _compile_target_with_qiskit
+from config import GQEConfig, TargetConfig, load_config
 from operator_pool import build_operator_pool
-from reporting import (
-    build_reported_circuit,
-    circuit_stats,
-    gate_names_from_token_sequence,
-    select_best_fidelity_token_sequence,
-    select_report_token_sequence,
-)
+from reporting import circuit_stats
+from target import build_target
+from trainer import gqe
 
 
-def haar_unitary(num_qubits: int, seed: int) -> np.ndarray:
-    """Haar-uniform unitary on ``num_qubits`` qubits (QR-on-ginibre method)."""
-    d = 2 ** num_qubits
-    rng = np.random.default_rng(seed)
-    z = (rng.standard_normal((d, d)) + 1j * rng.standard_normal((d, d))) / np.sqrt(2)
-    q, r = np.linalg.qr(z)
-    phase = np.diag(r) / np.abs(np.diag(r))
-    return q * phase[np.newaxis, :]
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Benchmark hybrid-action GQE vs Qiskit on N random unitaries. "
+                    "Target type and brickwork depth are read from the YAML config.",
+    )
+    p.add_argument("-n", "--num-circuits", type=int, default=50,
+                   help="Number of target unitaries to benchmark (default: 50).")
+    p.add_argument("-q", "--num-qubits", type=int, default=3,
+                   help="Qubit count for every target (default: 3).")
+    p.add_argument("-c", "--config", default="config.yml",
+                   help="Base GQE config YAML (default: config.yml). "
+                        "Drives target.type, target.brickwork_depth, and all "
+                        "training/reward hyperparameters.")
+    p.add_argument("--base-seed", type=int, default=1000,
+                   help="Seeds used: base_seed, base_seed+1, ... (default: 1000).")
+    p.add_argument("-o", "--output-dir", default="results",
+                   help="Directory for the JSONL + PNG outputs (default: results).")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip seeds already present in the JSONL output.")
+    p.add_argument("--no-plot", action="store_true",
+                   help="Skip plot generation (useful for headless dispatch).")
+    return p.parse_args()
 
 
-def build_benchmark_cfg(base_cfg, num_qubits: int):
-    """Return a copy of ``base_cfg`` forced to ``num_qubits`` qubits with W&B disabled.
+# ── Per-target helpers ───────────────────────────────────────────────────────
 
-    The target section is set to a placeholder; we never call ``build_target``
-    in the benchmark because the unitary is constructed in-process per seed.
+def _override_cfg(
+    base_cfg: GQEConfig,
+    num_qubits: int,
+    seed: int,
+) -> GQEConfig:
+    """Return a copy of ``base_cfg`` with per-iteration overrides applied.
+
+    Only ``num_qubits`` (CLI override) and ``training.seed`` (per-circuit) are
+    overridden; ``target.type`` and ``target.brickwork_depth`` come from the
+    YAML config and are propagated unchanged. W&B logging is disabled (the
+    benchmark would otherwise spam one run per circuit). The gate budget is
+    recomputed from the heuristic for the new qubit count.
     """
-    target = TargetConfig(num_qubits=num_qubits, type="haar_random", path=None)
+    from config import default_max_gates_count
+    target = dataclasses.replace(
+        base_cfg.target,
+        num_qubits=num_qubits,
+        # Drop any file path — for benchmarking we always synthesise the
+        # target on the fly from ``training.seed``.
+        path=None if base_cfg.target.type != "file" else base_cfg.target.path,
+    )
     logging = dataclasses.replace(base_cfg.logging, wandb=False)
     model = dataclasses.replace(
-        base_cfg.model, max_gates_count=default_max_gates_count(num_qubits)
+        base_cfg.model, max_gates_count=default_max_gates_count(num_qubits),
     )
-    return dataclasses.replace(base_cfg, target=target, logging=logging, model=model)
+    training = dataclasses.replace(base_cfg.training, seed=seed)
+    return dataclasses.replace(
+        base_cfg, target=target, logging=logging, model=model, training=training,
+    )
 
 
-def already_completed_seeds(output_path: Path) -> set[int]:
-    """Read any existing JSONL output and return the set of completed seeds."""
-    if not output_path.exists():
+def _qiskit_compile(u_target, num_qubits: int, rotation_gates):
+    """Run Qiskit's optimization_level=3 transpile against ``u_target``.
+
+    Returns ``(qc, depth, total_gates, cnot_count)``. Process fidelity isn't
+    reported because Qiskit's transpile is exact up to numerical noise — we
+    take F=1.
+    """
+    from qiskit import QuantumCircuit, transpile
+    from qiskit.circuit.library import UnitaryGate
+    qc = QuantumCircuit(num_qubits)
+    qc.append(UnitaryGate(u_target), list(range(num_qubits)))
+    basis = [*rotation_gates, "sx", "cx"]
+    compiled = transpile(qc, basis_gates=basis, optimization_level=3)
+    depth, total, _ = circuit_stats(compiled)
+    return compiled, depth, total, int(compiled.count_ops().get("cx", 0))
+
+
+def _gqe_best(result) -> dict:
+    """Return ``{F, depth, total_gates, cnots}`` for the best-fidelity entry
+    in ``result.pareto_archive`` (after post-training refinement).
+
+    Falls back to the best raw rollout if the archive is empty (the
+    fidelity_floor wasn't reached during training).
+    """
+    arc = result.pareto_archive
+    if arc is not None and len(arc) > 0:
+        bf = arc.best_by_fidelity()
+        return {
+            "F": float(bf.fidelity),
+            "depth": int(bf.depth),
+            "total_gates": int(bf.total_gates),
+            "cnots": int(bf.cnot_count),
+        }
+    F = (
+        result.refined_raw_fidelity
+        if result.refined_raw_fidelity is not None
+        else result.best_raw_fidelity
+    )
+    return {
+        "F": float(F) if F is not None else float("nan"),
+        "depth": -1, "total_gates": -1, "cnots": -1,
+    }
+
+
+# ── JSONL persistence ────────────────────────────────────────────────────────
+
+def _completed_seeds(jsonl_path: Path) -> set[int]:
+    if not jsonl_path.exists():
         return set()
     seeds: set[int] = set()
-    with output_path.open() as f:
+    with jsonl_path.open() as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -75,158 +166,248 @@ def already_completed_seeds(output_path: Path) -> set[int]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if "seed" in row and "gqe_fidelity" in row:
+            if "seed" in row:
                 seeds.add(int(row["seed"]))
     return seeds
 
 
-def run_one(cfg, pool, u_target: np.ndarray, seed: int, num_qubits: int) -> dict:
-    """Run GQE + Qiskit on one unitary. Returns a row dict ready for JSONL."""
-    cost_fn = build_cost_fn(u_target)
+def _load_rows(jsonl_path: Path) -> list[dict]:
+    if not jsonl_path.exists():
+        return []
+    rows = []
+    with jsonl_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return rows
 
-    # ── Qiskit reference ───────────────────────────────────────────────────
-    qiskit_qc = _compile_target_with_qiskit(u_target, num_qubits, cfg.pool.rotation_gates)
-    q_depth, q_total, q_two_q = circuit_stats(qiskit_qc)
 
-    # ── GQE training ────────────────────────────────────────────────────────
+# ── One target run ───────────────────────────────────────────────────────────
+
+def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
+    cfg = _override_cfg(base_cfg, args.num_qubits, seed)
+    pool = build_operator_pool(args.num_qubits, cfg.pool.rotation_gates)
+    u_target, desc = build_target(pool, cfg)
+
+    # Qiskit reference (tiny cost)
+    _, q_depth, q_total, q_cnot = _qiskit_compile(
+        u_target, args.num_qubits, cfg.pool.rotation_gates,
+    )
+
+    # GQE training
     t0 = time.time()
-    _best_cost, best_indices, best_angles, pareto_archive = gqe(
-        cost_fn, pool, cfg, u_target=u_target, logger=None
-    )
-    elapsed = time.time() - t0
+    result = gqe(cfg, u_target, pool, logger=None)
+    dt = time.time() - t0
+    gqe_b = _gqe_best(result)
 
-    # Report two views of the trained archive:
-    #  1. Best-fidelity circuit  → drives the fidelity panel
-    #  2. Pareto best-depth at F≥threshold → drives the CNOT/depth panels
-    bf_idx, bf_angles, bf_f, bf_src = select_best_fidelity_token_sequence(
-        best_indices, best_angles, pareto_archive
-    )
-    rep_idx, rep_angles, rep_f, rep_src = select_report_token_sequence(
-        best_indices, best_angles, pareto_archive, cfg.reward.fidelity_threshold
-    )
-
-    row: dict = {
+    return {
         "seed": seed,
-        "num_qubits": num_qubits,
-        "qiskit_cnot": int(qiskit_qc.count_ops().get("cx", 0)),
-        "qiskit_depth": q_depth,
-        "qiskit_total_gates": q_total,
-        "qiskit_two_q_gates": q_two_q,
-        "elapsed_sec": elapsed,
+        "num_qubits": args.num_qubits,
+        "target_type": cfg.target.type,
+        "target_desc": desc,
+        "elapsed_sec": dt,
+        "gqe_F": gqe_b["F"],
+        "gqe_depth": gqe_b["depth"],
+        "gqe_total_gates": gqe_b["total_gates"],
+        "gqe_cnot": gqe_b["cnots"],
+        "qiskit_depth": int(q_depth),
+        "qiskit_total_gates": int(q_total),
+        "qiskit_cnot": int(q_cnot),
     }
 
-    if bf_idx is not None:
-        bf = build_reported_circuit(
-            cfg=cfg, pool=pool, u_target=u_target,
-            report_indices=bf_idx, report_angles=bf_angles, report_fidelity=bf_f,
-        )
-        bf_depth, bf_total, _ = circuit_stats(bf.qc)
-        row.update({
-            "gqe_fidelity": bf.qc_fidelity,
-            "gqe_cnot": int(bf.qc.count_ops().get("cx", 0)),
-            "gqe_depth": bf_depth,
-            "gqe_total_gates": bf_total,
-            "gqe_gate_count": len(bf.gate_names),
-            "gqe_source": bf_src,
-        })
+
+# ── Plot ─────────────────────────────────────────────────────────────────────
+
+def _plot(rows: list[dict], png_path: Path, *, fidelity_threshold: float = 0.99) -> None:
+    """Render the three-panel benchmark figure (sorted by GQE F ascending)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = [r for r in rows if r.get("gqe_F") is not None]
+    if not rows:
+        print("No rows to plot — aborting plot step.")
+        return
+
+    N = len(rows)
+    F = np.asarray([r["gqe_F"] for r in rows], dtype=np.float64)
+    gqe_cnot = np.asarray([r["gqe_cnot"] for r in rows], dtype=np.int64)
+    gqe_depth = np.asarray([r["gqe_depth"] for r in rows], dtype=np.int64)
+    qk_cnot = np.asarray([r["qiskit_cnot"] for r in rows], dtype=np.int64)
+    qk_depth = np.asarray([r["qiskit_depth"] for r in rows], dtype=np.int64)
+    n_qubits = int(rows[0]["num_qubits"])
+    target_type = rows[0]["target_type"]
+
+    order = np.argsort(F)
+    F_s = F[order]
+    gqe_cnot_s = gqe_cnot[order]
+    gqe_depth_s = gqe_depth[order]
+    qk_cnot_s = qk_cnot[order]
+    qk_depth_s = qk_depth[order]
+    xs = np.arange(N)
+
+    # Summary stats
+    n_above = int((F >= fidelity_threshold).sum())
+    pct_above = 100.0 * n_above / N
+    if n_above > 0:
+        mask = F >= fidelity_threshold
+        cnot_delta = gqe_cnot[mask] - qk_cnot[mask]
+        depth_delta = gqe_depth[mask] - qk_depth[mask]
+        med_cnot_delta = float(np.median(cnot_delta))
+        med_depth_delta = float(np.median(depth_delta))
+        match_pct = 100.0 * float(np.mean(cnot_delta <= 0))
     else:
-        row.update({
-            "gqe_fidelity": float("nan"),
-            "gqe_cnot": -1, "gqe_depth": -1,
-            "gqe_total_gates": -1, "gqe_gate_count": 0,
-            "gqe_source": "unavailable",
-        })
+        med_cnot_delta = float("nan")
+        med_depth_delta = float("nan")
+        match_pct = float("nan")
 
-    if rep_idx is not None:
-        rep = build_reported_circuit(
-            cfg=cfg, pool=pool, u_target=u_target,
-            report_indices=rep_idx, report_angles=rep_angles, report_fidelity=rep_f,
-        )
-        rep_depth, rep_total, _ = circuit_stats(rep.qc)
-        row.update({
-            "gqe_pareto_fidelity": rep.qc_fidelity,
-            "gqe_pareto_cnot": int(rep.qc.count_ops().get("cx", 0)),
-            "gqe_pareto_depth": rep_depth,
-            "gqe_pareto_total_gates": rep_total,
-            "gqe_pareto_source": rep_src,
-        })
-    else:
-        row.update({
-            "gqe_pareto_fidelity": row["gqe_fidelity"],
-            "gqe_pareto_cnot": row["gqe_cnot"],
-            "gqe_pareto_depth": row["gqe_depth"],
-            "gqe_pareto_total_gates": row["gqe_total_gates"],
-            "gqe_pareto_source": row["gqe_source"],
-        })
+    # Khaneja-Glaser CNOT optimum (for the upper bound line)
+    numer = 4 ** n_qubits - 3 * n_qubits - 1
+    cnot_lb = max(0, -(-numer // 4))
 
-    return row
+    fig, axes = plt.subplots(
+        3, 1, sharex=True, figsize=(11, 8),
+        gridspec_kw={"height_ratios": [1.6, 1, 1]},
+    )
+
+    # ── Top: fidelity scatter + threshold lines + stats text ────────────────
+    ax = axes[0]
+    ax.scatter(xs, F_s, color="C0", s=22, zorder=3, label="GQE best fidelity")
+    ax.axhline(1.0, color="C1", linestyle="--", linewidth=1.2, label="Qiskit reference (F=1)")
+    ax.axhline(fidelity_threshold, color="C2", linestyle=":", linewidth=1.2,
+               label=f"F = {fidelity_threshold}")
+    ax.set_ylabel("Process fidelity")
+    fmin = max(0.0, F.min() - 0.02)
+    ax.set_ylim(fmin, 1.005)
+    ax.legend(loc="lower right", fontsize=8)
+    stats = (
+        f"N = {N} unitaries\n"
+        f"GQE fidelity: mean {F.mean():.4f}  |  median {np.median(F):.4f}  |  min {F.min():.4f}\n"
+        f"F ≥ {fidelity_threshold}: {pct_above:.0f}% of instances\n"
+        f"At F ≥ {fidelity_threshold}: GQE ≤ Qiskit (CNOT) in {match_pct:.0f}%\n"
+        f"Median delta (GQE - Qiskit) at F ≥ {fidelity_threshold}: "
+        f"CNOT {med_cnot_delta:+.1f}, depth {med_depth_delta:+.1f}"
+    )
+    ax.text(
+        0.02, 0.05, stats, transform=ax.transAxes, fontsize=8.5,
+        verticalalignment="bottom",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="0.7"),
+    )
+
+    # ── Middle: CNOT bars ───────────────────────────────────────────────────
+    ax = axes[1]
+    width = 0.4
+    ax.bar(xs - width / 2, gqe_cnot_s, width, color="C0", label="GQE")
+    ax.bar(xs + width / 2, qk_cnot_s, width, color="C1", label="Qiskit")
+    if cnot_lb > 0:
+        ax.axhline(cnot_lb, color="0.4", linestyle="--", linewidth=1.0,
+                   label=f"K-G optimum = {cnot_lb}")
+    ax.set_ylabel("CNOT count")
+    ax.legend(loc="upper right", fontsize=8)
+
+    # ── Bottom: depth bars ──────────────────────────────────────────────────
+    ax = axes[2]
+    ax.bar(xs - width / 2, gqe_depth_s, width, color="C0", label="GQE")
+    ax.bar(xs + width / 2, qk_depth_s, width, color="C1", label="Qiskit")
+    ax.set_ylabel("Circuit depth")
+    ax.set_xlabel("Unitary index (sorted by GQE fidelity, ascending)")
+    ax.legend(loc="upper right", fontsize=8)
+
+    fig.suptitle(
+        f"GQE vs Qiskit on {N} {target_type} {n_qubits}-qubit unitaries",
+        fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(png_path, dpi=130)
+    plt.close(fig)
+    print(f"Saved plot → {png_path}")
 
 
-def format_eta(remaining: int, mean_sec: float) -> str:
-    total = int(remaining * mean_sec)
-    h, m = divmod(total // 60, 60)
-    return f"{h:d}h{m:02d}m"
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--qubits", type=int, default=2, help="Number of qubits")
-    parser.add_argument(
-        "--circuits", "--num-unitaries", dest="circuits", type=int, default=50,
-        help="Number of Haar-random circuits to benchmark",
-    )
-    parser.add_argument("--base-seed", type=int, default=1000)
-    parser.add_argument("--config", default="config.yml")
-    parser.add_argument(
-        "--output", default=None,
-        help="Output JSONL path (default: results/benchmark_<qubits>q.jsonl)",
-    )
-    args = parser.parse_args()
-
-    num_qubits = args.qubits
+    args = _parse_args()
     load_dotenv()
 
     base_cfg = load_config(args.config)
-    cfg = build_benchmark_cfg(base_cfg, num_qubits)
-    pool = build_operator_pool(num_qubits=num_qubits, rotation_gates=cfg.pool.rotation_gates)
+    target_type = base_cfg.target.type
+    if target_type == "file":
+        raise ValueError(
+            "Cannot benchmark with target.type='file' — the benchmark generates "
+            "fresh targets per seed. Use 'haar_random' or 'brickwork' in config.yml."
+        )
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = Path(args.output or f"results/benchmark_{num_qubits}q.jsonl")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    done = already_completed_seeds(output_path)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    jsonl_path = output_dir / (
+        f"benchmark_{args.num_qubits}q_{target_type}_{stamp}.jsonl"
+    )
+    png_path = jsonl_path.with_suffix(".png")
 
-    all_seeds = [args.base_seed + i for i in range(args.circuits)]
+    # Resume support: if --resume, look for an existing JSONL with the same
+    # config tag and append to it. Otherwise we always start fresh.
+    if args.resume:
+        existing = sorted(output_dir.glob(
+            f"benchmark_{args.num_qubits}q_{target_type}_*.jsonl"
+        ))
+        if existing:
+            jsonl_path = existing[-1]
+            png_path = jsonl_path.with_suffix(".png")
+            print(f"Resuming into existing file: {jsonl_path}")
+
+    done = _completed_seeds(jsonl_path) if args.resume else set()
+    all_seeds = [args.base_seed + i for i in range(args.num_circuits)]
     pending = [s for s in all_seeds if s not in done]
 
-    print(f"Benchmark config: {num_qubits}q, {args.circuits} unitaries")
-    print(f"  Output: {output_path}")
-    print(f"  Completed (resume): {len(done)} / {len(all_seeds)}")
-    print(f"  Pending: {len(pending)}")
-    print(f"  Training epochs per unitary: {cfg.training.max_epochs}")
-    print(f"  Rotation gates: {', '.join(cfg.pool.rotation_gates)}")
-    print(f"  Pool size: {len(pool)}  |  max_gates: {cfg.model.max_gates_count}")
+    print(f"Benchmark configuration:")
+    print(f"  Qubits:               {args.num_qubits}")
+    print(f"  Target type:          {target_type}  (from {args.config})")
+    if target_type == "brickwork":
+        depth = base_cfg.target.brickwork_depth or (2 * args.num_qubits)
+        print(f"  Brickwork depth:      {depth}")
+    print(f"  Total circuits:       {args.num_circuits}")
+    print(f"  Already completed:    {len(done)}")
+    print(f"  Pending:              {len(pending)}")
+    print(f"  Output JSONL:         {jsonl_path}")
+    print(f"  Output PNG:           {png_path}")
+    print()
 
     durations: list[float] = []
     for i, seed in enumerate(pending, start=1):
-        u_target = haar_unitary(num_qubits, seed=seed)
-        print(f"\n[{i}/{len(pending)}] seed={seed}")
-        t0 = time.time()
-        row = run_one(cfg, pool, u_target, seed, num_qubits)
-        dt = time.time() - t0
-        durations.append(dt)
+        print(f"[{i}/{len(pending)}] seed={seed}", flush=True)
+        try:
+            row = _run_one(args, base_cfg, seed)
+        except Exception as e:
+            print(f"  FAILED: {e!r}")
+            continue
+        durations.append(row["elapsed_sec"])
 
-        with output_path.open("a") as f:
+        with jsonl_path.open("a") as f:
             f.write(json.dumps(row) + "\n")
 
-        mean_sec = sum(durations) / len(durations)
+        mean_dt = sum(durations) / len(durations)
         remaining = len(pending) - i
+        eta_sec = int(mean_dt * remaining)
+        eta_h, rem = divmod(eta_sec, 3600)
+        eta_m = rem // 60
         print(
-            f"  done in {dt:.1f}s  |  "
-            f"GQE F={row['gqe_fidelity']:.4f} CX={row['gqe_cnot']} D={row['gqe_depth']}  |  "
+            f"  done in {row['elapsed_sec']:.1f}s  |  "
+            f"GQE F={row['gqe_F']:.4f} CX={row['gqe_cnot']} D={row['gqe_depth']}  |  "
             f"Qiskit CX={row['qiskit_cnot']} D={row['qiskit_depth']}  |  "
-            f"ETA {format_eta(remaining, mean_sec)}"
+            f"ETA {eta_h:d}h{eta_m:02d}m"
         )
 
-    print(f"\nBenchmark complete. Wrote {len(pending)} new rows to {output_path}.")
+    print(f"\nBenchmark complete. Wrote {len(pending)} new rows to {jsonl_path}.")
+
+    if not args.no_plot:
+        rows = _load_rows(jsonl_path)
+        _plot(rows, png_path, fidelity_threshold=base_cfg.reward.fidelity_threshold)
 
 
 if __name__ == "__main__":
