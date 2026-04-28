@@ -117,7 +117,7 @@ class PolicyConfig:
       the categorical and Gaussian heads respectively. Both default to 0
       (pure PPO); a small positive value (~1e-3) helps when the policy
       collapses too early.
-    - ``inner_refine_steps``: how many L-BFGS iterations to run on each rollout
+    - ``inner_refine_steps``: how many Adam iterations to run on each rollout
       sample's angle vector, initialised at the RL-sampled angles. ``0``
       disables (pure RL). The HyRLQAS scheme (paper-faithful) is to run a few
       (5–10) steps per sample so the reward reflects how well-conditioned the
@@ -140,11 +140,11 @@ class RefinementConfig:
     """Post-training continuous-parameter refinement.
 
     The Pareto archive is re-optimised at the end of training. Each entry's
-    angles get ``steps`` iterations of L-BFGS initialised from the
+    angles get ``steps`` iterations of Adam initialised from the
     RL-suggested angles. Setting ``enabled=False`` skips this step entirely
     (the archive is reported as-is).
 
-    ``num_restarts`` runs L-BFGS additionally from ``num_restarts - 1``
+    ``num_restarts`` runs Adam additionally from ``num_restarts - 1``
     random Uniform[-π, π] initialisations and keeps the best per circuit.
     PQC loss landscapes are very non-convex; multi-restart routinely lifts
     the best-fidelity circuit from ~0.98 to 1.0. Cost scales linearly with

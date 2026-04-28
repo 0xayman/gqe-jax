@@ -8,7 +8,7 @@ called both:
 
   - during RL training (forward-only fidelity for sampled (token, angle)
     pairs — no optimisation), and
-  - during post-training refinement (with optax L-BFGS wrapped around the
+  - during post-training refinement (with optax Adam wrapped around the
     same forward pass).
 
 Tokens are encoded by id from a fixed vocab ``[BOS, STOP, gate_1, ..., gate_V]``;
@@ -190,7 +190,7 @@ class CircuitEvaluator:
 
     Reused both during training (forward-only, batched fidelity) and during
     post-training refinement (the same forward pass under value-and-grad,
-    wrapped in optax L-BFGS).
+    wrapped in optax Adam).
     """
 
     def __init__(

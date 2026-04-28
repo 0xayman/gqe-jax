@@ -2,7 +2,7 @@
 #
 # RL-only training: the policy emits both gate tokens AND initial angles each
 # step. Fidelity is evaluated directly from sampled angles — no GD inner loop.
-# After training, the Pareto archive is refined with a few L-BFGS steps.
+# After training, the Pareto archive is refined with a few Adam steps.
 
 target:
   num_qubits: 4
@@ -33,7 +33,7 @@ policy:
   entropy_disc: 0.005 # categorical-entropy regularisation weight
   entropy_cont: 0.005 # Gaussian-entropy regularisation weight
   # HyRLQAS-style inner refinement: each rollout sample's angles get this many
-  # L-BFGS steps initialised at the RL-suggested angles. The reward then
+  # Adam steps initialised at the RL-suggested angles. The reward then
   # reflects the post-refinement fidelity, so the policy learns to suggest
   # *initial* angles that converge fast rather than the optimum directly.
   # Set to 0 for pure RL (no inner loop). With a tiny model 12-16 helps
@@ -61,7 +61,7 @@ refinement:
   steps: 100
   lr: 0.1
   # Multi-restart escapes the highly non-convex PQC loss landscape: runs
-  # L-BFGS from the RL angles AND from (num_restarts - 1) random Uniform[-π, π]
+  # Adam from the RL angles AND from (num_restarts - 1) random Uniform[-π, π]
   # initialisations, keeps the best per circuit. Cost scales linearly.
   # If F is still capped < 1.0 with high num_restarts, the bottleneck is
   # the agent's discrete topology (not the optimiser) — bump model.size.
@@ -98,7 +98,7 @@ reward:
   # behaviour at low/mid F (multiplier ≈ 1 there).
   qaser_log_infidelity_eps: 1.0e-3
   # fidelity_floor must be reachable during training, otherwise the Pareto
-  # archive stays empty and the post-training L-BFGS refinement has nothing
+  # archive stays empty and the post-training Adam refinement has nothing
   # to polish. Setting it too low (e.g. 0.0) floods the front with trivially
   # short low-fidelity circuits (a depth-1 F=0.08 circuit is "non-dominated
   # on compactness"). 0.5 keeps the Pareto useful while staying reachable.

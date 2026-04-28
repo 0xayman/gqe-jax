@@ -2,10 +2,10 @@
 
 After RL training has converged we still want to squeeze the last bit of
 fidelity out of the best discovered circuits. The RL policy supplied initial
-angles; here we run a small number of classical-optimiser steps (L-BFGS by
-default) initialised at those angles. A handful of L-BFGS iterations is
-typically enough to lift fidelity from 0.99 to 1.0 on the circuits the policy
-already found.
+angles; here we run a fixed number of Adam steps initialised at those angles.
+Adam is cheap (one ``value_and_grad`` per step, no line search) and converges
+fast from a warm RL-suggested init, which is what the policy is trained to
+provide.
 
 Operates on an entire ``ParetoArchive``: each surviving entry is re-optimised
 in a single batched JAX call, then re-inserted into a fresh archive (so any
@@ -28,11 +28,11 @@ from simplify import build_token_axis, simplify_token_sequence
 
 
 class AngleRefiner:
-    """L-BFGS refinement of angle vectors for a batch of circuits.
+    """Adam refinement of angle vectors for a batch of circuits.
 
-    PQC loss landscapes are notoriously non-convex, so single-shot L-BFGS from
+    PQC loss landscapes are notoriously non-convex, so single-shot Adam from
     one starting point routinely gets stuck in local minima. Set
-    ``num_restarts > 1`` to also run L-BFGS from ``num_restarts - 1`` random
+    ``num_restarts > 1`` to also run Adam from ``num_restarts - 1`` random
     Uniform[-π, π] initialisations alongside the RL-suggested angles, then
     keep the highest-fidelity outcome per circuit.
     """
@@ -51,26 +51,26 @@ class AngleRefiner:
         self.steps = int(steps)
         self.lr = float(lr)
         self.num_restarts = int(num_restarts)
-        self._lbfgs = optax.lbfgs(learning_rate=lr)
+        self._adam = optax.adam(learning_rate=lr)
 
-        eval_loss_one = lambda angles, token_ids: 1.0 - evaluator._fidelity_one(
-            token_ids, angles
+        value_and_grad_one = jax.value_and_grad(
+            lambda angles, token_ids: 1.0 - evaluator._fidelity_one(
+                token_ids, angles,
+            )
         )
 
-        def lbfgs_step(angles, token_ids):
-            value_fn = lambda a: eval_loss_one(a, token_ids)
-            value_and_grad = optax.value_and_grad_from_state(value_fn)
-            opt_state = self._lbfgs.init(angles)
+        def adam_step(angles, token_ids):
+            opt_state = self._adam.init(angles)
 
             def body(_, carry):
                 a, st = carry
-                v, g = value_and_grad(a, state=st)
-                u, st = self._lbfgs.update(g, st, a, value=v, grad=g, value_fn=value_fn)
+                _v, g = value_and_grad_one(a, token_ids)
+                u, st = self._adam.update(g, st, a)
                 return optax.apply_updates(a, u), st
 
             return jax.lax.fori_loop(0, self.steps, body, (angles, opt_state))[0]
 
-        self._refine_batch = jax.jit(jax.vmap(lbfgs_step, in_axes=(0, 0)))
+        self._refine_batch = jax.jit(jax.vmap(adam_step, in_axes=(0, 0)))
         self._rng_seed = 0
 
     def refine_batch(
@@ -80,7 +80,7 @@ class AngleRefiner:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return ``(refined_fidelities, refined_angles)`` for a batch.
 
-        With ``num_restarts > 1`` runs L-BFGS from the supplied initialisation
+        With ``num_restarts > 1`` runs Adam from the supplied initialisation
         AND from (num_restarts − 1) random Uniform[-π, π] vectors per circuit,
         then keeps the best refined fidelity per row.
         """
@@ -190,7 +190,7 @@ def refine_pareto_archive(
     )
     for i, p in enumerate(entries):
         new_f = float(refined_fids[i])
-        # Refinement should not regress fidelity, but L-BFGS can occasionally
+        # Refinement should not regress fidelity, but Adam can occasionally
         # overshoot — fall back to the stored fidelity in that case.
         if new_f < float(p.fidelity):
             new_f = float(p.fidelity)

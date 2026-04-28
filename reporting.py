@@ -189,6 +189,34 @@ def build_reported_circuit(
     )
 
 
+def _run_metadata(cfg: GQEConfig, target_desc: str, n_epochs: int) -> dict:
+    """Lightweight run-level metadata: when, where, and what experiment."""
+    import getpass
+    import platform
+    import socket
+    import sys
+    from datetime import datetime, timezone
+
+    return {
+        "kind": "single_run",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "user": getpass.getuser(),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "argv": list(sys.argv),
+        "experiment": {
+            "num_qubits": int(cfg.target.num_qubits),
+            "target_type": cfg.target.type,
+            "target_description": target_desc,
+            "seed": int(cfg.training.seed),
+            "max_epochs": int(cfg.training.max_epochs),
+            "epochs_completed": int(n_epochs),
+            "fidelity_threshold": float(cfg.reward.fidelity_threshold),
+        },
+    }
+
+
 def _config_snapshot(cfg: GQEConfig) -> dict:
     """Serialise the parts of cfg most useful for reproducing a run."""
     return {
@@ -320,6 +348,7 @@ def save_run_artifact(
     }
 
     payload = {
+        "metadata": _run_metadata(cfg, target_desc, n_epochs=len(epoch_logs or [])),
         "target": target_payload,
         "config": _config_snapshot(cfg),
         "training_log": list(epoch_logs) if epoch_logs is not None else [],

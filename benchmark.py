@@ -15,13 +15,16 @@ the user's ``config.yml`` (overriding only ``num_qubits`` and
 ``training.seed``), records the best Pareto-front circuit found, and compiles
 the same target with Qiskit ``optimization_level=3`` for reference.
 
-Outputs:
+Outputs (written under ``results/benchmarks/`` by default):
 
-* ``results/benchmark_<N>q_<type>_<stamp>.jsonl`` — one JSON row per circuit
+* ``benchmark_<N>q_<type>_<stamp>.jsonl`` — one JSON row per circuit
   with both GQE and Qiskit metrics (process fidelity, depth, total gates,
   CNOT count, training time).
 
-* ``results/benchmark_<N>q_<type>_<stamp>.png`` — three-panel plot:
+* ``benchmark_<N>q_<type>_<stamp>.meta.json`` — sidecar with the full
+  config snapshot, CLI args, seed plan, and host info for reproducibility.
+
+* ``benchmark_<N>q_<type>_<stamp>.png`` — three-panel plot:
 
   - top: per-circuit GQE fidelity (sorted ascending) + Qiskit reference line
     + F=0.99 threshold line + summary statistics
@@ -65,8 +68,9 @@ def _parse_args() -> argparse.Namespace:
                         "training/reward hyperparameters.")
     p.add_argument("--base-seed", type=int, default=1000,
                    help="Seeds used: base_seed, base_seed+1, ... (default: 1000).")
-    p.add_argument("-o", "--output-dir", default="results",
-                   help="Directory for the JSONL + PNG outputs (default: results).")
+    p.add_argument("-o", "--output-dir", default="results/benchmarks",
+                   help="Directory for the JSONL + PNG outputs "
+                        "(default: results/benchmarks).")
     p.add_argument("--resume", action="store_true",
                    help="Skip seeds already present in the JSONL output.")
     p.add_argument("--no-plot", action="store_true",
@@ -328,6 +332,69 @@ def _plot(rows: list[dict], png_path: Path, *, fidelity_threshold: float = 0.99)
     print(f"Saved plot → {png_path}")
 
 
+# ── Metadata sidecar ─────────────────────────────────────────────────────────
+
+def _write_benchmark_metadata(
+    *,
+    meta_path: Path,
+    args: argparse.Namespace,
+    base_cfg: GQEConfig,
+    all_seeds: list[int],
+    already_done: list[int],
+    jsonl_path: Path,
+    png_path: Path,
+) -> None:
+    """Write a JSON sidecar describing the benchmark experiment.
+
+    Captures the full config snapshot, CLI args, seed plan, and host info so
+    that a JSONL row file is self-contained for later analysis.
+    """
+    import getpass
+    import platform
+    import socket
+    import sys
+    from datetime import datetime, timezone
+
+    # Reuse the same config snapshot used for single runs to keep the schema
+    # consistent across results/runs/ and results/benchmarks/.
+    from reporting import _config_snapshot
+
+    target_type = base_cfg.target.type
+    payload = {
+        "kind": "benchmark",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "user": getpass.getuser(),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "argv": list(sys.argv),
+        "experiment": {
+            "num_qubits": int(args.num_qubits),
+            "target_type": target_type,
+            "brickwork_depth": (
+                int(base_cfg.target.brickwork_depth or (2 * args.num_qubits))
+                if target_type == "brickwork" else None
+            ),
+            "num_circuits": int(args.num_circuits),
+            "base_seed": int(args.base_seed),
+            "seeds": all_seeds,
+            "already_completed_seeds": already_done,
+            "config_path": args.config,
+            "fidelity_threshold": float(base_cfg.reward.fidelity_threshold),
+        },
+        "outputs": {
+            "jsonl": str(jsonl_path),
+            "png": str(png_path),
+        },
+        "config": _config_snapshot(base_cfg),
+    }
+
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with meta_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Wrote benchmark metadata → {meta_path}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -349,6 +416,7 @@ def main():
         f"benchmark_{args.num_qubits}q_{target_type}_{stamp}.jsonl"
     )
     png_path = jsonl_path.with_suffix(".png")
+    meta_path = jsonl_path.with_suffix(".meta.json")
 
     # Resume support: if --resume, look for an existing JSONL with the same
     # config tag and append to it. Otherwise we always start fresh.
@@ -359,6 +427,7 @@ def main():
         if existing:
             jsonl_path = existing[-1]
             png_path = jsonl_path.with_suffix(".png")
+            meta_path = jsonl_path.with_suffix(".meta.json")
             print(f"Resuming into existing file: {jsonl_path}")
 
     done = _completed_seeds(jsonl_path) if args.resume else set()
@@ -376,7 +445,18 @@ def main():
     print(f"  Pending:              {len(pending)}")
     print(f"  Output JSONL:         {jsonl_path}")
     print(f"  Output PNG:           {png_path}")
+    print(f"  Output meta:          {meta_path}")
     print()
+
+    _write_benchmark_metadata(
+        meta_path=meta_path,
+        args=args,
+        base_cfg=base_cfg,
+        all_seeds=all_seeds,
+        already_done=sorted(done),
+        jsonl_path=jsonl_path,
+        png_path=png_path,
+    )
 
     durations: list[float] = []
     for i, seed in enumerate(pending, start=1):

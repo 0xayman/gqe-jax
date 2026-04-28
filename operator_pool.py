@@ -6,7 +6,7 @@ from qiskit.circuit.library import CXGate, RXGate, RYGate, RZGate, SXGate
 
 # Placeholder angle stored in pool matrices for rotation gates.
 # Only used for the pure-discrete evaluation path (continuous_opt disabled).
-# L-BFGS initialises from this value when continuous_opt is enabled.
+# Adam initialises from this value when continuous_opt is enabled.
 _DEFAULT_ANGLE = np.pi / 4
 
 
@@ -118,7 +118,7 @@ def build_operator_pool(
 
     Each rotation gate type (RX/RY/RZ) appears once per qubit. The stored
     matrix uses _DEFAULT_ANGLE as a placeholder; when continuous optimization
-    is enabled, L-BFGS will find the optimal angle during training.
+    is enabled, Adam will find the optimal angle during training.
 
     Returns a list of (name, matrix) tuples ordered as:
       1. Configured rotation gates for each qubit (one token per axis/qubit)

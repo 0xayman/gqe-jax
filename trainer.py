@@ -11,7 +11,7 @@ Per-epoch:
   4. For ``buffer.steps_per_epoch`` passes, sample mini-batches from the
      buffer and step PPO on the joint discrete + continuous action space.
 
-After the final epoch, refine the Pareto archive with a few L-BFGS steps
+After the final epoch, refine the Pareto archive with a few Adam steps
 initialised at the RL-suggested angles.
 """
 
@@ -290,7 +290,7 @@ class Trainer:
 
         # ── Per-rollout angle refiner (HyRLQAS-style hybrid loop) ───────────
         # When enabled, every rollout sample runs ``inner_refine_steps``
-        # iterations of L-BFGS initialised at the RL-sampled angles.
+        # iterations of Adam initialised at the RL-sampled angles.
         # The PPO buffer stores the *initial* (RL-sampled) angles so the
         # importance ratio is computed against the actually sampled action;
         # cost / Pareto archive use the refined fidelity / refined angles so
@@ -445,7 +445,7 @@ class Trainer:
             refined_fidelities, refined_angles = self.inner_refiner.refine_batch(
                 action_tokens, init_angles,
             )
-            # Refinement shouldn't decrease fidelity, but L-BFGS can briefly
+            # Refinement shouldn't decrease fidelity, but Adam can briefly
             # overshoot; clip to monotone non-decreasing.
             improved = refined_fidelities >= raw_fidelities
             fidelities = np.where(improved, refined_fidelities, raw_fidelities)
@@ -673,7 +673,7 @@ class Trainer:
                 if cfg.logging.verbose:
                     print(
                         f"\nRefining best raw rollout (F={best_raw_fidelity:.4f}) "
-                        f"with {cfg.refinement.steps} lbfgs steps..."
+                        f"with {cfg.refinement.steps} adam steps..."
                     )
                 tok_no_bos = np.asarray(best_raw_tokens, dtype=np.int32)[1:][None, :]
                 ang = np.asarray(best_raw_angles, dtype=np.float32)[None, :]
@@ -691,7 +691,7 @@ class Trainer:
                 if cfg.logging.verbose:
                     print(
                         f"\nRefining {len(self.pareto_archive)} Pareto entries "
-                        f"with {cfg.refinement.steps} lbfgs steps..."
+                        f"with {cfg.refinement.steps} adam steps..."
                     )
                 self.pareto_archive = refine_pareto_archive(
                     self.pareto_archive, refiner,

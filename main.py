@@ -116,7 +116,7 @@ def main():
     print(f"  Model size:           {cfg.model.size}")
     print(f"  Max gates/circuit:    {cfg.model.max_gates_count}")
     print(f"  Training epochs:      {cfg.training.max_epochs}")
-    print(f"  Refinement:           {'lbfgs' if cfg.refinement.enabled else 'off'}")
+    print(f"  Refinement:           {'adam' if cfg.refinement.enabled else 'off'}")
     print(f"  W&B logging:          {cfg.logging.wandb}")
     print(f"  JAX backend:          {jax.default_backend()}")
     print(f"  JAX devices:          {jax.devices()}")
@@ -209,7 +209,7 @@ def main():
     from datetime import datetime
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     artifact_path = (
-        f"results/run_{cfg.target.num_qubits}q_{cfg.target.type}_{stamp}.json"
+        f"results/runs/run_{cfg.target.num_qubits}q_{cfg.target.type}_{stamp}.json"
     )
     n_saved = save_run_artifact(
         cfg=cfg,
