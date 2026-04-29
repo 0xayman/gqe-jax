@@ -1,8 +1,8 @@
 # config.yml — Hybrid-Action GQE Quantum Compilation
 #
-# RL-only training: the policy emits both gate tokens AND initial angles each
-# step. Fidelity is evaluated directly from sampled angles — no GD inner loop.
-# After training, the Pareto archive is refined with a few Adam steps.
+# The policy emits both gate tokens and angles per step. Optional per-rollout
+# Adam refinement runs on the sampled angles (policy.inner_refine_steps),
+# and the Pareto archive is re-optimised post-training (refinement.*).
 
 target:
   num_qubits: 4
@@ -14,13 +14,11 @@ pool:
 
 model:
   size: "tiny" # tiny | small | medium | large
-  # Default = 2 * 4^n  (16 for 1q, 32 for 2q, 128 for 3q, 512 for 4q).
-  # Smaller values force compactness — set to ~1.5× a Qiskit transpile depth
-  # for the target. For 3q Haar (Qiskit ~30 gates), 70 is a tight budget.
+  # max_gates_count default = 2 * 4^n. Override to force compactness.
   # max_gates_count: 70
 
 training:
-  max_epochs: 100
+  max_epochs: 300
   num_samples: 1024 # circuits sampled per epoch
   batch_size: 256 # gradient-step batch size
   lr: 1.0e-4
@@ -30,15 +28,10 @@ training:
   early_stop: false # stop training once fidelity reaches 1.0
 
 policy:
-  entropy_disc: 0.005 # categorical-entropy regularisation weight
-  entropy_cont: 0.005 # Gaussian-entropy regularisation weight
-  # HyRLQAS-style inner refinement: each rollout sample's angles get this many
-  # Adam steps initialised at the RL-suggested angles. The reward then
-  # reflects the post-refinement fidelity, so the policy learns to suggest
-  # *initial* angles that converge fast rather than the optimum directly.
-  # Set to 0 for pure RL (no inner loop). With a tiny model 12-16 helps
-  # compensate for limited capacity; 5-10 is enough for small/medium models.
-  inner_refine_steps: 12
+  entropy_disc: 0.005
+  entropy_cont: 0.005
+  # Per-rollout Adam steps on the sampled angles before scoring (0 = pure RL).
+  inner_refine_steps: 8
   inner_refine_lr: 0.1
 
 temperature:
@@ -50,7 +43,7 @@ temperature:
 
 buffer:
   max_size: 2048
-  steps_per_epoch: 4
+  steps_per_epoch: 8
 
 logging:
   verbose: true
@@ -58,50 +51,26 @@ logging:
 
 refinement:
   enabled: true
-  steps: 100
+  steps: 200
   lr: 0.1
-  # Multi-restart escapes the highly non-convex PQC loss landscape: runs
-  # Adam from the RL angles AND from (num_restarts - 1) random Uniform[-π, π]
-  # initialisations, keeps the best per circuit. Cost scales linearly.
-  # If F is still capped < 1.0 with high num_restarts, the bottleneck is
-  # the agent's discrete topology (not the optimiser) — bump model.size.
+  # Adam restarts: 1 from the RL angles, the rest from Uniform[-π, π].
   num_restarts: 16
-  apply_simplify: true # simplify each archive circuit before re-optim
+  apply_simplify: true
 
 reward:
   enabled: true
-  # QASER reward: base = w_d * M_D/(D+1) + w_c * M_C/(C+1) + w_g * M_G/(G+1)
-  #               R    = base ** F - 1
-  #               (M_*: running maxima; F as exponent → structure savings count near F=1)
-  # Leave the qaser_init_max_* values at 0 to auto-init the running maxima
-  # from the first rollout's observed worst case.
+  # QASER:  base = w_d·M_D/(D+1) + w_c·M_C/(C+1) + w_g·M_G/(G+1)
+  #         R    = base**F · (1 - log(1 - F + eps)) - 1
+  # Leave qaser_init_max_* at 0 to auto-init running maxima from the first rollout.
   qaser_init_max_depth: 0.0
   qaser_init_max_cnot: 0.0
   qaser_init_max_gates: 0.0
-  # Per-axis weights tuned for the tiny model's limited topological capacity:
-  #
-  #   w_c too high (e.g. 3): agent locks onto the first 14-CNOT layout it
-  #     finds and can't escape — non-universal topology caps F at ~0.98.
-  #   w_c too low (e.g. 0): agent uses 30+ CNOTs unnecessarily.
-  #
-  # 1.5 / 1.5 lets the agent use 14-20 CNOTs (much wider topology search)
-  # while w_g=1.5 keeps total rotations from drifting up. With a larger model
-  # (size: small / medium) you can push w_c back up to 2-3 since the model
-  # has the capacity to find universal Cartan-style 14-CNOT decompositions.
   qaser_w_depth: 1.0
-  qaser_w_cnot: 2.0
+  qaser_w_cnot: 2.5
   qaser_w_gates: 1.5
-  # Log-infidelity multiplier: R *= (1 - log(1 - F + eps)).
-  # Set 0 for the paper-faithful QASER form. Setting eps > 0 (1e-3 typical)
-  # gives an unbounded marginal pull as F → 1, escaping the F ≈ 0.98 plateau
-  # observed on harder targets where pure base^F flattens out. Doesn't change
-  # behaviour at low/mid F (multiplier ≈ 1 there).
-  qaser_log_infidelity_eps: 1.0e-3
-  # fidelity_floor must be reachable during training, otherwise the Pareto
-  # archive stays empty and the post-training Adam refinement has nothing
-  # to polish. Setting it too low (e.g. 0.0) floods the front with trivially
-  # short low-fidelity circuits (a depth-1 F=0.08 circuit is "non-dominated
-  # on compactness"). 0.5 keeps the Pareto useful while staying reachable.
+  # eps > 0 enables the log-infidelity multiplier (set 0 for paper-faithful QASER).
+  qaser_log_infidelity_eps: 1.0e-4
+  # Pareto archive admission gate; must be reachable during training.
   fidelity_floor: 0.5
   max_archive_size: 500
-  fidelity_threshold: 0.99 # "best by CNOT/depth at F >= threshold" reporting
+  fidelity_threshold: 0.99

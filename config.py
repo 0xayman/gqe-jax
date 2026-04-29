@@ -114,18 +114,11 @@ class PolicyConfig:
     """Hybrid-action policy hyperparameters.
 
     - ``entropy_disc`` / ``entropy_cont``: entropy-regularisation weights for
-      the categorical and Gaussian heads respectively. Both default to 0
-      (pure PPO); a small positive value (~1e-3) helps when the policy
-      collapses too early.
-    - ``inner_refine_steps``: how many Adam iterations to run on each rollout
-      sample's angle vector, initialised at the RL-sampled angles. ``0``
-      disables (pure RL). The HyRLQAS scheme (paper-faithful) is to run a few
-      (5–10) steps per sample so the reward reflects how well-conditioned the
-      RL-suggested *initial* angles are; the policy then learns to suggest
-      angles that converge fast under classical optimisation. Refined angles
-      are stored in the Pareto archive; the buffer keeps the RL-sampled
-      (initial) angles so the PPO ratio is computed against the actually
-      sampled actions.
+      the categorical and Gaussian heads.
+    - ``inner_refine_steps``: per-rollout Adam iterations on the sampled angles
+      before scoring (0 = pure RL). The buffer stores the RL-sampled angles so
+      the PPO ratio is computed against the actually sampled actions; the
+      Pareto archive stores the refined angles.
     - ``inner_refine_lr``: passed to AngleRefiner.
     """
 
@@ -137,18 +130,12 @@ class PolicyConfig:
 
 @dataclass(frozen=True)
 class RefinementConfig:
-    """Post-training continuous-parameter refinement.
+    """Post-training continuous-parameter refinement of the Pareto archive.
 
-    The Pareto archive is re-optimised at the end of training. Each entry's
-    angles get ``steps`` iterations of Adam initialised from the
-    RL-suggested angles. Setting ``enabled=False`` skips this step entirely
-    (the archive is reported as-is).
-
-    ``num_restarts`` runs Adam additionally from ``num_restarts - 1``
-    random Uniform[-π, π] initialisations and keeps the best per circuit.
-    PQC loss landscapes are very non-convex; multi-restart routinely lifts
-    the best-fidelity circuit from ~0.98 to 1.0. Cost scales linearly with
-    ``num_restarts``.
+    Each entry's angles get ``steps`` iterations of Adam, run once from the
+    RL-suggested angles and ``num_restarts - 1`` more times from Uniform[-π, π]
+    initialisations; the best per circuit is kept. ``enabled=False`` reports
+    the archive as-is.
     """
 
     enabled: bool = True
@@ -164,50 +151,24 @@ class RewardConfig:
 
         base = w_d * M_D/(D+1) + w_c * M_C/(C+1) + w_g * M_G/(G+1)
         R    = base ** F * (1 - log(1 - F + eps)) - 1     # if eps > 0
-        R    = base ** F - 1                              # if eps == 0 (paper-faithful)
+        R    = base ** F - 1                              # if eps == 0
 
-    where M_D, M_C, M_G are running maxima of depth, CNOT count and total
-    gate count seen so far, and ``w_d``, ``w_c``, ``w_g`` are configurable
-    per-axis weights (``qaser_w_depth``, ``qaser_w_cnot``, ``qaser_w_gates``,
-    all default 1.0).
-
-    Structural compactness is a multiplicative *base*; F is the *exponent*.
-    When F is small the reward collapses toward 0 regardless of structure;
-    when F → 1 the structural savings dominate. The total-gates term is
-    what the paper calls the "1-qubit gate weight" — without it single-qubit
-    rotations are free and the agent sprinkles redundant rotations between
-    CNOTs at high fidelity. CNOTs are the expensive resource on real
-    hardware; bumping ``qaser_w_cnot`` to 2-3 pushes the top of the Pareto
-    front toward Qiskit-level CNOT budgets.
-
-    ``qaser_log_infidelity_eps`` (default 0 = disabled) optionally folds a
-    log-infidelity multiplier ``(1 - log(1 - F + eps))`` into the reward.
-    Pure QASER's marginal gradient flattens near F=1 (``base^0.99 ≈ base^1``),
-    which causes a high-fidelity plateau — visible as F capping at ~0.98 on
-    4-qubit Haar targets even after multi-restart refinement. The log-inf
-    multiplier provides a ~100× stronger gradient in the F → 1 region while
-    preserving the multiplicative structural pressure. Typical eps: 1e-3.
-
-    The Pareto archive is reporting-only and does not feed back into the
-    reward.
+    M_D, M_C, M_G are running maxima of depth, CNOT count, and total gate
+    count. ``qaser_log_infidelity_eps > 0`` adds an unbounded F → 1 gradient
+    on top of the otherwise-saturating ``base ** F`` term. The Pareto archive
+    is reporting-only and does not feed back into the reward.
 
     .. _arXiv\\:2511.16272: https://arxiv.org/abs/2511.16272
     """
 
     enabled: bool = True
-    # Initial running maxima. If <= 0 they are auto-initialised
-    # from the first rollout's observed max (recommended).
+    # If <= 0, running maxima are auto-initialised from the first rollout.
     qaser_init_max_depth: float = 0.0
     qaser_init_max_cnot: float = 0.0
     qaser_init_max_gates: float = 0.0
-    # Per-axis weights for the QASER base term. Default 1.0 each (paper-faithful).
-    # Bump qaser_w_cnot to 2-3 if the top of the Pareto front uses too many CNOTs.
     qaser_w_depth: float = 1.0
     qaser_w_cnot: float = 1.0
     qaser_w_gates: float = 1.0
-    # Log-infidelity multiplier (R *= 1 - log(1 - F + eps)). Set to 0 for the
-    # paper-faithful QASER form; small positive eps (1e-3 to 1e-4) provides
-    # an unbounded gradient near F=1 to escape the high-fidelity plateau.
     qaser_log_infidelity_eps: float = 0.0
     fidelity_floor: float = 0.0
     max_archive_size: int = 500

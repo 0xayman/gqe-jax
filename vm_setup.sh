@@ -3,7 +3,7 @@ set -e
 
 PROJECT_ID="aymantarig-project"
 ZONE="us-central1-f"
-INSTANCE="instance-20260428-114640"
+INSTANCE="instance-20260429-120033"
 VM_USER="aymantarig_aims_ac_za"
 
 LOCAL_PROJECT_DIR="$HOME/Downloads/Quantum/project/gqe-torch"

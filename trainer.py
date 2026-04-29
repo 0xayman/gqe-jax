@@ -4,15 +4,15 @@ Per-epoch:
   1. Roll out ``num_samples`` circuits with the current policy. Each circuit
      comes with both discrete tokens and per-position angle samples plus the
      per-position log-probabilities under the current (behavior) policy.
-  2. Evaluate process fidelity directly from the sampled (token, angle) pairs
-     — no GD inner loop. Compute structural metrics (depth, gates, CNOTs).
+  2. Optionally refine the sampled angles with a few Adam steps
+     (``policy.inner_refine_steps``); evaluate process fidelity from the
+     resulting (token, angle) pairs and compute structural metrics.
   3. Score each sample with the scalarised reward and push it into the
      replay buffer.
   4. For ``buffer.steps_per_epoch`` passes, sample mini-batches from the
      buffer and step PPO on the joint discrete + continuous action space.
 
-After the final epoch, refine the Pareto archive with a few Adam steps
-initialised at the RL-suggested angles.
+After the final epoch, refine the Pareto archive with multi-restart Adam.
 """
 
 from __future__ import annotations
@@ -532,9 +532,6 @@ class Trainer:
         C = cnots.astype(np.float32)
         D = depths.astype(np.float32)
 
-        # G is total gate count (paper's "1-qubit weight" axis). Falling
-        # back to depth is only there to keep the unit test that omits
-        # ``total_gates`` happy — it should always be passed by the trainer.
         G = (
             total_gates.astype(np.float32)
             if total_gates is not None
@@ -560,18 +557,6 @@ class Trainer:
             + w_c * np.float32(self._qaser_max_c) / (C + 1.0)
             + w_g * np.float32(self._qaser_max_g) / (G + 1.0)
         )
-        # base ≥ ~1.5 (when D=C=G all at running max); grows toward
-        # (M_D + M_C + M_G) for compact circuits. F in [0, 1] as the
-        # exponent; subtract 1 so bad-fidelity circuits get cost ≈ 0
-        # rather than collapsing to a flat constant that would zero-out
-        # GRPO advantages.
-        #
-        # Optional log-infidelity multiplier: paper-faithful QASER's
-        # marginal gradient ``base^F · log(base)`` flattens near F=1 (the
-        # ``base^F`` term saturates), causing a high-fidelity plateau on
-        # harder targets. Multiplying by ``1 - log(1 - F + eps)`` provides
-        # an unbounded marginal pull toward F=1 while preserving the
-        # multiplicative structural-pressure shape.
         log_inf_eps = float(r.qaser_log_infidelity_eps)
         if log_inf_eps > 0.0:
             eps = np.float32(log_inf_eps)

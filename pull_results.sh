@@ -12,13 +12,13 @@
 #   ./pull_results.sh --delete        # also delete local files no longer on VM
 #
 # Env overrides:
-#   VM_HOST   default: aymantarig_aims_ac_za@instance-20260416-150256.us-central1-f.aymantarig-project
+#   VM_HOST   default: aymantarig_aims_ac_za@instance-20260429-120033.us-central1-f.aymantarig-project
 #   VM_PATH   default: ~/work/gqe-torch
 #   LOCAL     default: directory of this script
 
 set -euo pipefail
 
-VM_HOST="${VM_HOST:-aymantarig_aims_ac_za@instance-20260428-114640.us-central1-f.aymantarig-project}"
+VM_HOST="${VM_HOST:-aymantarig_aims_ac_za@instance-20260429-120033.us-central1-f.aymantarig-project}"
 VM_PATH="${VM_PATH:-~/work/gqe-torch}"
 LOCAL="${LOCAL:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
