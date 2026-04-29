@@ -44,7 +44,6 @@ dist/
 wandb/
 artifacts/
 outputs/
-runs/
 checkpoints/
 trajectories/
 logs/

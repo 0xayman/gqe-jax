@@ -315,16 +315,28 @@ def simplify_token_sequence(
     token_q0: np.ndarray,
     token_q1: np.ndarray,
     stop_token_id: int,
+    *,
+    max_passes: int = 3,
 ) -> np.ndarray:
-    """Return a simplified copy of ``tokens`` (shape ``(L,)``)."""
+    """Return a simplified copy of ``tokens`` (shape ``(L,)``).
+
+    Iterates the single-pass simplifier up to ``max_passes`` times until a
+    fixed point is reached. A single forward scan can leave cascade merges on
+    the table — e.g. a CNOT-cancellation late in the row enables an earlier
+    rotation merge across the now-cleared support — so we keep going until no
+    new STOPs are introduced.
+    """
     toks = np.asarray(tokens, dtype=np.int32).tolist()
     axis_tbl = np.asarray(token_axis, dtype=np.int32).tolist()
     q0_tbl = np.asarray(token_q0, dtype=np.int32).tolist()
     q1_tbl = np.asarray(token_q1, dtype=np.int32).tolist()
-    simplified = _simplify_row_pylists(
-        toks, axis_tbl, q0_tbl, q1_tbl, int(stop_token_id)
-    )
-    return np.asarray(simplified, dtype=np.int32)
+    stop_id = int(stop_token_id)
+    for _ in range(max(1, int(max_passes))):
+        before = list(toks)
+        toks = _simplify_row_pylists(toks, axis_tbl, q0_tbl, q1_tbl, stop_id)
+        if toks == before:
+            break
+    return np.asarray(toks, dtype=np.int32)
 
 
 def simplify_token_batch(
@@ -333,12 +345,14 @@ def simplify_token_batch(
     token_q0: np.ndarray,
     token_q1: np.ndarray,
     stop_token_id: int,
+    *,
+    max_passes: int = 3,
 ) -> np.ndarray:
     """Apply simplification to each row of ``tokens_batch``.
 
     Runs rows in parallel via a numba.njit kernel — releases the GIL so the
     batch fans out across CPU cores instead of serialising one Python row at
-    a time.
+    a time. Iterates up to ``max_passes`` times to capture cascade merges.
     """
     tokens_batch = np.ascontiguousarray(tokens_batch, dtype=np.int32)
     if tokens_batch.size == 0:
@@ -346,6 +360,12 @@ def simplify_token_batch(
     axis_tbl = np.ascontiguousarray(token_axis, dtype=np.int32)
     q0_tbl = np.ascontiguousarray(token_q0, dtype=np.int32)
     q1_tbl = np.ascontiguousarray(token_q1, dtype=np.int32)
-    return _simplify_batch_nb(
-        tokens_batch, axis_tbl, q0_tbl, q1_tbl, np.int32(stop_token_id)
-    )
+    out = tokens_batch
+    for _ in range(max(1, int(max_passes))):
+        new_out = _simplify_batch_nb(
+            out, axis_tbl, q0_tbl, q1_tbl, np.int32(stop_token_id)
+        )
+        if np.array_equal(new_out, out):
+            return new_out
+        out = new_out
+    return out

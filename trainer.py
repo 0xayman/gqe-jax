@@ -167,6 +167,50 @@ def _row_structure_metrics(
     return int(np.max(qubit_depths)), total, cnots
 
 
+def _cnot_pair_max_repetition(
+    token_ids: np.ndarray,
+    token_qubit0,
+    token_qubit1,
+    window: int,
+) -> int:
+    """Max count of any (control, target) CNOT pair in any sliding window.
+
+    Per arXiv:2601.03123 Sec 4.1: when the same CNOT pair recurs ``k`` times
+    inside a window of width comparable to the qubit count, layer symmetries
+    collapse parameters and the resulting "effectively underparameterised"
+    skeleton plateaus far above the desired precision regardless of how long
+    you optimise. This metric returns that ``k`` so callers can reject the
+    structure cheaply.
+    """
+    if window <= 1 or token_ids.size == 0:
+        return 0
+    pairs: list[tuple[int, int]] = []
+    for tok in token_ids:
+        tok = int(tok)
+        q1 = int(token_qubit1[tok])
+        if q1 >= 0:
+            pairs.append((int(token_qubit0[tok]), q1))
+    n = len(pairs)
+    if n <= 1:
+        return 0
+    counter: dict[tuple[int, int], int] = {}
+    win = min(window, n)
+    for i in range(win):
+        counter[pairs[i]] = counter.get(pairs[i], 0) + 1
+    best = max(counter.values())
+    for start in range(1, n - win + 1):
+        old = pairs[start - 1]
+        counter[old] -= 1
+        if counter[old] == 0:
+            del counter[old]
+        new = pairs[start + win - 1]
+        counter[new] = counter.get(new, 0) + 1
+        m = max(counter.values())
+        if m > best:
+            best = m
+    return int(best)
+
+
 # ── Trainer ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -296,10 +340,19 @@ class Trainer:
         # cost / Pareto archive use the refined fidelity / refined angles so
         # the reward signal reflects the well-conditioned init the agent found.
         if cfg.policy.inner_refine_steps > 0:
+            # Inner (per-rollout) refinement uses the same upgraded loss
+            # / early-stop machinery as the post-training refiner. Sweep
+            # polish stays off here — the budget per rollout is too small to
+            # benefit and Adam alone covers the warm-start regime.
             self.inner_refiner: AngleRefiner | None = AngleRefiner(
                 self.evaluator,
                 steps=cfg.policy.inner_refine_steps,
                 lr=cfg.policy.inner_refine_lr,
+                use_linear_trace_loss=cfg.refinement.use_linear_trace_loss,
+                early_stop_patience=cfg.refinement.early_stop_patience,
+                early_stop_rel_tol=cfg.refinement.early_stop_rel_tol,
+                adaptive_restarts=False,
+                sweep_passes=0,
             )
         else:
             self.inner_refiner = None
@@ -492,6 +545,21 @@ class Trainer:
 
         if self.pareto_archive is not None:
             keep = np.flatnonzero(fidelities >= self.pareto_archive.fidelity_floor)
+            # Optional CNOT-pair-repetition admission filter — drop rollouts
+            # whose CNOT layout is "effectively underparameterised" (the same
+            # pair recurring densely, per arXiv:2601.03123 Sec 4.1).
+            window = int(self.cfg.reward.pair_repeat_window)
+            max_rep = int(self.cfg.reward.pair_repeat_max)
+            if window > 1 and keep.size:
+                survivors: list[int] = []
+                for i in keep.tolist():
+                    rep = _cnot_pair_max_repetition(
+                        action_tokens[i], self.token_qubit0,
+                        self.token_qubit1, window,
+                    )
+                    if rep <= max_rep:
+                        survivors.append(i)
+                keep = np.asarray(survivors, dtype=np.int64)
             if keep.size:
                 new_points = [
                     ParetoPoint(
@@ -650,6 +718,12 @@ class Trainer:
                 steps=cfg.refinement.steps,
                 lr=cfg.refinement.lr,
                 num_restarts=cfg.refinement.num_restarts,
+                use_linear_trace_loss=cfg.refinement.use_linear_trace_loss,
+                early_stop_patience=cfg.refinement.early_stop_patience,
+                early_stop_rel_tol=cfg.refinement.early_stop_rel_tol,
+                adaptive_restarts=cfg.refinement.adaptive_restarts,
+                restart_fidelity_threshold=cfg.refinement.restart_fidelity_threshold,
+                sweep_passes=cfg.refinement.sweep_passes,
             )
 
             # 1. Always refine the best raw rollout, even if the Pareto archive
@@ -688,6 +762,7 @@ class Trainer:
                     bos_token_id=self.bos_token_id,
                     stop_token_id=self.stop_token_id,
                     apply_simplify=cfg.refinement.apply_simplify,
+                    simplify_max_passes=cfg.refinement.simplify_max_passes,
                     verbose=cfg.logging.verbose,
                 )
             elif cfg.logging.verbose:

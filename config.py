@@ -132,10 +132,27 @@ class PolicyConfig:
 class RefinementConfig:
     """Post-training continuous-parameter refinement of the Pareto archive.
 
-    Each entry's angles get ``steps`` iterations of Adam, run once from the
-    RL-suggested angles and ``num_restarts - 1`` more times from Uniform[-π, π]
-    initialisations; the best per circuit is kept. ``enabled=False`` reports
-    the archive as-is.
+    Each entry's angles get up to ``steps`` iterations of Adam, run once from
+    the RL-suggested angles and ``num_restarts - 1`` more times from
+    Uniform[-π, π] initialisations; the best per circuit is kept.
+    ``enabled=False`` reports the archive as-is.
+
+    Knobs added per arXiv:2601.03123 (Meiburg & Gomathi):
+
+    - ``use_linear_trace_loss``: minimise ``1 − |Tr|/d`` instead of HS
+      infidelity ``1 − |Tr|²/d²``. Linear in trace deviation → stronger
+      gradient near the optimum.
+    - ``early_stop_patience`` / ``early_stop_rel_tol``: bail out of Adam when
+      the loss has not relatively-improved by ``rel_tol`` for ``patience``
+      consecutive steps. Critical because underparameterised skeletons plateau
+      near 1e-3 forever (Sec 4 / Appendix B).
+    - ``adaptive_restarts`` / ``restart_fidelity_threshold``: skip random
+      restarts on circuits that already cleared the threshold; the paper
+      reports random init reliably converges first try for adequate skeletons.
+    - ``sweep_passes``: per-parameter closed-form sweep refinement (Sec 3.2.1
+      "DMRG-style" updates) applied after Adam. 0 disables.
+    - ``simplify_max_passes``: number of fixed-point iterations of the
+      structural simplifier; cascades may unlock further merges.
     """
 
     enabled: bool = True
@@ -143,6 +160,13 @@ class RefinementConfig:
     lr: float = 0.1
     num_restarts: int = 1
     apply_simplify: bool = True
+    use_linear_trace_loss: bool = True
+    early_stop_patience: int = 30
+    early_stop_rel_tol: float = 1.0e-5
+    adaptive_restarts: bool = True
+    restart_fidelity_threshold: float = 0.999
+    sweep_passes: int = 0
+    simplify_max_passes: int = 3
 
 
 @dataclass(frozen=True)
@@ -173,6 +197,15 @@ class RewardConfig:
     fidelity_floor: float = 0.0
     max_archive_size: int = 500
     fidelity_threshold: float = 0.99
+    # CNOT-pair-repetition admission filter (arXiv:2601.03123, Sec 4.1).
+    # When the same (control, target) pair recurs ``> pair_repeat_max`` times
+    # within any sliding window of ``pair_repeat_window`` consecutive CNOTs,
+    # the structure is "effectively underparameterised" — symmetries collapse
+    # parameters in that block and refinement plateaus around 10⁻³. Such
+    # rollouts are skipped at Pareto admission to save refinement compute.
+    # ``pair_repeat_window <= 0`` disables the filter.
+    pair_repeat_window: int = 0
+    pair_repeat_max: int = 1
 
 
 @dataclass(frozen=True)
@@ -298,6 +331,24 @@ def validate_config(raw: dict) -> None:
         if r.get("num_restarts", 1) < 1:
             raise ValueError("refinement.num_restarts must be >= 1")
         _require_bool("refinement.apply_simplify", r.get("apply_simplify", True))
+        if "use_linear_trace_loss" in r:
+            _require_bool(
+                "refinement.use_linear_trace_loss", r["use_linear_trace_loss"]
+            )
+        if r.get("early_stop_patience", 1) <= 0:
+            raise ValueError("refinement.early_stop_patience must be positive")
+        if r.get("early_stop_rel_tol", 1.0) < 0:
+            raise ValueError("refinement.early_stop_rel_tol must be >= 0")
+        if "adaptive_restarts" in r:
+            _require_bool("refinement.adaptive_restarts", r["adaptive_restarts"])
+        if not (0.0 < r.get("restart_fidelity_threshold", 0.999) <= 1.0):
+            raise ValueError(
+                "refinement.restart_fidelity_threshold must be in (0, 1]"
+            )
+        if r.get("sweep_passes", 0) < 0:
+            raise ValueError("refinement.sweep_passes must be >= 0")
+        if r.get("simplify_max_passes", 1) <= 0:
+            raise ValueError("refinement.simplify_max_passes must be positive")
 
     rw = raw.get("reward", {})
     if rw:
@@ -322,6 +373,10 @@ def validate_config(raw: dict) -> None:
             raise ValueError("reward.max_archive_size must be positive")
         if not (0.0 < rw.get("fidelity_threshold", 0.99) <= 1.0):
             raise ValueError("reward.fidelity_threshold must be in (0, 1]")
+        if rw.get("pair_repeat_window", 0) < 0:
+            raise ValueError("reward.pair_repeat_window must be >= 0")
+        if rw.get("pair_repeat_max", 1) < 1:
+            raise ValueError("reward.pair_repeat_max must be >= 1")
 
 
 def load_config(path: str) -> GQEConfig:

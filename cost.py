@@ -45,6 +45,19 @@ def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array
     return jnp.clip((jnp.abs(trace) ** 2) / (d**2), 0.0, 1.0)
 
 
+def linear_trace_cost_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array:
+    """``1 − |Tr(U_target^H U_circ)| / d`` — paper-faithful refinement loss.
+
+    Compared with ``1 − F = 1 − |Tr|² / d²``, this cost is linear in the trace
+    deviation rather than quadratic, so its gradient does not flatten as the
+    circuit approaches the target. That stronger late-stage signal is what
+    drives the final 10⁻³ → 10⁻⁸ infidelity range in arXiv:2601.03123.
+    """
+    d = u_target.shape[0]
+    trace = jnp.sum(jnp.conjugate(u_target) * u_circuit)
+    return 1.0 - jnp.abs(trace) / d
+
+
 @jax.jit
 def compose_unitary_batch(gate_batch: jax.Array) -> jax.Array:
     batch_size = gate_batch.shape[0]

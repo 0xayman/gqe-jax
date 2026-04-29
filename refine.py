@@ -2,7 +2,7 @@
 
 After RL training has converged we still want to squeeze the last bit of
 fidelity out of the best discovered circuits. The RL policy supplied initial
-angles; here we run a fixed number of Adam steps initialised at those angles.
+angles; here we run a fixed-budget Adam loop initialised at those angles.
 Adam is cheap (one ``value_and_grad`` per step, no line search) and converges
 fast from a warm RL-suggested init, which is what the policy is trained to
 provide.
@@ -10,6 +10,23 @@ provide.
 Operates on an entire ``ParetoArchive``: each surviving entry is re-optimised
 in a single batched JAX call, then re-inserted into a fresh archive (so any
 entries dominated after refinement are evicted).
+
+Per arXiv:2601.03123 (Meiburg & Gomathi):
+
+  - **Early stop on plateau** — underparameterised skeletons plateau at
+    cost ≈ 1e-3 forever. We bail out when no improvement is observed for
+    ``early_stop_patience`` consecutive steps so they don't burn the full
+    step budget.
+  - **Linear-trace loss** (``1 − |Tr|/d``) — keeps gradient magnitude
+    constant near the optimum, unlike HS infidelity (``1 − |Tr|²/d²``)
+    which flattens quadratically.
+  - **Adaptive restarts** — random restarts only run on circuits whose
+    best fidelity is below ``restart_fidelity_threshold``. The paper's
+    main result is that good skeletons converge first try, so restarts
+    are pure waste on those.
+  - **Sweep polish** (optional) — after Adam, run per-parameter closed-form
+    updates (``polish.sweep_refine``) for the final 10⁻³→10⁻⁸ window where
+    the linear loss alone still benefits from manifold-aware updates.
 """
 
 from __future__ import annotations
@@ -31,10 +48,18 @@ class AngleRefiner:
     """Adam refinement of angle vectors for a batch of circuits.
 
     PQC loss landscapes are notoriously non-convex, so single-shot Adam from
-    one starting point routinely gets stuck in local minima. Set
-    ``num_restarts > 1`` to also run Adam from ``num_restarts - 1`` random
-    Uniform[-π, π] initialisations alongside the RL-suggested angles, then
-    keep the highest-fidelity outcome per circuit.
+    one starting point can get stuck. ``num_restarts > 1`` runs Adam from
+    ``num_restarts - 1`` random Uniform[-π, π] initialisations on top of the
+    RL-suggested angles. With ``adaptive_restarts=True``, those restarts only
+    fire on rows whose best fidelity is still below
+    ``restart_fidelity_threshold`` — circuits that already converged on the
+    first run do not pay for further restarts.
+
+    Each Adam invocation runs at most ``steps`` iterations but bails out
+    early when the loss has not relatively-improved by ``early_stop_rel_tol``
+    for ``early_stop_patience`` consecutive steps. This is the dominant
+    runtime saving on a Pareto archive that mixes well- and badly-
+    parameterised candidates.
     """
 
     def __init__(
@@ -44,34 +69,134 @@ class AngleRefiner:
         steps: int = 50,
         lr: float = 0.1,
         num_restarts: int = 1,
+        use_linear_trace_loss: bool = True,
+        early_stop_patience: int = 30,
+        early_stop_rel_tol: float = 1.0e-5,
+        adaptive_restarts: bool = True,
+        restart_fidelity_threshold: float = 0.999,
+        sweep_passes: int = 0,
     ):
         if num_restarts < 1:
             raise ValueError("num_restarts must be >= 1")
+        if steps <= 0:
+            raise ValueError("steps must be positive")
+        if early_stop_patience <= 0:
+            raise ValueError("early_stop_patience must be positive")
+        if early_stop_rel_tol < 0:
+            raise ValueError("early_stop_rel_tol must be >= 0")
+        if not (0.0 < restart_fidelity_threshold <= 1.0):
+            raise ValueError(
+                "restart_fidelity_threshold must be in (0, 1]"
+            )
+        if sweep_passes < 0:
+            raise ValueError("sweep_passes must be >= 0")
         self.evaluator = evaluator
         self.steps = int(steps)
         self.lr = float(lr)
         self.num_restarts = int(num_restarts)
+        self.use_linear_trace_loss = bool(use_linear_trace_loss)
+        self.early_stop_patience = int(early_stop_patience)
+        self.early_stop_rel_tol = float(early_stop_rel_tol)
+        self.adaptive_restarts = bool(adaptive_restarts)
+        self.restart_fidelity_threshold = float(restart_fidelity_threshold)
+        self.sweep_passes = int(sweep_passes)
         self._adam = optax.adam(learning_rate=lr)
 
-        value_and_grad_one = jax.value_and_grad(
-            lambda angles, token_ids: 1.0 - evaluator._fidelity_one(
-                token_ids, angles,
+        if self.use_linear_trace_loss:
+            value_and_grad_one = jax.value_and_grad(
+                lambda angles, token_ids: evaluator._linear_loss_one(
+                    angles, token_ids
+                )
             )
-        )
+        else:
+            value_and_grad_one = jax.value_and_grad(
+                lambda angles, token_ids: 1.0 - evaluator._fidelity_one(
+                    token_ids, angles,
+                )
+            )
 
-        def adam_step(angles, token_ids):
+        max_steps = jnp.int32(self.steps)
+        patience = jnp.int32(self.early_stop_patience)
+        real_dtype = evaluator._real_dtype
+        rel_tol = jnp.asarray(self.early_stop_rel_tol, dtype=real_dtype)
+
+        def adam_refine_one(angles, token_ids):
+            angles = angles.astype(real_dtype)
             opt_state = self._adam.init(angles)
+            init_loss, _ = value_and_grad_one(angles, token_ids)
+            init_carry = (
+                angles,                       # current angles
+                opt_state,                    # adam state
+                jnp.int32(0),                 # step counter
+                init_loss,                    # best loss so far
+                angles,                       # best angles so far
+                jnp.int32(0),                 # steps since last improvement
+            )
 
-            def body(_, carry):
-                a, st = carry
-                _v, g = value_and_grad_one(a, token_ids)
-                u, st = self._adam.update(g, st, a)
-                return optax.apply_updates(a, u), st
+            def cond(c):
+                _a, _st, step, _best, _ba, ss = c
+                return jnp.logical_and(step < max_steps, ss < patience)
 
-            return jax.lax.fori_loop(0, self.steps, body, (angles, opt_state))[0]
+            def body(c):
+                a, st, step, best, ba, ss = c
+                v, g = value_and_grad_one(a, token_ids)
+                u, st_new = self._adam.update(g, st, a)
+                a_next = optax.apply_updates(a, u)
+                # Per-element activity: under vmap the loop runs while ANY
+                # element wants to continue, so we gate writes on this.
+                active = jnp.logical_and(step < max_steps, ss < patience)
+                # "Improved enough to reset patience" requires a relative
+                # decrease ≥ rel_tol (so float jitter at the noise floor
+                # doesn't mask a real plateau).
+                rel_thresh = rel_tol * jnp.maximum(
+                    jnp.abs(best), jnp.asarray(1e-12, dtype=best.dtype),
+                )
+                strictly_improved = v < best
+                improved_rel = (best - v) > rel_thresh
+                update_best = jnp.logical_and(active, strictly_improved)
+                new_best = jnp.where(update_best, v, best)
+                new_ba = jnp.where(update_best, a, ba)
+                new_ss = jnp.where(
+                    jnp.logical_and(active, improved_rel),
+                    jnp.int32(0),
+                    jnp.where(active, ss + jnp.int32(1), ss),
+                )
+                new_step = jnp.where(active, step + jnp.int32(1), step)
+                new_a = jnp.where(active, a_next, a)
+                return (new_a, st_new, new_step, new_best, new_ba, new_ss)
 
-        self._refine_batch = jax.jit(jax.vmap(adam_step, in_axes=(0, 0)))
+            final_carry = jax.lax.while_loop(cond, body, init_carry)
+            return final_carry[4]  # best angles seen
+
+        self._refine_batch = jax.jit(jax.vmap(adam_refine_one, in_axes=(0, 0)))
         self._rng_seed = 0
+
+    # ── Adam stage ─────────────────────────────────────────────────────────
+
+    def _run_adam(
+        self,
+        token_ids_batch: np.ndarray,
+        init_angles_batch: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        real_dtype = self.evaluator._real_dtype
+        token_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)
+        # ``np.asarray`` on a JAX device array yields a zero-copy read-only
+        # numpy view — we need writable buffers for the adaptive-restart
+        # in-place row updates downstream, so force a copy here.
+        out = np.array(
+            self._refine_batch(
+                jnp.asarray(init_angles_batch, dtype=real_dtype),
+                token_jax,
+            ),
+            dtype=np.float32,
+            copy=True,
+        )
+        fids = np.array(
+            self.evaluator.fidelity_batch(token_ids_batch, out),
+            dtype=np.float32,
+            copy=True,
+        )
+        return fids, out
 
     def refine_batch(
         self,
@@ -81,8 +206,11 @@ class AngleRefiner:
         """Return ``(refined_fidelities, refined_angles)`` for a batch.
 
         With ``num_restarts > 1`` runs Adam from the supplied initialisation
-        AND from (num_restarts − 1) random Uniform[-π, π] vectors per circuit,
-        then keeps the best refined fidelity per row.
+        AND from up to ``num_restarts − 1`` random Uniform[-π, π] vectors per
+        circuit, then keeps the best refined fidelity per row. With
+        ``adaptive_restarts=True`` (default), each random restart skips rows
+        that already cleared ``restart_fidelity_threshold`` — saving
+        compute on circuits that converged first try.
         """
         if token_ids_batch.shape[0] == 0:
             return (
@@ -90,36 +218,56 @@ class AngleRefiner:
                 np.zeros((0, self.evaluator.max_gates), dtype=np.float32),
             )
         B, T = init_angles_batch.shape
-        token_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)
-        real_dtype = self.evaluator._real_dtype
 
-        # First run: from the supplied RL-suggested angles.
-        best_angles = np.asarray(
-            self._refine_batch(
-                jnp.asarray(init_angles_batch, dtype=real_dtype),
-                token_jax,
-            ),
-            dtype=np.float32,
+        # First Adam run from the supplied (RL-suggested) angles.
+        best_fids, best_angles = self._run_adam(
+            token_ids_batch, init_angles_batch.astype(np.float32)
         )
-        best_fids = self.evaluator.fidelity_batch(token_ids_batch, best_angles)
 
-        # Additional random restarts. Use a NumPy RNG seeded once per refiner
-        # instance so reruns are reproducible without complicating the API.
+        # Random restarts.
         rng = np.random.default_rng(self._rng_seed)
         self._rng_seed += 1
         for _ in range(self.num_restarts - 1):
-            random_init = rng.uniform(-np.pi, np.pi, size=(B, T)).astype(np.float32)
-            refined = np.asarray(
-                self._refine_batch(
-                    jnp.asarray(random_init, dtype=real_dtype),
-                    token_jax,
-                ),
-                dtype=np.float32,
+            if self.adaptive_restarts:
+                needs = best_fids < self.restart_fidelity_threshold
+                if not bool(np.any(needs)):
+                    break
+                keep_idx = np.flatnonzero(needs)
+                sub_tokens = token_ids_batch[keep_idx]
+                sub_init = rng.uniform(
+                    -np.pi, np.pi, size=(keep_idx.size, T)
+                ).astype(np.float32)
+                fids_sub, refined_sub = self._run_adam(sub_tokens, sub_init)
+                cur_sub = best_fids[keep_idx]
+                improved_sub = fids_sub > cur_sub
+                upd_local = np.flatnonzero(improved_sub)
+                if upd_local.size:
+                    upd_global = keep_idx[upd_local]
+                    best_fids[upd_global] = fids_sub[upd_local]
+                    best_angles[upd_global] = refined_sub[upd_local]
+            else:
+                random_init = rng.uniform(
+                    -np.pi, np.pi, size=(B, T)
+                ).astype(np.float32)
+                fids, refined = self._run_adam(token_ids_batch, random_init)
+                improved = fids > best_fids
+                best_fids = np.where(improved, fids, best_fids)
+                best_angles = np.where(improved[:, None], refined, best_angles)
+
+        # Optional closed-form sweep polish (DMRG-style per-parameter atan2).
+        if self.sweep_passes > 0:
+            from polish import sweep_refine_batch
+            polished_angles, polished_fids = sweep_refine_batch(
+                self.evaluator,
+                token_ids_batch,
+                best_angles,
+                num_sweeps=self.sweep_passes,
             )
-            fids = self.evaluator.fidelity_batch(token_ids_batch, refined)
-            improved = fids > best_fids
-            best_fids = np.where(improved, fids, best_fids)
-            best_angles = np.where(improved[:, None], refined, best_angles)
+            improved = polished_fids > best_fids
+            best_fids = np.where(improved, polished_fids, best_fids)
+            best_angles = np.where(
+                improved[:, None], polished_angles, best_angles
+            )
 
         return best_fids, best_angles
 
@@ -133,6 +281,7 @@ def refine_pareto_archive(
     bos_token_id: int,
     stop_token_id: int,
     apply_simplify: bool = True,
+    simplify_max_passes: int = 3,
     verbose: bool = False,
 ) -> ParetoArchive:
     """Refine every entry in ``archive`` in-place; return the rebuilt archive.
@@ -172,6 +321,7 @@ def refine_pareto_archive(
         if apply_simplify:
             tok_no_bos = simplify_token_sequence(
                 tok_no_bos, token_axis, token_q0, token_q1, stop_token_id,
+                max_passes=simplify_max_passes,
             )
         tokens_batch[i, :tok_no_bos.size] = tok_no_bos
         if p.opt_angles is not None:

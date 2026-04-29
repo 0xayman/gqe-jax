@@ -25,14 +25,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import jax_setup  # noqa: F401
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+import jax_setup  # noqa: F401
 
 # ── Architecture sizes ──────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class _ArchConfig:
@@ -42,10 +43,11 @@ class _ArchConfig:
 
 
 _SIZES: dict[str, _ArchConfig] = {
-    "tiny":   _ArchConfig(n_layer=2,  n_head=2,  n_embd=128),
-    "small":  _ArchConfig(n_layer=6,  n_head=6,  n_embd=384),
+    # "tiny":   _ArchConfig(n_layer=2,  n_head=2,  n_embd=128),
+    "tiny": _ArchConfig(n_layer=2, n_head=2, n_embd=384),
+    "small": _ArchConfig(n_layer=6, n_head=6, n_embd=384),
     "medium": _ArchConfig(n_layer=12, n_head=12, n_embd=768),
-    "large":  _ArchConfig(n_layer=24, n_head=16, n_embd=1024),
+    "large": _ArchConfig(n_layer=24, n_head=16, n_embd=1024),
 }
 
 VALID_MODEL_SIZES = frozenset(_SIZES)
@@ -61,7 +63,7 @@ LOG_STD_MAX = 2.0
 
 def _gelu_new(x: jax.Array) -> jax.Array:
     coeff = jnp.sqrt(2.0 / jnp.pi)
-    return 0.5 * x * (1.0 + jnp.tanh(coeff * (x + 0.044715 * (x ** 3))))
+    return 0.5 * x * (1.0 + jnp.tanh(coeff * (x + 0.044715 * (x**3))))
 
 
 def _init():
@@ -69,6 +71,7 @@ def _init():
 
 
 # ── Transformer blocks ───────────────────────────────────────────────────────
+
 
 class _CausalSelfAttention(nn.Module):
     n_head: int
@@ -123,7 +126,9 @@ class _Block(nn.Module):
     def __call__(self, x, mask, deterministic):
         attn_in = nn.LayerNorm(epsilon=_LAYER_NORM_EPS, name="ln_1")(x)
         x = x + _CausalSelfAttention(
-            n_head=self.n_head, n_embd=self.n_embd, name="attn",
+            n_head=self.n_head,
+            n_embd=self.n_embd,
+            name="attn",
         )(attn_in, mask, deterministic)
         mlp_in = nn.LayerNorm(epsilon=_LAYER_NORM_EPS, name="ln_2")(x)
         x = x + _MLP(n_embd=self.n_embd, name="mlp")(mlp_in, deterministic)
@@ -153,17 +158,21 @@ class HybridPolicy(nn.Module):
             raise ValueError(f"Sequence length {T} exceeds max {self.n_positions}")
 
         wte = nn.Embed(self.vocab_size, arch.n_embd, embedding_init=_init(), name="wte")
-        wpe = nn.Embed(self.n_positions, arch.n_embd, embedding_init=_init(), name="wpe")
+        wpe = nn.Embed(
+            self.n_positions, arch.n_embd, embedding_init=_init(), name="wpe"
+        )
         x = wte(input_ids) + wpe(jnp.arange(T, dtype=jnp.int32)[None, :])
         x = nn.Dropout(rate=_DROPOUT_RATE)(x, deterministic=deterministic)
 
         for i in range(arch.n_layer):
             x = _Block(n_head=arch.n_head, n_embd=arch.n_embd, name=f"h_{i}")(
-                x, attention_mask, deterministic,
+                x,
+                attention_mask,
+                deterministic,
             )
 
         x = nn.LayerNorm(epsilon=_LAYER_NORM_EPS, name="ln_f")(x)
-        discrete_logits = wte.attend(x)                         # tied weights
+        discrete_logits = wte.attend(x)  # tied weights
 
         # Continuous head: small MLP -> (mu, log_sigma) per position.
         h = nn.Dense(arch.n_embd, kernel_init=_init(), name="cont_fc")(x)
@@ -176,7 +185,10 @@ class HybridPolicy(nn.Module):
 
 # ── Helpers shared by training-mode and rollout-mode evaluation ──────────────
 
-def gaussian_log_prob(value: jax.Array, mu: jax.Array, log_sigma: jax.Array) -> jax.Array:
+
+def gaussian_log_prob(
+    value: jax.Array, mu: jax.Array, log_sigma: jax.Array
+) -> jax.Array:
     """Per-element log-probability of a univariate Normal."""
     var = jnp.exp(2.0 * log_sigma)
     return -0.5 * (jnp.log(2.0 * jnp.pi) + 2.0 * log_sigma + (value - mu) ** 2 / var)
@@ -212,7 +224,9 @@ def reduce_sequence_log_probs(
     max_len = token_log_probs.shape[-1]
     pos = jnp.arange(max_len, dtype=lengths.dtype)
     mask = pos[None, :] < lengths[:, None]
-    masked = jnp.where(mask, token_log_probs, jnp.asarray(0.0, dtype=token_log_probs.dtype))
+    masked = jnp.where(
+        mask, token_log_probs, jnp.asarray(0.0, dtype=token_log_probs.dtype)
+    )
     denom = jnp.maximum(lengths.astype(token_log_probs.dtype), 1.0)
     return jnp.sum(masked, axis=-1) / denom
 
@@ -233,6 +247,7 @@ def compute_lengths_from_tokens(token_ids: jax.Array, stop_token_id: int) -> jax
 # rollout we want O(N) by caching per-layer (K, V). We read weights directly
 # from the Flax params dict; layout matches ``HybridPolicy`` (and
 # ``model.GPT2`` historically).
+
 
 def _layernorm(x, scale, bias):
     mean = x.mean(axis=-1, keepdims=True)
@@ -272,9 +287,9 @@ def build_rollout_fn(
     def decode_step(params, k_cache, v_cache, prev_token, step_idx):
         wte = params["wte"]["embedding"]
         wpe = params["wpe"]["embedding"]
-        x = (wte[prev_token] + wpe[step_idx])[:, None, :]            # (B, 1, D)
+        x = (wte[prev_token] + wpe[step_idx])[:, None, :]  # (B, 1, D)
         positions = jnp.arange(total_len, dtype=jnp.int32)
-        key_mask = positions <= step_idx                              # (T,)
+        key_mask = positions <= step_idx  # (T,)
 
         for i in range(n_layer):
             block = params[f"h_{i}"]
@@ -317,21 +332,23 @@ def build_rollout_fn(
         x = _layernorm(x, params["ln_f"]["scale"], params["ln_f"]["bias"])
 
         # Discrete head (tied with wte).
-        discrete_logits = (x @ wte.T)[:, 0, :]                        # (B, V)
+        discrete_logits = (x @ wte.T)[:, 0, :]  # (B, V)
 
         # Continuous head: 2-layer MLP -> (mu, log_sigma).
         cont_fc = params["cont_fc"]
         cont_out = params["cont_out"]
         h = x @ cont_fc["kernel"] + cont_fc["bias"]
         h = _gelu_new(h)
-        h = h @ cont_out["kernel"] + cont_out["bias"]                 # (B, 1, 2)
+        h = h @ cont_out["kernel"] + cont_out["bias"]  # (B, 1, 2)
         mu = h[:, 0, 0]
         log_sigma = jnp.clip(h[:, 0, 1], LOG_STD_MIN, LOG_STD_MAX)
         return k_cache, v_cache, discrete_logits, mu, log_sigma
 
     def rollout(params, rng_key, beta):
         dtype = params["wte"]["embedding"].dtype
-        k_cache = jnp.zeros((n_layer, batch_size, n_head, total_len, head_dim), dtype=dtype)
+        k_cache = jnp.zeros(
+            (n_layer, batch_size, n_head, total_len, head_dim), dtype=dtype
+        )
         v_cache = jnp.zeros_like(k_cache)
         init_token = jnp.full((batch_size,), bos_token_id, dtype=jnp.int32)
         init_stopped = jnp.zeros((batch_size,), dtype=bool)
@@ -340,13 +357,19 @@ def build_rollout_fn(
             k_c, v_c, prev_token, stopped, rng = carry
             rng, k_disc, k_cont = jax.random.split(rng, 3)
             k_c, v_c, logits, mu, log_sigma = decode_step(
-                params, k_c, v_c, prev_token, step_idx,
+                params,
+                k_c,
+                v_c,
+                prev_token,
+                step_idx,
             )
             # Mask BOS and (at first step) STOP. Convention: sampling uses
             # softmax(-beta * logits), so +inf suppresses.
             pos_inf = jnp.asarray(jnp.inf, dtype=logits.dtype)
             logits = logits.at[:, bos_token_id].set(pos_inf)
-            stop_bias = jnp.where(step_idx == 0, pos_inf, jnp.asarray(0.0, dtype=logits.dtype))
+            stop_bias = jnp.where(
+                step_idx == 0, pos_inf, jnp.asarray(0.0, dtype=logits.dtype)
+            )
             logits = logits.at[:, stop_token_id].add(stop_bias)
 
             # Discrete sample under temperature ``beta``: p ∝ softmax(-beta * logits).
@@ -358,7 +381,9 @@ def build_rollout_fn(
             # Discrete log-prob under the same scaled distribution.
             log_p_disc_all = jax.nn.log_softmax(scaled, axis=-1)
             log_p_disc = jnp.take_along_axis(
-                log_p_disc_all, tok_next[:, None], axis=-1,
+                log_p_disc_all,
+                tok_next[:, None],
+                axis=-1,
             ).squeeze(-1)
 
             # Continuous sample from N(mu, exp(log_sigma)).
@@ -368,7 +393,10 @@ def build_rollout_fn(
             log_p_cont = gaussian_log_prob(angle_next, mu, log_sigma)
 
             return (k_c, v_c, tok_next, new_stopped, rng), (
-                tok_next, angle_next, log_p_disc, log_p_cont,
+                tok_next,
+                angle_next,
+                log_p_disc,
+                log_p_cont,
             )
 
         (_, _, _, _, _), (toks, angles, log_p_d, log_p_c) = jax.lax.scan(
@@ -399,6 +427,7 @@ def build_rollout_fn(
 # Given a stored (tokens, angles) batch, recompute the *current* policy's
 # discrete + continuous per-token log-probs. Used by the PPO loss.
 
+
 def hybrid_log_probs(
     discrete_logits: jax.Array,
     mu: jax.Array,
@@ -423,7 +452,9 @@ def hybrid_log_probs(
     )
     log_p_all = jax.nn.log_softmax(-beta * aligned_logits, axis=-1)
     log_p_disc = jnp.take_along_axis(
-        log_p_all, actions_disc[..., None], axis=-1,
+        log_p_all,
+        actions_disc[..., None],
+        axis=-1,
     ).squeeze(-1)
 
     mu_a = mu[:, :seq_len]

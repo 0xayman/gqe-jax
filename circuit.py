@@ -349,6 +349,12 @@ class CircuitEvaluator:
         overlap = jnp.sum(jnp.conjugate(self.u_target) * U)
         return jnp.clip((jnp.abs(overlap) ** 2) / (d ** 2), 0.0, 1.0)
 
+    def _linear_trace_cost(self, U: jax.Array) -> jax.Array:
+        # ``1 − |Tr(U_target^H U)| / d`` — see cost.linear_trace_cost_jax.
+        d = U.shape[0]
+        overlap = jnp.sum(jnp.conjugate(self.u_target) * U)
+        return 1.0 - jnp.abs(overlap) / d
+
     def _build_jit_fns(self) -> None:
         def fidelity_one(token_ids, angles):
             return self._process_fidelity(self._build_unitary(token_ids, angles))
@@ -356,11 +362,18 @@ class CircuitEvaluator:
         def loss_one(angles, token_ids):
             return 1.0 - fidelity_one(token_ids, angles)
 
+        def linear_loss_one(angles, token_ids):
+            return self._linear_trace_cost(self._build_unitary(token_ids, angles))
+
         self._fidelity_one = jax.jit(fidelity_one)
         self._loss_one = jax.jit(loss_one)
+        self._linear_loss_one = jax.jit(linear_loss_one)
         self._fidelity_batch = jax.jit(jax.vmap(fidelity_one, in_axes=(0, 0)))
         self._loss_value_and_grad_batch = jax.jit(
             jax.vmap(jax.value_and_grad(loss_one), in_axes=(0, 0))
+        )
+        self._linear_loss_value_and_grad_batch = jax.jit(
+            jax.vmap(jax.value_and_grad(linear_loss_one), in_axes=(0, 0))
         )
 
     # ── Public entrypoints ───────────────────────────────────────────────────

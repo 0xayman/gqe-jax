@@ -1,0 +1,217 @@
+"""Closed-form sweep refinement (DMRG-style) for token-based PQCs.
+
+After Adam refinement, we still want to drive the residual infidelity from
+~1e-4 down to the floating-point floor on the survivors that are worth the
+effort. arXiv:2601.03123 Sec 3.2.1 motivates an SVD-based "manifold-aware"
+update: per single-qubit slot, one closed-form step replaces dozens of
+gradient steps and removes learning-rate dependence.
+
+Their trick is for a *generic* SU(2) slot with three Euler angles. Our
+circuit emits one specific axis rotation (R_X / R_Y / R_Z) per token, which
+makes the per-token closed form even simpler: for a fixed rotation axis σ,
+
+    Tr(M · R_σ(θ)) = a · cos(θ/2) + b · sin(θ/2)
+
+with ``a = Tr(A)`` and ``b = −i · Tr(σ · A)``, where A is the partial trace
+of ``M = L · U_target^H · R`` onto the gate's qubit and L / R are the running
+products of the gates strictly before / after the slot.
+
+Maximising |Tr|² over θ gives
+
+    θ* = atan2( 2 Re(a* b) ,  |a|² − |b|² )
+
+so the optimal angle is computed in closed form per parameter. Sweeping
+forward through the circuit while caching L (forward partial product) and
+the precomputed R (backward partial products) brings the per-sweep cost to
+O(L · d³). Two sweeps reliably push 1e-4 → 1e-8 for adequately
+parameterised skeletons.
+
+Non-parametric tokens (CNOT / SX / NOOP / BOS / STOP) are left in place;
+their stored matrices just feed into L for downstream slots.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from circuit import (
+    GATE_TYPE_CNOT,
+    GATE_TYPE_NOOP,
+    GATE_TYPE_RX,
+    GATE_TYPE_RY,
+    GATE_TYPE_RZ,
+    GATE_TYPE_SX,
+    _CNOT,
+    _PAULI_X,
+    _PAULI_Y,
+    _PAULI_Z,
+    _SX,
+    _embed_single_qubit,
+    _embed_two_qubit,
+)
+
+
+_PAULI_BY_AXIS = {
+    GATE_TYPE_RX: _PAULI_X.astype(np.complex128),
+    GATE_TYPE_RY: _PAULI_Y.astype(np.complex128),
+    GATE_TYPE_RZ: _PAULI_Z.astype(np.complex128),
+}
+
+
+def _build_static_cache(evaluator) -> dict:
+    """Pre-build per-token static information for CPU sweep refinement.
+
+    Pulled once per refiner instance — re-uses the evaluator's vocab tables
+    to avoid duplicating gate metadata across modules.
+    """
+    n = int(evaluator.num_qubits)
+    d = 2 ** n
+    gate_types = np.asarray(evaluator._tok_gate_type, dtype=np.int32)
+    qubit0 = np.asarray(evaluator._tok_qubit0, dtype=np.int32)
+    pair_idx = np.asarray(evaluator._tok_cnot_pair, dtype=np.int32)
+    cnot_pairs = list(evaluator._cnot_pairs)
+    u_target = np.asarray(evaluator.u_target, dtype=np.complex128)
+    cnot_full = [
+        _embed_two_qubit(_CNOT, c, t, n).astype(np.complex128)
+        for c, t in cnot_pairs
+    ]
+    sx_full = [
+        _embed_single_qubit(_SX, q, n).astype(np.complex128)
+        for q in range(n)
+    ]
+    return {
+        "n": n,
+        "d": d,
+        "gate_types": gate_types,
+        "q0": qubit0,
+        "pair_idx": pair_idx,
+        "cnot_full": cnot_full,
+        "sx_full": sx_full,
+        "u_target": u_target,
+        "u_target_dag": u_target.conj().T,
+    }
+
+
+def _rotation_full(axis: int, angle: float, qubit: int, n: int) -> np.ndarray:
+    pauli = _PAULI_BY_AXIS[axis]
+    half = float(angle) * 0.5
+    g2 = (
+        np.cos(half) * np.eye(2, dtype=np.complex128)
+        - 1j * np.sin(half) * pauli
+    )
+    return _embed_single_qubit(g2, qubit, n)
+
+
+def _gate_full(tok: int, angle: float, cache: dict) -> np.ndarray:
+    gtype = int(cache["gate_types"][tok])
+    if gtype == GATE_TYPE_RX or gtype == GATE_TYPE_RY or gtype == GATE_TYPE_RZ:
+        return _rotation_full(gtype, angle, int(cache["q0"][tok]), cache["n"])
+    if gtype == GATE_TYPE_SX:
+        return cache["sx_full"][int(cache["q0"][tok])]
+    if gtype == GATE_TYPE_CNOT:
+        return cache["cnot_full"][int(cache["pair_idx"][tok])]
+    return np.eye(cache["d"], dtype=np.complex128)
+
+
+def _partial_trace_to_qubit(M: np.ndarray, qubit: int, n: int) -> np.ndarray:
+    """Trace out all qubits except ``qubit``; return 2x2.
+
+    Convention matches ``_embed_single_qubit``: qubit 0 is the most-significant
+    bit (axis 0 of the (2,)*(2n) reshape).
+    """
+    Mr = M.reshape((2,) * (2 * n))
+    perm = list(range(2 * n))
+    perm.remove(qubit)
+    perm.insert(0, qubit)
+    perm.remove(n + qubit)
+    perm.insert(1, n + qubit)
+    Mp = np.transpose(Mr, perm)
+    d_prime = 2 ** (n - 1)
+    Mp = Mp.reshape(2, 2, d_prime, d_prime)
+    return np.trace(Mp, axis1=2, axis2=3)
+
+
+def _optimal_angle(M: np.ndarray, axis: int, qubit: int, n: int) -> float:
+    A = _partial_trace_to_qubit(M, qubit, n)
+    pauli = _PAULI_BY_AXIS[axis]
+    a = np.trace(A)
+    b = -1j * np.trace(pauli @ A)
+    X = float((np.abs(a) ** 2) - (np.abs(b) ** 2))
+    Y = float(2.0 * (np.conjugate(a) * b).real)
+    if abs(X) < 1e-15 and abs(Y) < 1e-15:
+        return 0.0
+    return float(np.arctan2(Y, X))
+
+
+def sweep_refine_one(
+    token_ids: np.ndarray,
+    angles: np.ndarray,
+    cache: dict,
+    *,
+    num_sweeps: int = 2,
+) -> np.ndarray:
+    """Per-circuit forward-sweep refinement; returns updated angles."""
+    n = cache["n"]
+    d = cache["d"]
+    L = int(token_ids.shape[0])
+    u_target_dag = cache["u_target_dag"]
+    angles = np.asarray(angles, dtype=np.float64).copy()
+
+    for _ in range(int(num_sweeps)):
+        gates = [_gate_full(int(token_ids[i]), float(angles[i]), cache) for i in range(L)]
+        # R[p] = product of gates with index strictly > p.
+        # R[L-1] = I (no gates after the last). R[p] = R[p+1] @ G_{p+1}.
+        R = [None] * L
+        if L > 0:
+            R[L - 1] = np.eye(d, dtype=np.complex128)
+            for p in range(L - 2, -1, -1):
+                R[p] = R[p + 1] @ gates[p + 1]
+
+        L_prev = np.eye(d, dtype=np.complex128)
+        for p in range(L):
+            tok = int(token_ids[p])
+            gtype = int(cache["gate_types"][tok])
+            if gtype in (GATE_TYPE_RX, GATE_TYPE_RY, GATE_TYPE_RZ):
+                M = L_prev @ u_target_dag @ R[p]
+                qubit = int(cache["q0"][tok])
+                theta_new = _optimal_angle(M, gtype, qubit, n)
+                angles[p] = theta_new
+                gates[p] = _rotation_full(gtype, theta_new, qubit, n)
+            L_prev = gates[p] @ L_prev
+
+    return angles
+
+
+def sweep_refine_batch(
+    evaluator,
+    token_ids_batch: np.ndarray,
+    angles_batch: np.ndarray,
+    *,
+    num_sweeps: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run sweep refinement on each row.
+
+    Returns ``(refined_angles, refined_fidelities)``. Operates on the host
+    in numpy — sweeping is intrinsically sequential per parameter, which
+    fights JAX vmap, and the polish stage is only meaningful for the small
+    set of survivors at the end of training.
+    """
+    cache = _build_static_cache(evaluator)
+    B, T = angles_batch.shape
+    out_angles = np.array(angles_batch, dtype=np.float32).copy()
+    if B == 0:
+        return out_angles, np.zeros((0,), dtype=np.float32)
+    for b in range(B):
+        new_angles = sweep_refine_one(
+            np.asarray(token_ids_batch[b], dtype=np.int32),
+            angles_batch[b],
+            cache,
+            num_sweeps=num_sweeps,
+        )
+        out_angles[b] = new_angles.astype(np.float32)
+    fids = np.array(
+        evaluator.fidelity_batch(token_ids_batch, out_angles),
+        dtype=np.float32,
+        copy=True,
+    )
+    return out_angles, fids
