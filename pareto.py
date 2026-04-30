@@ -239,12 +239,25 @@ class ParetoArchive:
         return hv
 
     def to_sorted_list(self) -> List[ParetoPoint]:
-        """Return all archive entries sorted by fidelity descending."""
-        return sorted(self._archive, key=lambda p: -p.fidelity)
+        """Return archive entries with best-fidelity ties ordered by compactness."""
+        return sorted(
+            self._archive,
+            key=lambda p: (-p.fidelity, p.cnot_count, p.depth, p.total_gates),
+        )
 
     def best_by_fidelity(self) -> Optional[ParetoPoint]:
-        """Return the entry with the highest fidelity, or None if empty."""
-        return max(self._archive, key=lambda p: p.fidelity) if self._archive else None
+        """Return the highest-fidelity entry, tie-breaking by compactness."""
+        if not self._archive:
+            return None
+        best_f = max(p.fidelity for p in self._archive)
+        candidates = [
+            p for p in self._archive
+            if np.isclose(p.fidelity, best_f, rtol=0.0, atol=1.0e-7)
+        ]
+        return min(
+            candidates,
+            key=lambda p: (p.cnot_count, p.depth, p.total_gates, -p.fidelity),
+        )
 
     def best_by_cnot(self, min_fidelity: float = 0.0) -> Optional[ParetoPoint]:
         """Return the lowest-CNOT entry among circuits with fidelity >= min_fidelity."""

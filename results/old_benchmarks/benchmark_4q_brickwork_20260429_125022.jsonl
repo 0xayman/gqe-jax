@@ -1,1 +1,0 @@
-{"seed": 1000, "num_qubits": 4, "target_type": "brickwork", "target_desc": "brickwork_haar n=4 depth=8 seed=1000", "elapsed_sec": 1207.7508339881897, "gqe_F": 0.9951332807540894, "gqe_depth": 213, "gqe_total_gates": 396, "gqe_cnot": 138, "qiskit_depth": 272, "qiskit_total_gates": 405, "qiskit_cnot": 95}

@@ -12,7 +12,6 @@ import optax
 
 from circuit import CircuitEvaluator
 from pareto import ParetoArchive, ParetoPoint
-from simplify import build_token_axis, simplify_token_sequence
 
 
 class AngleRefiner:
@@ -143,7 +142,7 @@ class AngleRefiner:
         if token_ids_batch.shape[0] == 0:
             return (
                 np.zeros((0,), dtype=np.float32),
-                np.zeros((0, self.evaluator.max_gates), dtype=np.float32),
+                np.zeros(init_angles_batch.shape, dtype=np.float32),
             )
 
         best_fids, best_angles = self._run_adam(
@@ -172,50 +171,41 @@ def refine_pareto_archive(
     refiner: AngleRefiner,
     *,
     structure_metrics_fn,
-    pool_token_names: list[str],
     bos_token_id: int,
-    stop_token_id: int,
-    apply_simplify: bool = True,
-    simplify_max_passes: int = 3,
+    pad_token_id: int,
     verbose: bool = False,
 ) -> ParetoArchive:
-    """Refine archive entries and return a fresh non-dominated archive."""
+    """Refine archive entries and return a fresh verified non-dominated archive."""
     if archive is None or len(archive) == 0:
         return archive
 
     entries = list(archive._archive)
     n = len(entries)
-    max_gates = refiner.evaluator.max_gates
+    action_width = max(
+        max(
+            np.asarray(p.token_sequence, dtype=np.int32).size - 1,
+            0 if p.opt_angles is None else np.asarray(p.opt_angles).size,
+        )
+        for p in entries
+    )
 
-    token_axis = build_token_axis(pool_token_names) if apply_simplify else None
-    if apply_simplify:
-        from circuit import parse_gate_name
-        token_q0 = np.zeros((len(pool_token_names),), dtype=np.int32)
-        token_q1 = np.full((len(pool_token_names),), -1, dtype=np.int32)
-        for i, name in enumerate(pool_token_names):
-            spec = parse_gate_name(name)
-            token_q0[i] = spec.qubits[0]
-            if spec.gate_type == "CNOT":
-                token_q1[i] = spec.qubits[1]
-
-    tokens_batch = np.zeros((n, max_gates), dtype=np.int32)
-    angles_batch = np.zeros((n, max_gates), dtype=np.float32)
+    tokens_batch = np.full((n, action_width), pad_token_id, dtype=np.int32)
+    original_angles = np.zeros((n, action_width), dtype=np.float32)
     for i, p in enumerate(entries):
         tok_no_bos = np.asarray(p.token_sequence, dtype=np.int32)[1:].copy()
-        if apply_simplify:
-            tok_no_bos = simplify_token_sequence(
-                tok_no_bos, token_axis, token_q0, token_q1, stop_token_id,
-                max_passes=simplify_max_passes,
-            )
         tokens_batch[i, :tok_no_bos.size] = tok_no_bos
         if p.opt_angles is not None:
             init = np.asarray(p.opt_angles, dtype=np.float32)
-            angles_batch[i, :init.size] = init
+            original_angles[i, :init.size] = init
 
     if verbose:
         t0 = time.perf_counter()
 
-    refined_fids, refined_angles = refiner.refine_batch(tokens_batch, angles_batch)
+    original_fids = refiner.evaluator.fidelity_batch(tokens_batch, original_angles)
+    refined_fids, refined_angles = refiner.refine_batch(tokens_batch, original_angles)
+    improved = refined_fids >= original_fids
+    stored_angles = np.where(improved[:, None], refined_angles, original_angles)
+    stored_fids = refiner.evaluator.fidelity_batch(tokens_batch, stored_angles)
 
     refined_archive = ParetoArchive(
         max_size=archive.max_size,
@@ -223,17 +213,6 @@ def refine_pareto_archive(
         fidelity_tol=archive.fidelity_tol,
     )
     for i, p in enumerate(entries):
-        new_f = float(refined_fids[i])
-        if new_f < float(p.fidelity):
-            new_f = float(p.fidelity)
-            new_angles = (
-                np.asarray(p.opt_angles, dtype=np.float32)
-                if p.opt_angles is not None
-                else np.zeros((max_gates,), dtype=np.float32)
-            )
-        else:
-            new_angles = refined_angles[i]
-
         tok_no_bos = tokens_batch[i]
         depth, total, cnot = structure_metrics_fn(tok_no_bos)
         full_seq = np.concatenate(
@@ -241,13 +220,13 @@ def refine_pareto_archive(
             axis=0,
         )
         refined_archive.update(ParetoPoint(
-            fidelity=new_f,
+            fidelity=float(stored_fids[i]),
             depth=int(depth),
             total_gates=int(total),
             cnot_count=int(cnot),
             token_sequence=full_seq,
             epoch=int(p.epoch),
-            opt_angles=np.asarray(new_angles, dtype=np.float32),
+            opt_angles=np.asarray(stored_angles[i], dtype=np.float32),
         ))
 
     if verbose:

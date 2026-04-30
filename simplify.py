@@ -1,310 +1,292 @@
-"""Conservative token-sequence simplification before angle refinement."""
+"""Circuit simplification via algebraic rewriting (Rules 1-7).
+
+Rules 1-2 are the user-specified ones; 3-7 are verified extensions:
+  1. Merge consecutive same-axis same-qubit rotations: R_P(t1) R_P(t2) = R_P(t1+t2)
+  2. Cancel consecutive identical CNOTs: CNOT(c,t) CNOT(c,t) = I
+  3. Remove zero-angle rotations: R_P(0) = I
+  4. Angle reduction mod 4pi
+  5. SX periodicity: SX^2 = RX(pi), SX^4 = I
+  6. R_Z commutes past CNOT control  (enables further merging via Rule 1)
+  7. R_X commutes past CNOT target   (enables further merging via Rule 1)
+"""
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 import numpy as np
-import numba
 
-TOKEN_AXIS_NOOP = 0
-TOKEN_AXIS_RX = 1
-TOKEN_AXIS_RY = 2
-TOKEN_AXIS_RZ = 3
-TOKEN_AXIS_SX = 4
-TOKEN_AXIS_CNOT = 5
+from pareto import ParetoArchive, ParetoPoint
+
+_GATE_OFFSET = 3        # tokens 0/1/2 are BOS/STOP/special
+_FOUR_PI = 4.0 * math.pi
+_TWO_PI  = 2.0 * math.pi
+_ANGLE_TOL = 1e-9
 
 
-@numba.njit(cache=True, inline="always")
-def _commutes_nb(axis_a, q0_a, q1_a, axis_b, q0_b, q1_b):
-    a_is_two = q1_a >= 0
-    b_is_two = q1_b >= 0
+# ---------------------------------------------------------------------------
+# Internal op representation
+# ---------------------------------------------------------------------------
 
-    if a_is_two:
-        if b_is_two:
-            disjoint = (q0_a != q0_b and q0_a != q1_b
-                        and q1_a != q0_b and q1_a != q1_b)
-        else:
-            disjoint = (q0_b != q0_a and q0_b != q1_a)
-    else:
-        if b_is_two:
-            disjoint = (q0_a != q0_b and q0_a != q1_b)
-        else:
-            disjoint = q0_a != q0_b
-    if disjoint:
-        return True
+@dataclass(frozen=True)
+class _Op:
+    gate_type: str      # 'RX' | 'RY' | 'RZ' | 'SX' | 'CNOT'
+    qubits: tuple       # (q,) for 1-qubit gates; (ctrl, tgt) for CNOT
+    angle: float = 0.0  # meaningful only for RX / RY / RZ
 
-    if (not a_is_two) and (not b_is_two):
-        return axis_a == axis_b and q0_a == q0_b
 
-    if (not a_is_two) and b_is_two:
-        if axis_a == TOKEN_AXIS_RZ and q0_a == q0_b:
-            return True
-        if (axis_a == TOKEN_AXIS_RX or axis_a == TOKEN_AXIS_SX) and q0_a == q1_b:
-            return True
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _reduce_angle(theta: float) -> float:
+    """Canonicalise to (-2pi, 2pi] (Rule 4)."""
+    theta = math.fmod(theta, _FOUR_PI)
+    if theta > _TWO_PI:
+        theta -= _FOUR_PI
+    elif theta <= -_TWO_PI:
+        theta += _FOUR_PI
+    return theta
+
+
+def _commutes_through(gt: str, qubits: tuple, blocker: _Op) -> bool:
+    """True if the gate (gt, qubits) can be moved past blocker without error.
+
+    Implements Rules 6 and 7:
+      Rule 6: R_Z on CNOT control commutes with CNOT.
+      Rule 7: R_X on CNOT target commutes with CNOT.
+    """
+    if blocker.gate_type != 'CNOT':
         return False
-    if (not b_is_two) and a_is_two:
-        if axis_b == TOKEN_AXIS_RZ and q0_b == q0_a:
-            return True
-        if (axis_b == TOKEN_AXIS_RX or axis_b == TOKEN_AXIS_SX) and q0_b == q1_a:
-            return True
-        return False
-
-    if q0_a == q0_b and q1_a == q1_b:
-        return True
-    cross = (q0_a == q1_b) or (q1_a == q0_b)
-    return not cross
+    c, t = blocker.qubits
+    return (gt == 'RZ' and qubits == (c,)) or (gt == 'RX' and qubits == (t,))
 
 
-@numba.njit(cache=True, parallel=True)
-def _simplify_batch_nb(rows, axis_tbl, q0_tbl, q1_tbl, stop_id):
-    """Numba implementation of the same rules as the Python row simplifier."""
-    B, n = rows.shape
-    out = rows.copy()
-    for b in numba.prange(B):
-        for i in range(n):
-            tok_i = out[b, i]
-            axis_i = axis_tbl[tok_i]
-            if axis_i == TOKEN_AXIS_NOOP:
-                continue
-            q0_i = q0_tbl[tok_i]
-            q1_i = q1_tbl[tok_i]
-            a_is_two = q1_i >= 0
-            i_is_rot = (
-                axis_i == TOKEN_AXIS_RX
-                or axis_i == TOKEN_AXIS_RY
-                or axis_i == TOKEN_AXIS_RZ
-            )
+# ---------------------------------------------------------------------------
+# Decode token sequence → list[_Op]
+# ---------------------------------------------------------------------------
 
-            j = i + 1
-            while j < n:
-                tok_j = out[b, j]
-                axis_j = axis_tbl[tok_j]
-                if axis_j == TOKEN_AXIS_NOOP:
-                    j += 1
-                    continue
-                q0_j = q0_tbl[tok_j]
-                q1_j = q1_tbl[tok_j]
-                b_is_two = q1_j >= 0
-
-                if (
-                    i_is_rot
-                    and axis_i == axis_j
-                    and (not a_is_two)
-                    and (not b_is_two)
-                    and q0_i == q0_j
-                ):
-                    out[b, j] = stop_id
-                    j += 1
-                    continue
-
-                if (
-                    axis_i == TOKEN_AXIS_CNOT
-                    and axis_j == TOKEN_AXIS_CNOT
-                    and q0_i == q0_j
-                    and q1_i == q1_j
-                ):
-                    out[b, i] = stop_id
-                    out[b, j] = stop_id
-                    break
-
-                if a_is_two:
-                    if b_is_two:
-                        disjoint = (q0_i != q0_j and q0_i != q1_j
-                                    and q1_i != q0_j and q1_i != q1_j)
-                    else:
-                        disjoint = (q0_j != q0_i and q0_j != q1_i)
-                else:
-                    if b_is_two:
-                        disjoint = (q0_i != q0_j and q0_i != q1_j)
-                    else:
-                        disjoint = q0_i != q0_j
-                if disjoint:
-                    j += 1
-                    continue
-
-                if not _commutes_nb(axis_i, q0_i, q1_i, axis_j, q0_j, q1_j):
-                    break
-                j += 1
-    return out
-
-
-def build_token_axis(pool_names: list[str]) -> np.ndarray:
-    """Return a ``(vocab_size,)`` int32 axis-id table keyed by token id."""
-    axis = np.zeros((len(pool_names),), dtype=np.int32)
-    for i, name in enumerate(pool_names):
-        if name.startswith("<"):
-            axis[i] = TOKEN_AXIS_NOOP
-        elif name.startswith("RX"):
-            axis[i] = TOKEN_AXIS_RX
-        elif name.startswith("RY"):
-            axis[i] = TOKEN_AXIS_RY
-        elif name.startswith("RZ"):
-            axis[i] = TOKEN_AXIS_RZ
-        elif name.startswith("SX"):
-            axis[i] = TOKEN_AXIS_SX
-        elif name.startswith("CNOT"):
-            axis[i] = TOKEN_AXIS_CNOT
-        else:
-            raise ValueError(f"Unknown pool name: {name!r}")
-    return axis
-
-
-def _commutes(
-    axis_a: int, q0_a: int, q1_a: int,
-    axis_b: int, q0_b: int, q1_b: int,
-) -> bool:
-    a_is_two = q1_a >= 0
-    b_is_two = q1_b >= 0
-    support_a = {q0_a, q1_a} if a_is_two else {q0_a}
-    support_b = {q0_b, q1_b} if b_is_two else {q0_b}
-    if support_a.isdisjoint(support_b):
-        return True
-
-    if not a_is_two and not b_is_two:
-        return axis_a == axis_b and q0_a == q0_b
-
-    if not a_is_two and b_is_two:
-        if axis_a == TOKEN_AXIS_RZ and q0_a == q0_b:
-            return True
-        if axis_a in (TOKEN_AXIS_RX, TOKEN_AXIS_SX) and q0_a == q1_b:
-            return True
-        return False
-    if not b_is_two and a_is_two:
-        if axis_b == TOKEN_AXIS_RZ and q0_b == q0_a:
-            return True
-        if axis_b in (TOKEN_AXIS_RX, TOKEN_AXIS_SX) and q0_b == q1_a:
-            return True
-        return False
-
-    if (q0_a, q1_a) == (q0_b, q1_b):
-        return True
-    cross = (q0_a == q1_b) or (q1_a == q0_b)
-    return not cross
-
-
-def _is_rotation(axis: int) -> bool:
-    return axis == TOKEN_AXIS_RX or axis == TOKEN_AXIS_RY or axis == TOKEN_AXIS_RZ
-
-
-def _simplify_row_pylists(
-    toks: list,
-    axis_tbl: list,
-    q0_tbl: list,
-    q1_tbl: list,
-    stop_id: int,
-) -> list:
-    """Simplify one token row using plain Python lists."""
-    n = len(toks)
-    is_rot_set = (TOKEN_AXIS_RX, TOKEN_AXIS_RY, TOKEN_AXIS_RZ)
-    for i in range(n):
-        tok_i = toks[i]
-        axis_i = axis_tbl[tok_i]
-        if axis_i == TOKEN_AXIS_NOOP:
+def _decode(tokens: np.ndarray, angles: np.ndarray, pool) -> list[_Op]:
+    ops: list[_Op] = []
+    for pos in range(1, len(tokens)):
+        tok = int(tokens[pos])
+        if tok < _GATE_OFFSET:
             continue
-        q0_i = q0_tbl[tok_i]
-        q1_i = q1_tbl[tok_i]
-        a_is_two = q1_i >= 0
-        i_is_rot = axis_i in is_rot_set
+        name, _ = pool[tok - _GATE_OFFSET]
+        parts = name.split('_')
+        gt = parts[0]
+        if gt in ('RX', 'RY', 'RZ'):
+            q = int(parts[1][1:])
+            ops.append(_Op(gt, (q,), float(angles[pos])))
+        elif gt == 'SX':
+            q = int(parts[1][1:])
+            ops.append(_Op('SX', (q,)))
+        elif gt == 'CNOT':
+            c, t = int(parts[1][1:]), int(parts[2][1:])
+            ops.append(_Op('CNOT', (c, t)))
+    return ops
 
-        j = i + 1
-        while j < n:
-            tok_j = toks[j]
-            axis_j = axis_tbl[tok_j]
-            if axis_j == TOKEN_AXIS_NOOP:
-                j += 1
-                continue
-            q0_j = q0_tbl[tok_j]
-            q1_j = q1_tbl[tok_j]
-            b_is_two = q1_j >= 0
 
-            if (
-                i_is_rot
-                and axis_i == axis_j
-                and not a_is_two
-                and not b_is_two
-                and q0_i == q0_j
-            ):
-                toks[j] = stop_id
-                j += 1
-                continue
+# ---------------------------------------------------------------------------
+# Encode list[_Op] → token sequence + angles (padded to orig_len)
+# ---------------------------------------------------------------------------
 
-            if (
-                axis_i == TOKEN_AXIS_CNOT
-                and axis_j == TOKEN_AXIS_CNOT
-                and q0_i == q0_j
-                and q1_i == q1_j
-            ):
-                toks[i] = stop_id
-                toks[j] = stop_id
+def _encode(
+    ops: list[_Op],
+    pool_name_map: dict[str, int],
+    orig_len: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    toks: list[int]   = [0]    # BOS
+    angs: list[float] = [0.0]
+    for op in ops:
+        if op.gate_type in ('RX', 'RY', 'RZ', 'SX'):
+            name = f"{op.gate_type}_q{op.qubits[0]}"
+        else:
+            name = f"CNOT_q{op.qubits[0]}_q{op.qubits[1]}"
+        toks.append(pool_name_map[name] + _GATE_OFFSET)
+        angs.append(op.angle)
+    # Pad to original length with STOP (1); tokens[i] >= 3 filter ignores these
+    while len(toks) < orig_len:
+        toks.append(1)
+        angs.append(0.0)
+    return (
+        np.array(toks[:orig_len], dtype=np.int32),
+        np.array(angs[:orig_len], dtype=np.float64),
+    )
+
+
+# ---------------------------------------------------------------------------
+# One peephole pass: Rules 1-5 + look-through for Rules 6-7
+# ---------------------------------------------------------------------------
+
+def _one_pass(ops: list[_Op], rx_qubits: set[int]) -> tuple[list[_Op], bool]:
+    """Scan left-to-right, merging / cancelling adjacent-on-qubit gate pairs."""
+    out: list[_Op] = []
+    changed = False
+
+    for op in ops:
+        gt, qubits = op.gate_type, op.qubits
+
+        if gt in ('RX', 'RY', 'RZ'):
+            q = qubits[0]
+            placed = False
+            for j in range(len(out) - 1, -1, -1):
+                prev = out[j]
+                if q not in prev.qubits:
+                    continue                         # gate does not touch q
+                if _commutes_through(gt, qubits, prev):
+                    continue                         # Rules 6/7: look further back
+                if prev.gate_type == gt and prev.qubits == qubits:
+                    out[j] = _Op(gt, qubits, prev.angle + op.angle)  # Rule 1
+                    changed = True
+                    placed = True
+                break                               # blocker found (match or not)
+            if not placed:
+                out.append(op)
+
+        elif gt == 'SX':
+            q = qubits[0]
+            placed = False
+            for j in range(len(out) - 1, -1, -1):
+                prev = out[j]
+                if q not in prev.qubits:
+                    continue
+                if prev.gate_type == 'SX' and prev.qubits == qubits and q in rx_qubits:
+                    out[j] = _Op('RX', qubits, math.pi)  # Rule 5: SX² = RX(pi)
+                    changed = True
+                    placed = True
                 break
+            if not placed:
+                out.append(op)
 
-            if a_is_two:
-                if b_is_two:
-                    disjoint = (q0_i != q0_j and q0_i != q1_j
-                                and q1_i != q0_j and q1_i != q1_j)
-                else:
-                    disjoint = (q0_j != q0_i and q0_j != q1_i)
-            else:
-                if b_is_two:
-                    disjoint = (q0_i != q0_j and q0_i != q1_j)
-                else:
-                    disjoint = q0_i != q0_j
-
-            if disjoint:
-                j += 1
-                continue
-
-            if not _commutes(axis_i, q0_i, q1_i, axis_j, q0_j, q1_j):
+        elif gt == 'CNOT':
+            c, t = qubits
+            placed = False
+            for j in range(len(out) - 1, -1, -1):
+                prev = out[j]
+                if c not in prev.qubits and t not in prev.qubits:
+                    continue
+                if prev.gate_type == 'CNOT' and prev.qubits == qubits:
+                    out.pop(j)       # Rule 2: CNOT cancellation
+                    changed = True
+                    placed = True
                 break
-            j += 1
+            if not placed:
+                out.append(op)
+        else:
+            out.append(op)
 
-    return toks
+    # Rules 3 + 4: reduce angles, drop zeros
+    filtered: list[_Op] = []
+    for op in out:
+        if op.gate_type in ('RX', 'RY', 'RZ'):
+            r = _reduce_angle(op.angle)
+            if abs(r) < _ANGLE_TOL:
+                changed = True
+                continue                 # Rule 3: zero angle → identity
+            if r != op.angle:
+                changed = True
+            filtered.append(_Op(op.gate_type, op.qubits, r))
+        else:
+            filtered.append(op)
+
+    return filtered, changed
 
 
-def simplify_token_sequence(
-    tokens: np.ndarray,
-    token_axis: np.ndarray,
-    token_q0: np.ndarray,
-    token_q1: np.ndarray,
-    stop_token_id: int,
-    *,
-    max_passes: int = 3,
-) -> np.ndarray:
-    """Return a fixed-point simplified copy of one token sequence."""
-    toks = np.asarray(tokens, dtype=np.int32).tolist()
-    axis_tbl = np.asarray(token_axis, dtype=np.int32).tolist()
-    q0_tbl = np.asarray(token_q0, dtype=np.int32).tolist()
-    q1_tbl = np.asarray(token_q1, dtype=np.int32).tolist()
-    stop_id = int(stop_token_id)
-    for _ in range(max(1, int(max_passes))):
-        before = list(toks)
-        toks = _simplify_row_pylists(toks, axis_tbl, q0_tbl, q1_tbl, stop_id)
-        if toks == before:
+# ---------------------------------------------------------------------------
+# Fixed-point iteration over passes
+# ---------------------------------------------------------------------------
+
+def _simplify_ops(ops: list[_Op], rx_qubits: set[int]) -> list[_Op]:
+    for _ in range(200):
+        ops, changed = _one_pass(ops, rx_qubits)
+        if not changed:
             break
-    return np.asarray(toks, dtype=np.int32)
+    return ops
 
 
-def simplify_token_batch(
-    tokens_batch: np.ndarray,
-    token_axis: np.ndarray,
-    token_q0: np.ndarray,
-    token_q1: np.ndarray,
-    stop_token_id: int,
-    *,
-    max_passes: int = 3,
-) -> np.ndarray:
-    """Simplify every row of a batch with the numba implementation."""
-    tokens_batch = np.ascontiguousarray(tokens_batch, dtype=np.int32)
-    if tokens_batch.size == 0:
-        return tokens_batch.copy()
-    axis_tbl = np.ascontiguousarray(token_axis, dtype=np.int32)
-    q0_tbl = np.ascontiguousarray(token_q0, dtype=np.int32)
-    q1_tbl = np.ascontiguousarray(token_q1, dtype=np.int32)
-    out = tokens_batch
-    for _ in range(max(1, int(max_passes))):
-        new_out = _simplify_batch_nb(
-            out, axis_tbl, q0_tbl, q1_tbl, np.int32(stop_token_id)
-        )
-        if np.array_equal(new_out, out):
-            return new_out
-        out = new_out
-    return out
+# ---------------------------------------------------------------------------
+# Metric recomputation
+# ---------------------------------------------------------------------------
+
+def _compute_metrics(ops: list[_Op], num_qubits: int) -> tuple[int, int, int]:
+    """Return (depth, total_gates, cnot_count) from a simplified op list."""
+    qubit_time = [0] * num_qubits
+    for op in ops:
+        layer = max(qubit_time[q] for q in op.qubits)
+        for q in op.qubits:
+            qubit_time[q] = layer + 1
+    depth      = max(qubit_time) if any(qubit_time) else 0
+    total      = len(ops)
+    cnot_count = sum(1 for op in ops if op.gate_type == 'CNOT')
+    return depth, total, cnot_count
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def simplify_point(point: ParetoPoint, pool, num_qubits: int) -> ParetoPoint:
+    """Return a new ParetoPoint with its circuit algebraically simplified.
+
+    Fidelity is preserved (rules are exact equivalences).
+    Metrics (depth, total_gates, cnot_count) are recomputed from the simplified
+    gate sequence.
+    """
+    tokens = np.asarray(point.token_sequence, dtype=np.int32)
+    if point.opt_angles is not None:
+        raw = np.asarray(point.opt_angles, dtype=np.float64)
+        if raw.size == len(tokens):
+            angles = raw                          # BOS-aligned (pre-refinement)
+        elif raw.size < len(tokens):
+            # No-BOS convention (post-refinement): shift into BOS-aligned layout
+            angles = np.zeros(len(tokens), dtype=np.float64)
+            angles[1:1 + raw.size] = raw
+        else:
+            angles = raw[:len(tokens)]
+    else:
+        angles = np.zeros(len(tokens), dtype=np.float64)
+
+    pool_name_map = {name: idx for idx, (name, _) in enumerate(pool)}
+    rx_qubits     = {int(n.split('_')[1][1:]) for n, _ in pool if n.startswith('RX_')}
+
+    ops = _decode(tokens, angles, pool)
+    ops = _simplify_ops(ops, rx_qubits)
+
+    depth, total, cnot_count = _compute_metrics(ops, num_qubits)
+    new_tokens, new_angles   = _encode(ops, pool_name_map, orig_len=len(tokens))
+
+    return ParetoPoint(
+        fidelity=point.fidelity,
+        depth=depth,
+        total_gates=total,
+        cnot_count=cnot_count,
+        token_sequence=new_tokens,
+        epoch=point.epoch,
+        opt_angles=new_angles,
+    )
+
+
+def simplify_pareto_archive(
+    archive: ParetoArchive,
+    pool,
+    num_qubits: int,
+) -> ParetoArchive:
+    """Simplify every circuit in the archive and return a rebuilt archive.
+
+    The new archive is rebuilt from scratch so that dominance relationships
+    are recomputed after simplification (a simplified circuit may now dominate
+    one that it did not dominate before).
+    """
+    new_arc = ParetoArchive(
+        max_size=archive.max_size,
+        fidelity_floor=archive.fidelity_floor,
+        fidelity_tol=archive.fidelity_tol,
+    )
+    simplified = [
+        simplify_point(p, pool, num_qubits)
+        for p in archive.to_sorted_list()
+    ]
+    new_arc.update_batch(simplified)
+    return new_arc

@@ -160,10 +160,8 @@ class CircuitEvaluator:
         u_target: np.ndarray,
         num_qubits: int,
         pool_token_names: list[str],
-        max_gates: int,
     ):
         self.num_qubits = num_qubits
-        self.max_gates = max_gates
         self.vocab_size = len(pool_token_names)
 
         backend = jax.default_backend()

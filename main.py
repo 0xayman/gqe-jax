@@ -15,6 +15,7 @@ from reporting import (
     save_run_artifact,
     select_report_token_sequence,
 )
+from simplify import simplify_pareto_archive
 from target import build_target
 from trainer import build_logger, gqe
 
@@ -114,7 +115,6 @@ def main():
     print(f"  Qubits:               {cfg.target.num_qubits}")
     print(f"  Scheduler:            {cfg.temperature.scheduler}")
     print(f"  Model size:           {cfg.model.size}")
-    print(f"  Max gates/circuit:    {cfg.model.max_gates_count}")
     print(f"  Training epochs:      {cfg.training.max_epochs}")
     print(f"  Refinement:           {'adam' if cfg.refinement.enabled else 'off'}")
     print(f"  W&B logging:          {cfg.logging.wandb}")
@@ -126,7 +126,7 @@ def main():
         rotation_gates=cfg.pool.rotation_gates,
     )
     print(f"  Gate pool size:       {len(pool)}")
-    print(f"  Model vocab size:     {len(pool) + 2}")
+    print(f"  Model vocab size:     {len(pool) + 3}")
     print(f"  Rotation gates:       {', '.join(cfg.pool.rotation_gates)}")
 
     u_target, target_desc = build_target(pool, cfg)
@@ -145,6 +145,11 @@ def main():
 
     print("\nStarting hybrid-action GQE training...\n")
     result = gqe(cfg, u_target, pool, logger=logger)
+
+    if result.pareto_archive is not None and len(result.pareto_archive) > 0:
+        result.pareto_archive = simplify_pareto_archive(
+            result.pareto_archive, pool, cfg.target.num_qubits,
+        )
 
     print(f"\n{'=' * 55}")
     print("Training complete!")

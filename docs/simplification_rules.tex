@@ -1,0 +1,181 @@
+%-----------------------------------------------------------------------------
+% Content for \input{work-in-progress}
+% Paste everything below into work-in-progress.tex
+%-----------------------------------------------------------------------------
+
+\chapter{Work in Progress}
+
+\newtheorem{rul}[subsection]{Rule}
+
+%-----------------------------------------------------------------------------
+
+%-----------------------------------------------------------------------------
+\section{Circuit Simplification Rules}
+
+%--- Rule 1 ------------------------------------------------------------------
+\begin{rul}[Merge consecutive same-axis rotations]
+\label{rul:merge-rot}
+Two consecutive rotation gates of the same type on the same qubit compose into a
+single gate whose angle is the sum of the individual angles:
+\be
+  R_P^{(q)}(\theta_1)\;R_P^{(q)}(\theta_2)
+  \;=\;
+  R_P^{(q)}(\theta_1+\theta_2),
+  \qquad
+  P \in \{X,Y,Z\}.
+\ee
+\end{rul}
+
+
+\begin{rem}
+Rotations about \emph{different} axes on the same qubit do not merge:
+$R_Y(\theta_1)\,R_Z(\theta_2) \neq R_P(\theta)$ for any single Pauli $P$.
+\end{rem}
+
+%--- Rule 2 ------------------------------------------------------------------
+\begin{rul}[Cancel consecutive identical CNOTs]
+\label{rul:cnot-cancel}
+Two consecutive CNOT gates with the same control $c$ and target $t$ cancel to the
+identity:
+\be
+  \mathrm{CNOT}^{(c,t)}\;\mathrm{CNOT}^{(c,t)} \;=\; I.
+\ee
+\end{rul}
+
+\begin{proof}
+CNOT is its own inverse.  In the two-qubit computational basis ordered as
+$|00\rangle,|01\rangle,|10\rangle,|11\rangle$ it reads
+\be
+  \mathrm{CNOT}
+  =
+  \begin{pmatrix}1&0&0&0\\0&1&0&0\\0&0&0&1\\0&0&1&0\end{pmatrix},
+\ee
+and a direct computation gives $\mathrm{CNOT}^2 = I_4$.
+\end{proof}
+
+%--- Rule 3 ------------------------------------------------------------------
+\begin{rul}[Remove zero-angle rotations]
+\label{rul:zero-angle}
+A rotation gate whose angle satisfies $\theta \equiv 0 \pmod{4\pi}$ equals
+$(\pm I)$ and may be dropped:
+\be
+  R_P^{(q)}(4\pi k) \;=\; (-1)^k\,I, \qquad k\in\Z.
+\ee
+In particular $R_P^{(q)}(0) = I$ and $R_P^{(q)}(4\pi) = I$.
+The case $\theta = 2\pi$ gives $R_P(2\pi) = -I$, a global phase with no
+observable consequence in unitary synthesis, and may also be removed.
+\end{rul}
+
+%--- Rule 4 ------------------------------------------------------------------
+\begin{rul}[Angle reduction modulo $4\pi$]
+\label{rul:angle-mod}
+The rotation angle is $4\pi$-periodic:
+\be
+  R_P^{(q)}(\theta) \;=\; R_P^{(q)}(\theta \bmod 4\pi).
+\ee
+After applying Rule~\ref{rul:merge-rot}, the combined angle should be reduced to
+the canonical interval $(-2\pi,\,2\pi]$ before testing Rule~\ref{rul:zero-angle}.
+\end{rul}
+
+%--- Rule 5 ------------------------------------------------------------------
+\begin{rul}[SX periodicity]
+\label{rul:sx-period}
+Consecutive $\mathrm{SX}$ gates on the same qubit reduce as follows:
+\begin{align}
+  \mathrm{SX}^{(q)}\,\mathrm{SX}^{(q)}
+    &\;=\; X^{(q)} \;=\; R_X^{(q)}(\pi), \\
+  \bigl(\mathrm{SX}^{(q)}\bigr)^3
+    &\;=\; \bigl(\mathrm{SX}^\dagger\bigr)^{(q)}, \\
+  \bigl(\mathrm{SX}^{(q)}\bigr)^4
+    &\;=\; I.
+\end{align}
+\end{rul}
+
+\begin{proof}[Proof (two-gate case)]
+The explicit matrix is
+\be
+  \mathrm{SX}
+  =
+  \frac{1}{2}\begin{pmatrix}1+i&1-i\\1-i&1+i\end{pmatrix},
+  \qquad
+  \mathrm{SX}^2
+  =
+  \begin{pmatrix}0&1\\1&0\end{pmatrix}
+  = X. \qedhere
+\ee
+\end{proof}
+
+\begin{rem}
+A pair of consecutive $\mathrm{SX}$ gates is replaced by $R_X(\pi)$, which then
+participates in further merging via Rule~\ref{rul:merge-rot}.  Four consecutive
+$\mathrm{SX}$ gates are removed entirely.
+\end{rem}
+
+%--- Rule 6 ------------------------------------------------------------------
+\begin{rul}[$R_Z$ commutes past the CNOT control]
+\label{rul:rz-cnot}
+A $Z$-rotation on the control qubit commutes with the CNOT:
+\be
+  R_Z^{(c)}(\theta)\;\mathrm{CNOT}^{(c,t)}
+  \;=\;
+  \mathrm{CNOT}^{(c,t)}\;R_Z^{(c)}(\theta).
+\ee
+\end{rul}
+
+
+\begin{rem}
+Rule~\ref{rul:rz-cnot} does not reduce gate count on its own.  Its role is to
+move an $R_Z$ gate past a CNOT so that it becomes consecutive with another $R_Z$
+on the same qubit, enabling Rule~\ref{rul:merge-rot} to fire.
+\end{rem}
+
+%--- Rule 7 ------------------------------------------------------------------
+\begin{rul}[$R_X$ commutes past the CNOT target]
+\label{rul:rx-cnot}
+An $X$-rotation on the target qubit commutes with the CNOT:
+\be
+  R_X^{(t)}(\theta)\;\mathrm{CNOT}^{(c,t)}
+  \;=\;
+  \mathrm{CNOT}^{(c,t)}\;R_X^{(t)}(\theta).
+\ee
+\end{rul}
+
+
+\begin{rem}
+As with Rule~\ref{rul:rz-cnot}, this rule is used to expose consecutive $R_X$
+pairs for merging rather than to directly reduce gate count.
+\end{rem}
+
+%-----------------------------------------------------------------------------
+\section{Application Order}
+
+The rules fall into three tiers.
+
+\noindent\textbf{Tier 1 -- Structural cancellations} (gate count decreases directly):
+Rule~\ref{rul:cnot-cancel} (CNOT pairs),
+Rule~\ref{rul:zero-angle} (trivial rotations),
+Rule~\ref{rul:sx-period} (SX runs).
+
+\noindent\textbf{Tier 2 -- Merging} (two gates become one):
+Rule~\ref{rul:merge-rot} combined with Rule~\ref{rul:angle-mod}.
+
+\noindent\textbf{Tier 3 -- Commutation} (unlock further merges):
+Rule~\ref{rul:rz-cnot} and Rule~\ref{rul:rx-cnot}.
+
+A single-pass application order is:
+\begin{enumerate}
+  \item Scan left-to-right; apply Rule~\ref{rul:merge-rot} for every pair of
+        consecutive same-type, same-qubit rotations.  Immediately follow with
+        Rule~\ref{rul:angle-mod} and then Rule~\ref{rul:zero-angle}.
+  \item Scan again; apply Rule~\ref{rul:cnot-cancel} for consecutive identical
+        CNOTs.
+  \item Scan again; apply Rule~\ref{rul:sx-period} for runs of consecutive
+        $\mathrm{SX}$ gates.
+  \item Optionally apply the commutation Rules~\ref{rul:rz-cnot}
+        and~\ref{rul:rx-cnot} to expose new adjacent pairs, then repeat from
+        step~1.
+\end{enumerate}
+
+Iterating until no rule fires gives a locally simplified circuit.  The result is
+not guaranteed to be globally minimal, but removes the most common redundancies
+introduced by the GQE token decoder.

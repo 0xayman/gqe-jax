@@ -11,7 +11,7 @@ from config import GQEConfig
 from cost import process_fidelity
 
 
-GATE_TOKEN_OFFSET = 2
+GATE_TOKEN_OFFSET = 3
 
 def gate_indices_from_token_sequence(token_sequence) -> list[int]:
     return [
@@ -215,8 +215,6 @@ def _config_snapshot(cfg: GQEConfig) -> dict:
         "pool": {"rotation_gates": list(cfg.pool.rotation_gates)},
         "model": {
             "size": cfg.model.size,
-            "max_gates_count": int(cfg.model.max_gates_count),
-            "auto_max_gates_count": bool(cfg.model.auto_max_gates_count),
         },
         "training": {
             "max_epochs": int(cfg.training.max_epochs),
@@ -231,6 +229,7 @@ def _config_snapshot(cfg: GQEConfig) -> dict:
         "policy": {
             "entropy_disc": float(cfg.policy.entropy_disc),
             "entropy_cont": float(cfg.policy.entropy_cont),
+            "angle_supervision_weight": float(cfg.policy.angle_supervision_weight),
             "inner_refine_steps": int(cfg.policy.inner_refine_steps),
             "inner_refine_lr": float(cfg.policy.inner_refine_lr),
         },
@@ -249,32 +248,22 @@ def _config_snapshot(cfg: GQEConfig) -> dict:
             "enabled": bool(cfg.refinement.enabled),
             "steps": int(cfg.refinement.steps),
             "lr": float(cfg.refinement.lr),
-            "apply_simplify": bool(cfg.refinement.apply_simplify),
             "use_linear_trace_loss": bool(cfg.refinement.use_linear_trace_loss),
             "early_stop_patience": int(cfg.refinement.early_stop_patience),
             "early_stop_rel_tol": float(cfg.refinement.early_stop_rel_tol),
             "sweep_passes": int(cfg.refinement.sweep_passes),
-            "simplify_max_passes": int(cfg.refinement.simplify_max_passes),
         },
         "reward": {
             "enabled": bool(cfg.reward.enabled),
-            "mode": cfg.reward.mode,
             "lex_fidelity_weight": float(cfg.reward.lex_fidelity_weight),
             "lex_infidelity_eps": float(cfg.reward.lex_infidelity_eps),
             "lex_cnot_weight": float(cfg.reward.lex_cnot_weight),
             "lex_depth_weight": float(cfg.reward.lex_depth_weight),
-            "lex_total_gate_weight": float(cfg.reward.lex_total_gate_weight),
             "lex_structure_fidelity_threshold": float(
                 cfg.reward.lex_structure_fidelity_threshold
             ),
             "lex_no_stop_penalty": float(cfg.reward.lex_no_stop_penalty),
-            "qaser_init_max_depth": float(cfg.reward.qaser_init_max_depth),
-            "qaser_init_max_cnot": float(cfg.reward.qaser_init_max_cnot),
-            "qaser_init_max_gates": float(cfg.reward.qaser_init_max_gates),
-            "qaser_w_depth": float(cfg.reward.qaser_w_depth),
-            "qaser_w_cnot": float(cfg.reward.qaser_w_cnot),
-            "qaser_w_gates": float(cfg.reward.qaser_w_gates),
-            "qaser_log_infidelity_eps": float(cfg.reward.qaser_log_infidelity_eps),
+            "sequence_discount": float(cfg.reward.sequence_discount),
             "fidelity_floor": float(cfg.reward.fidelity_floor),
             "max_archive_size": int(cfg.reward.max_archive_size),
             "fidelity_threshold": float(cfg.reward.fidelity_threshold),

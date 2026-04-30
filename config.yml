@@ -10,13 +10,11 @@ pool:
 
 model:
   size: "tiny" # tiny | small | medium | large
-  # Safety cap only; rollout stops early when all samples emit STOP.
-  # max_gates_count: 105
 
 training:
-  max_epochs: 100
-  num_samples: 1024 # circuits sampled per epoch
-  batch_size: 256 # gradient-step batch size
+  max_epochs: 150
+  num_samples: 2048 # circuits sampled per epoch
+  batch_size: 512 # gradient-step batch size
   lr: 1.0e-4
   grad_norm_clip: 1.0
   seed: 42
@@ -24,21 +22,22 @@ training:
   early_stop: false # stop training once fidelity reaches 1.0
 
 policy:
-  entropy_disc: 0.005 # categorical-entropy regularisation weight
-  entropy_cont: 0.005 # Gaussian-entropy regularisation weight
-  # Optional Adam refinement applied before scoring each rollout sample.
-  inner_refine_steps: 8
-  inner_refine_lr: 0.1
+  entropy_disc: 0.003 # categorical-entropy regularisation weight
+  entropy_cont: 0.003 # Gaussian-entropy regularisation weight
+  angle_supervision_weight: 1.0 # regression weight toward refined rotation angles
+  # Optional Adam refinement used to score each sampled gate skeleton.
+  inner_refine_steps: 16
+  inner_refine_lr: 0.08
 
 temperature:
-  scheduler: "cosine" # fixed | linear | cosine
-  initial_value: 1.2
+  scheduler: "fixed" # fixed | linear | cosine
+  initial_value: 0.9
   delta: 0.02
   min_value: 0.3
   max_value: 1.5
 
 buffer:
-  max_size: 2048
+  max_size: 4096
   steps_per_epoch: 4
 
 logging:
@@ -47,34 +46,22 @@ logging:
 
 refinement:
   enabled: true
-  steps: 500
-  lr: 0.1
-  apply_simplify: true # simplify each archive circuit before re-optim
+  steps: 700
+  lr: 0.08
   use_linear_trace_loss: true
-  early_stop_patience: 50
+  early_stop_patience: 70
   early_stop_rel_tol: 1.0e-6
   sweep_passes: 2
-  simplify_max_passes: 3
 
 reward:
   enabled: true
-  # Fidelity-first reward; structure penalties activate above the threshold.
-  mode: "lexicographic" # lexicographic | qaser
   lex_fidelity_weight: 1.0
   lex_infidelity_eps: 1.0e-8
-  lex_cnot_weight: 0.01
-  lex_depth_weight: 0.001
-  lex_total_gate_weight: 0.001
-  lex_structure_fidelity_threshold: 0.99
+  lex_cnot_weight: 0.02
+  lex_depth_weight: 0.003
+  lex_structure_fidelity_threshold: 0.98
   lex_no_stop_penalty: 1.0
-  # QASER-mode parameters are ignored unless reward.mode is "qaser".
-  qaser_init_max_depth: 0.0
-  qaser_init_max_cnot: 0.0
-  qaser_init_max_gates: 0.0
-  qaser_w_depth: 1.0
-  qaser_w_cnot: 2.0
-  qaser_w_gates: 1.5
-  qaser_log_infidelity_eps: 1.0e-3
+  sequence_discount: 0.995
   # Archive admission floor; lower values keep more exploratory circuits.
   fidelity_floor: 0.5
   max_archive_size: 500

@@ -28,21 +28,6 @@ class PoolConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     size: str
-    max_gates_count: int
-    auto_max_gates_count: bool = False
-
-
-def default_max_gates_count(num_qubits: int) -> int:
-    """Return the fallback rollout cap used when YAML omits ``max_gates_count``.
-
-    This value is an engineering ceiling for tensor shapes and runaway
-    generation, not a statement about the optimal circuit length. Rollout code
-    stops as soon as all sampled rows emit STOP.
-    """
-    numer = 4 ** num_qubits - 3 * num_qubits - 1
-    cnot_lb = max(0, -(-numer // 4))
-    raw = int(round(1.5 * 5 * cnot_lb))
-    return max(32, min(1023, raw))
 
 
 @dataclass(frozen=True)
@@ -80,10 +65,11 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    """Exploration and optional per-rollout angle-refinement settings."""
+    """Exploration and angle-head training settings."""
 
     entropy_disc: float = 0.0
     entropy_cont: float = 0.0
+    angle_supervision_weight: float = 1.0
     inner_refine_steps: int = 0
     inner_refine_lr: float = 0.1
 
@@ -95,40 +81,29 @@ class RefinementConfig:
     enabled: bool = True
     steps: int = 50
     lr: float = 0.1
-    apply_simplify: bool = True
     use_linear_trace_loss: bool = True
     early_stop_patience: int = 30
     early_stop_rel_tol: float = 1.0e-5
     sweep_passes: int = 0
-    simplify_max_passes: int = 3
 
 
 @dataclass(frozen=True)
 class RewardConfig:
     """Reward and Pareto-archive settings.
 
-    ``lexicographic`` is the standard training reward. It optimizes fidelity
-    first, then applies structural penalties only after the configured
-    fidelity band is reached. ``qaser`` is a running-max scalarisation kept
-    for controlled ablations.
+    Uses a lexicographic reward: fidelity is optimised first; structural
+    penalties (CNOT count, depth) activate only after the configured
+    fidelity threshold is reached.
     """
 
     enabled: bool = True
-    mode: str = "lexicographic"
     lex_fidelity_weight: float = 1.0
     lex_infidelity_eps: float = 1.0e-8
     lex_cnot_weight: float = 0.01
     lex_depth_weight: float = 0.001
-    lex_total_gate_weight: float = 0.001
     lex_structure_fidelity_threshold: float = 0.99
     lex_no_stop_penalty: float = 1.0
-    qaser_init_max_depth: float = 0.0
-    qaser_init_max_cnot: float = 0.0
-    qaser_init_max_gates: float = 0.0
-    qaser_w_depth: float = 1.0
-    qaser_w_cnot: float = 1.0
-    qaser_w_gates: float = 1.0
-    qaser_log_infidelity_eps: float = 0.0
+    sequence_discount: float = 0.99
     fidelity_floor: float = 0.0
     max_archive_size: int = 500
     fidelity_threshold: float = 0.99
@@ -156,7 +131,6 @@ VALID_TARGET_TYPES = {
 VALID_MODEL_SIZES = {"tiny", "small", "medium", "large"}
 VALID_SCHEDULERS = {"fixed", "linear", "cosine"}
 VALID_ROTATION_GATES = {"rz", "rx", "ry"}
-VALID_REWARD_MODES = {"lexicographic", "qaser"}
 
 
 def normalize_rotation_gates(value) -> tuple[str, ...]:
@@ -201,8 +175,9 @@ def validate_config(raw: dict) -> None:
 
     if raw["model"]["size"] not in VALID_MODEL_SIZES:
         raise ValueError(f"Invalid model size: {raw['model']['size']}")
-    if "max_gates_count" in raw["model"] and raw["model"]["max_gates_count"] <= 0:
-        raise ValueError("max_gates_count must be positive when provided")
+    unknown_model_keys = set(raw["model"]) - set(ModelConfig.__dataclass_fields__)
+    if unknown_model_keys:
+        raise ValueError(f"Unknown model field(s): {sorted(unknown_model_keys)}")
 
     normalize_rotation_gates(raw.get("pool", {}).get("rotation_gates"))
 
@@ -243,6 +218,8 @@ def validate_config(raw: dict) -> None:
             raise ValueError("policy.entropy_disc must be >= 0")
         if p.get("entropy_cont", 0.0) < 0:
             raise ValueError("policy.entropy_cont must be >= 0")
+        if p.get("angle_supervision_weight", 1.0) < 0:
+            raise ValueError("policy.angle_supervision_weight must be >= 0")
         if p.get("inner_refine_steps", 0) < 0:
             raise ValueError("policy.inner_refine_steps must be >= 0")
         if p.get("inner_refine_lr", 0.1) <= 0:
@@ -250,12 +227,16 @@ def validate_config(raw: dict) -> None:
 
     r = raw.get("refinement", {})
     if r:
+        unknown_refinement_keys = set(r) - set(RefinementConfig.__dataclass_fields__)
+        if unknown_refinement_keys:
+            raise ValueError(
+                f"Unknown refinement field(s): {sorted(unknown_refinement_keys)}"
+            )
         _require_bool("refinement.enabled", r.get("enabled", True))
         if r.get("steps", 1) <= 0:
             raise ValueError("refinement.steps must be positive")
         if r.get("lr", 1.0) <= 0:
             raise ValueError("refinement.lr must be positive")
-        _require_bool("refinement.apply_simplify", r.get("apply_simplify", True))
         if "use_linear_trace_loss" in r:
             _require_bool(
                 "refinement.use_linear_trace_loss", r["use_linear_trace_loss"]
@@ -266,17 +247,15 @@ def validate_config(raw: dict) -> None:
             raise ValueError("refinement.early_stop_rel_tol must be >= 0")
         if r.get("sweep_passes", 0) < 0:
             raise ValueError("refinement.sweep_passes must be >= 0")
-        if r.get("simplify_max_passes", 1) <= 0:
-            raise ValueError("refinement.simplify_max_passes must be positive")
 
     rw = raw.get("reward", {})
     if rw:
-        _require_bool("reward.enabled", rw.get("enabled", True))
-        if rw.get("mode", "lexicographic") not in VALID_REWARD_MODES:
+        unknown_reward_keys = set(rw) - set(RewardConfig.__dataclass_fields__)
+        if unknown_reward_keys:
             raise ValueError(
-                f"Invalid reward.mode: {rw.get('mode')!r}. "
-                f"Allowed: {sorted(VALID_REWARD_MODES)}"
+                f"Unknown reward field(s): {sorted(unknown_reward_keys)}"
             )
+        _require_bool("reward.enabled", rw.get("enabled", True))
         if rw.get("lex_fidelity_weight", 1.0) < 0.0:
             raise ValueError("reward.lex_fidelity_weight must be >= 0")
         if rw.get("lex_infidelity_eps", 1.0e-8) <= 0.0:
@@ -285,28 +264,14 @@ def validate_config(raw: dict) -> None:
             raise ValueError("reward.lex_cnot_weight must be >= 0")
         if rw.get("lex_depth_weight", 0.001) < 0.0:
             raise ValueError("reward.lex_depth_weight must be >= 0")
-        if rw.get("lex_total_gate_weight", 0.001) < 0.0:
-            raise ValueError("reward.lex_total_gate_weight must be >= 0")
         if not (0.0 <= rw.get("lex_structure_fidelity_threshold", 0.99) <= 1.0):
             raise ValueError(
                 "reward.lex_structure_fidelity_threshold must be in [0, 1]"
             )
         if rw.get("lex_no_stop_penalty", 1.0) < 0.0:
             raise ValueError("reward.lex_no_stop_penalty must be >= 0")
-        if rw.get("qaser_init_max_depth", 0.0) < 0.0:
-            raise ValueError("reward.qaser_init_max_depth must be >= 0")
-        if rw.get("qaser_init_max_cnot", 0.0) < 0.0:
-            raise ValueError("reward.qaser_init_max_cnot must be >= 0")
-        if rw.get("qaser_init_max_gates", 0.0) < 0.0:
-            raise ValueError("reward.qaser_init_max_gates must be >= 0")
-        if rw.get("qaser_w_depth", 1.0) < 0.0:
-            raise ValueError("reward.qaser_w_depth must be >= 0")
-        if rw.get("qaser_w_cnot", 1.0) < 0.0:
-            raise ValueError("reward.qaser_w_cnot must be >= 0")
-        if rw.get("qaser_w_gates", 1.0) < 0.0:
-            raise ValueError("reward.qaser_w_gates must be >= 0")
-        if rw.get("qaser_log_infidelity_eps", 0.0) < 0.0:
-            raise ValueError("reward.qaser_log_infidelity_eps must be >= 0")
+        if not (0.0 < rw.get("sequence_discount", 0.99) <= 1.0):
+            raise ValueError("reward.sequence_discount must be in (0, 1]")
         if not (0.0 <= rw.get("fidelity_floor", 0.0) <= 1.0):
             raise ValueError("reward.fidelity_floor must be in [0, 1]")
         if rw.get("max_archive_size", 500) <= 0:
@@ -329,19 +294,12 @@ def load_config(path: str) -> GQEConfig:
     refinement_raw = raw.get("refinement", {})
     reward_raw = raw.get("reward", {})
 
-    num_qubits = int(raw["target"]["num_qubits"])
-    model_raw = dict(raw["model"])
-    auto_max_gates = model_raw.get("max_gates_count") is None
-    if model_raw.get("max_gates_count") is None:
-        model_raw["max_gates_count"] = default_max_gates_count(num_qubits)
-    model_raw["auto_max_gates_count"] = auto_max_gates
-
     return GQEConfig(
         target=TargetConfig(**raw["target"]),
         pool=PoolConfig(
             rotation_gates=normalize_rotation_gates(pool_raw.get("rotation_gates")),
         ),
-        model=ModelConfig(**model_raw),
+        model=ModelConfig(**raw["model"]),
         training=TrainingConfig(**raw["training"]),
         temperature=TemperatureConfig(**raw["temperature"]),
         buffer=BufferConfig(**raw["buffer"]),

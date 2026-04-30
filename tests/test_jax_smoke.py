@@ -39,11 +39,11 @@ from policy import (
     compute_lengths_from_tokens,
     gaussian_log_prob,
 )
-from refine import AngleRefiner
+from refine import AngleRefiner, refine_pareto_archive
 from reporting import select_report_token_sequence
 from scheduler import FixedScheduler, LinearScheduler
 from target import build_target
-from trainer import Trainer, _row_structure_metrics, gqe
+from trainer import Trainer, _row_structure_metrics, gqe, rollout_context_tokens
 
 
 def _tiny_cfg(
@@ -53,7 +53,7 @@ def _tiny_cfg(
 ) -> GQEConfig:
     return GQEConfig(
         target=TargetConfig(num_qubits=2, type="random_reachable", path=None),
-        model=ModelConfig(size="tiny", max_gates_count=4),
+        model=ModelConfig(size="tiny"),
         training=TrainingConfig(
             max_epochs=1,
             num_samples=4,
@@ -75,12 +75,12 @@ def _tiny_cfg(
         logging=LoggingConfig(verbose=False, wandb=False),
         policy=PolicyConfig(
             entropy_disc=0.0, entropy_cont=0.0,
+            angle_supervision_weight=1.0,
             inner_refine_steps=0,
         ),
         refinement=RefinementConfig(
             enabled=refinement_enabled,
             steps=2, lr=0.1,
-            apply_simplify=True,
         ),
         reward=RewardConfig(
             enabled=pareto_enabled,
@@ -114,7 +114,7 @@ def test_gqe_smoke_no_pareto():
 
     assert 0.0 <= result.best_cost <= 1.0
     assert isinstance(result.best_tokens, list)
-    assert len(result.best_tokens) == cfg.model.max_gates_count + 1
+    assert len(result.best_tokens) == rollout_context_tokens(cfg.target.num_qubits)
     assert result.pareto_archive is None
 
 
@@ -135,12 +135,12 @@ def test_circuit_evaluator_recovers_self_built_target():
 
     num_qubits = 2
     pool = build_operator_pool(num_qubits=num_qubits, rotation_gates=("rz",))
-    pool_token_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
+    pool_token_names = ["<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]]
     name_to_id = {n: i for i, n in enumerate(pool_token_names)}
 
     seed_evaluator = CircuitEvaluator(
         u_target=np.eye(2 ** num_qubits, dtype=np.complex128),
-        num_qubits=num_qubits, pool_token_names=pool_token_names, max_gates=8,
+        num_qubits=num_qubits, pool_token_names=pool_token_names,
     )
     tokens_build = np.zeros((8,), dtype=np.int32)
     angles_build = np.zeros((8,), dtype=np.float32)
@@ -156,7 +156,7 @@ def test_circuit_evaluator_recovers_self_built_target():
 
     evaluator = CircuitEvaluator(
         u_target=u_target, num_qubits=num_qubits,
-        pool_token_names=pool_token_names, max_gates=8,
+        pool_token_names=pool_token_names,
     )
     fids = evaluator.fidelity_batch(tokens_build[None, :], angles_build[None, :])
     assert fids.shape == (1,)
@@ -165,10 +165,10 @@ def test_circuit_evaluator_recovers_self_built_target():
 
 def test_circuit_evaluator_handles_empty_batch():
     pool = build_operator_pool(num_qubits=2, rotation_gates=("rz",))
-    pool_token_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
+    pool_token_names = ["<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]]
     evaluator = CircuitEvaluator(
         u_target=np.eye(4, dtype=np.complex128),
-        num_qubits=2, pool_token_names=pool_token_names, max_gates=4,
+        num_qubits=2, pool_token_names=pool_token_names,
     )
     fids = evaluator.fidelity_batch(
         np.zeros((0, 4), dtype=np.int32),
@@ -179,10 +179,10 @@ def test_circuit_evaluator_handles_empty_batch():
 
 def test_parametric_mask_marks_only_rotations():
     pool = build_operator_pool(num_qubits=2, rotation_gates=("rz", "ry"))
-    pool_token_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
+    pool_token_names = ["<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]]
     evaluator = CircuitEvaluator(
         u_target=np.eye(4, dtype=np.complex128),
-        num_qubits=2, pool_token_names=pool_token_names, max_gates=4,
+        num_qubits=2, pool_token_names=pool_token_names,
     )
     name_to_id = {n: i for i, n in enumerate(pool_token_names)}
     rz = name_to_id["RZ_q0"]
@@ -239,10 +239,13 @@ def test_reduce_per_token_mean_over_valid_positions():
 
 def test_apply_discrete_action_masks_blocks_bos_and_first_stop():
     """BOS is never sampled and STOP is blocked for the first action."""
-    logits = jnp.zeros((1, 3, 4), dtype=jnp.float32)
-    masked = apply_discrete_action_masks(logits, bos_token_id=0, stop_token_id=1)
+    logits = jnp.zeros((1, 3, 5), dtype=jnp.float32)
+    masked = apply_discrete_action_masks(
+        logits, bos_token_id=0, stop_token_id=1, pad_token_id=2,
+    )
     arr = np.asarray(masked)
     assert np.isposinf(arr[0, :, 0]).all()
+    assert np.isposinf(arr[0, :, 2]).all()
     assert np.isposinf(arr[0, 0, 1])
     assert arr[0, 1, 1] == 0.0
     assert arr[0, 2, 1] == 0.0
@@ -250,8 +253,8 @@ def test_apply_discrete_action_masks_blocks_bos_and_first_stop():
 
 def test_compute_lengths_from_tokens_handles_stop_and_no_stop():
     tokens = jnp.asarray([
-        [2, 3, 1, 1],
-        [2, 3, 4, 5],
+        [3, 4, 1, 2],
+        [3, 4, 5, 6],
     ], dtype=jnp.int32)
     lengths = compute_lengths_from_tokens(tokens, stop_token_id=1)
     np.testing.assert_array_equal(np.asarray(lengths), [3, 4])
@@ -262,8 +265,8 @@ def test_trainer_rollout_emits_valid_token_layout():
     roll = trainer.collect_rollout()
     tokens = roll["tokens"]
     angles = roll["angles"]
-    assert tokens.shape == (trainer.num_samples, trainer.ngates + 1)
-    assert angles.shape == (trainer.num_samples, trainer.ngates)
+    assert tokens.shape == (trainer.num_samples, trainer.context_tokens)
+    assert angles.shape == (trainer.num_samples, trainer.action_horizon)
     assert np.all(tokens[:, 0] == trainer.bos_token_id)
     assert np.all(tokens[:, 1] != trainer.stop_token_id)
     for row in tokens:
@@ -271,7 +274,8 @@ def test_trainer_rollout_emits_valid_token_layout():
         stop_pos = np.where(sub == trainer.stop_token_id)[0]
         if stop_pos.size > 0:
             first = stop_pos[0]
-            assert np.all(sub[first:] == trainer.stop_token_id)
+            assert sub[first] == trainer.stop_token_id
+            assert np.all(sub[first + 1:] == trainer.pad_token_id)
 
 
 def test_trainer_train_epoch_changes_params():
@@ -319,84 +323,17 @@ def test_reward_prefers_better_structure_at_same_fidelity():
     assert costs[1] < costs[0]
 
 
-def test_qaser_log_infidelity_strengthens_high_fidelity_gradient():
-    """QASER log-infidelity mode increases pressure near perfect fidelity."""
-    import dataclasses
-    cfg = _tiny_cfg(pareto_enabled=True)
-    cfg = dataclasses.replace(
-        cfg, reward=dataclasses.replace(cfg.reward,
-                                        mode="qaser",
-                                        qaser_init_max_depth=20,
-                                        qaser_init_max_cnot=10,
-                                        qaser_init_max_gates=40),
-    )
-    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
-    u_target, _ = build_target(pool, cfg)
-
-    cfg_off = dataclasses.replace(
-        cfg, reward=dataclasses.replace(cfg.reward, qaser_log_infidelity_eps=0.0),
-    )
-    trainer_off = Trainer(cfg_off, u_target, pool, logger=None)
-    c_off = trainer_off._compute_reward(
-        np.asarray([0.99, 0.999], dtype=np.float32),
-        np.asarray([5, 5], dtype=np.int32),
-        np.asarray([2, 2], dtype=np.int32),
-        np.asarray([10, 10], dtype=np.int32),
-    )
-    gap_off = abs(float(c_off[0] - c_off[1]))
-
-    cfg_on = dataclasses.replace(
-        cfg, reward=dataclasses.replace(cfg.reward, qaser_log_infidelity_eps=1e-3),
-    )
-    trainer_on = Trainer(cfg_on, u_target, pool, logger=None)
-    c_on = trainer_on._compute_reward(
-        np.asarray([0.99, 0.999], dtype=np.float32),
-        np.asarray([5, 5], dtype=np.int32),
-        np.asarray([2, 2], dtype=np.int32),
-        np.asarray([10, 10], dtype=np.int32),
-    )
-    gap_on = abs(float(c_on[0] - c_on[1]))
-    assert gap_on > gap_off * 5
-    c_zero = trainer_on._compute_reward(
-        np.asarray([0.0], dtype=np.float32),
-        np.asarray([5], dtype=np.int32),
-        np.asarray([2], dtype=np.int32),
-        np.asarray([10], dtype=np.int32),
-    )
-    assert abs(float(c_zero[0])) < 1e-2
-
-
-def test_qaser_reward_strongly_rewards_compact_high_fidelity():
-    """QASER structural terms still prefer compact high-fidelity circuits."""
-    import dataclasses
-    cfg = _tiny_cfg(pareto_enabled=True)
-    cfg = dataclasses.replace(
-        cfg, reward=dataclasses.replace(cfg.reward,
-                                        mode="qaser",
-                                        qaser_init_max_depth=20,
-                                        qaser_init_max_cnot=10),
-    )
-    pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
-    u_target, _ = build_target(pool, cfg)
-    trainer = Trainer(cfg, u_target, pool, logger=None)
-
-    costs_high_F = trainer._compute_reward(
+def test_reward_discount_prefers_shorter_same_quality():
+    trainer, _ = _build_trainer(pareto_enabled=True)
+    costs = trainer._compute_reward(
         np.asarray([0.99, 0.99], dtype=np.float32),
-        np.asarray([20, 5], dtype=np.int32),
-        np.asarray([10, 2], dtype=np.int32),
-        np.asarray([40, 8], dtype=np.int32),
+        np.asarray([8, 8], dtype=np.int32),
+        np.asarray([4, 4], dtype=np.int32),
+        lengths=np.asarray([3, 12], dtype=np.int32),
     )
-    assert costs_high_F[1] < costs_high_F[0]
+    assert costs[0] < costs[1]
 
-    costs_low_F = trainer._compute_reward(
-        np.asarray([0.05, 0.05], dtype=np.float32),
-        np.asarray([20, 5], dtype=np.int32),
-        np.asarray([10, 2], dtype=np.int32),
-        np.asarray([40, 8], dtype=np.int32),
-    )
-    spread_low = abs(float(costs_low_F[0] - costs_low_F[1]))
-    spread_high = abs(float(costs_high_F[0] - costs_high_F[1]))
-    assert spread_high > spread_low * 5
+
 
 
 def test_replay_buffer_iterates_full_batches_with_log_probs():
@@ -408,25 +345,23 @@ def test_replay_buffer_iterates_full_batches_with_log_probs():
             cost=0.1 * i,
             advantage=float(i),
             log_p_disc=np.asarray([-1.5, -0.5], dtype=np.float32),
-            log_p_cont=np.asarray([-0.2, -0.3], dtype=np.float32),
         ))
 
     dataset = BufferDataset(buffer, repetition=1)
     batch = next(dataset.iter_batches(2, shuffle=True, rng=np.random.default_rng(0)))
     assert set(batch) == {
-        "tokens", "angles", "cost", "advantage", "log_p_disc", "log_p_cont",
+        "tokens", "angles", "cost", "advantage", "log_p_disc",
     }
     assert batch["tokens"].shape == (2, 3)
     assert batch["angles"].shape == (2, 2)
     assert batch["cost"].shape == (2,)
     assert batch["advantage"].shape == (2,)
     assert batch["log_p_disc"].shape == (2, 2)
-    assert batch["log_p_cont"].shape == (2, 2)
 
 
 def test_select_report_prefers_pareto_best_depth():
-    raw_best = np.asarray([0, 2, 2, 2], dtype=np.int32)
-    shallower = np.asarray([0, 3, 3, 3], dtype=np.int32)
+    raw_best = np.asarray([0, 3, 3, 3], dtype=np.int32)
+    shallower = np.asarray([0, 4, 4, 4], dtype=np.int32)
     archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
     archive.update(ParetoPoint(
         fidelity=1.0, depth=18, total_gates=3, cnot_count=3,
@@ -445,8 +380,8 @@ def test_select_report_prefers_pareto_best_depth():
 
 
 def test_pareto_dominance_includes_total_gates():
-    bloated = np.asarray([0, 2, 3, 1], dtype=np.int32)
-    compact = np.asarray([0, 2, 1, 1], dtype=np.int32)
+    bloated = np.asarray([0, 3, 4, 1], dtype=np.int32)
+    compact = np.asarray([0, 3, 1, 2], dtype=np.int32)
     archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
     assert archive.update(ParetoPoint(
         fidelity=0.99, depth=5, total_gates=3, cnot_count=1,
@@ -459,6 +394,67 @@ def test_pareto_dominance_includes_total_gates():
     points = archive.to_sorted_list()
     assert len(points) == 1
     assert points[0].total_gates == 2
+
+
+def test_best_fidelity_tie_breaks_by_compactness():
+    high_cnot = np.asarray([0, 3, 4, 5], dtype=np.int32)
+    low_cnot = np.asarray([0, 3, 4, 6], dtype=np.int32)
+    archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
+    assert archive.update(ParetoPoint(
+        fidelity=1.0, depth=18, total_gates=24, cnot_count=5,
+        token_sequence=high_cnot, epoch=0,
+    ))
+    assert archive.update(ParetoPoint(
+        fidelity=1.0, depth=16, total_gates=25, cnot_count=3,
+        token_sequence=low_cnot, epoch=1,
+    ))
+
+    best = archive.best_by_fidelity()
+    assert best is not None
+    assert best.cnot_count == 3
+    assert best.depth == 16
+    np.testing.assert_array_equal(archive.to_sorted_list()[0].token_sequence, low_cnot)
+
+
+def test_archive_refinement_revalidates_stored_pair():
+    class FakeEvaluator:
+        def fidelity_batch(self, token_ids_batch, angles_batch):
+            del token_ids_batch
+            angles = np.asarray(angles_batch, dtype=np.float32)
+            return np.where(angles[:, 0] > 0.5, 0.2, 0.4).astype(np.float32)
+
+    class FakeRefiner:
+        evaluator = FakeEvaluator()
+
+        def refine_batch(self, token_ids_batch, init_angles_batch):
+            worse_angles = np.asarray(init_angles_batch, dtype=np.float32).copy()
+            worse_angles[:, 0] = 1.0
+            return (
+                self.evaluator.fidelity_batch(token_ids_batch, worse_angles),
+                worse_angles,
+            )
+
+    archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
+    archive.update(ParetoPoint(
+        fidelity=1.0,
+        depth=1,
+        total_gates=1,
+        cnot_count=0,
+        token_sequence=np.asarray([0, 3, 1, 2], dtype=np.int32),
+        epoch=0,
+        opt_angles=np.asarray([0.1, 0.0, 0.0], dtype=np.float32),
+    ))
+
+    refined = refine_pareto_archive(
+        archive,
+        FakeRefiner(),
+        structure_metrics_fn=lambda _toks: (1, 1, 0),
+        bos_token_id=0,
+        pad_token_id=2,
+    )
+    point = refined.to_sorted_list()[0]
+    np.testing.assert_allclose(point.fidelity, 0.4, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(point.opt_angles, [0.1, 0.0, 0.0])
 
 
 def test_basis_gates_include_configured_rotations():
@@ -482,7 +478,6 @@ def test_load_config_reads_pool_rotation_gates(tmp_path):
 
         model:
           size: "tiny"
-          max_gates_count: 4
 
         training:
           max_epochs: 1
@@ -514,11 +509,13 @@ def test_load_config_reads_pool_rotation_gates(tmp_path):
 
 
 def test_row_structure_metrics_skips_noop_tokens():
-    token_qubit0 = np.asarray([0, 0, 0, 1, 0, 1], dtype=np.int32)
-    token_qubit1 = np.asarray([-1, -1, -1, -1, 1, -1], dtype=np.int32)
-    token_is_noop = np.asarray([True, True, False, False, False, False], dtype=bool)
+    token_qubit0 = np.asarray([0, 0, 0, 0, 1, 0, 1], dtype=np.int32)
+    token_qubit1 = np.asarray([-1, -1, -1, -1, -1, 1, -1], dtype=np.int32)
+    token_is_noop = np.asarray(
+        [True, True, True, False, False, False, False], dtype=bool,
+    )
     depth, total, cnots = _row_structure_metrics(
-        np.asarray([2, 3, 4, 5, 1], dtype=np.int32),
+        np.asarray([3, 4, 5, 6, 1, 2], dtype=np.int32),
         num_qubits=2,
         token_qubit0=token_qubit0,
         token_qubit1=token_qubit1,
@@ -544,22 +541,22 @@ def test_angle_refiner_does_not_decrease_fidelity():
     cfg = _tiny_cfg(pareto_enabled=False)
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
-    pool_token_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
+    pool_token_names = ["<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]]
     name_to_id = {n: i for i, n in enumerate(pool_token_names)}
 
     evaluator = CircuitEvaluator(
         u_target=u_target,
         num_qubits=cfg.target.num_qubits,
         pool_token_names=pool_token_names,
-        max_gates=cfg.model.max_gates_count,
     )
     refiner = AngleRefiner(evaluator, steps=4, lr=0.1)
 
-    tokens = np.zeros((1, cfg.model.max_gates_count), dtype=np.int32)
-    angles = np.zeros((1, cfg.model.max_gates_count), dtype=np.float32)
+    tokens = np.zeros((1, 4), dtype=np.int32)
+    angles = np.zeros((1, 4), dtype=np.float32)
     tokens[0, 0] = name_to_id["RZ_q0"]
     tokens[0, 1] = name_to_id["SX_q1"]
-    tokens[0, 2:] = 1
+    tokens[0, 2] = name_to_id["<STOP>"]
+    tokens[0, 3] = name_to_id["<PAD>"]
     angles[0, 0] = 0.0
 
     init_fids = evaluator.fidelity_batch(tokens, angles)

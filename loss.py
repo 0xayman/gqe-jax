@@ -1,4 +1,4 @@
-"""Loss helpers for hybrid discrete/continuous PPO updates."""
+"""Loss helpers for discrete PPO updates and masked auxiliary terms."""
 
 from __future__ import annotations
 

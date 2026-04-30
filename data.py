@@ -17,7 +17,6 @@ class BufferEntry:
     cost: float
     advantage: float
     log_p_disc: np.ndarray
-    log_p_cont: np.ndarray
 
 
 class ReplayBuffer:
@@ -65,7 +64,6 @@ class BufferDataset:
         costs = np.asarray([r.cost for r in rows], dtype=np.float32)
         advantages = np.asarray([r.advantage for r in rows], dtype=np.float32)
         log_p_d = np.stack([r.log_p_disc for r in rows], axis=0).astype(np.float32)
-        log_p_c = np.stack([r.log_p_cont for r in rows], axis=0).astype(np.float32)
 
         length = n * self.repetition
         idx = np.arange(length, dtype=np.int32)
@@ -87,5 +85,4 @@ class BufferDataset:
                 "cost": costs[sel],
                 "advantage": advantages[sel],
                 "log_p_disc": log_p_d[sel],
-                "log_p_cont": log_p_c[sel],
             }

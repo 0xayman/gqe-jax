@@ -24,10 +24,12 @@ from loss import (
 )
 from pareto import ParetoArchive, ParetoPoint
 from policy import (
+    DEFAULT_CONTEXT_TOKENS,
     HybridPolicy,
     _SIZES as _POLICY_SIZES,
     apply_discrete_action_masks,
     build_rollout_fn,
+    canonicalize_angle,
     compute_lengths_from_tokens,
     periodic_gaussian_log_prob,
 )
@@ -46,10 +48,13 @@ class _WandbLogger:
                 "num_qubits": cfg.target.num_qubits,
                 "target_type": cfg.target.type,
                 "model_size": cfg.model.size,
-                "max_gates_count": cfg.model.max_gates_count,
+                "rollout_context_tokens": rollout_context_tokens(
+                    cfg.target.num_qubits
+                ),
                 "max_epochs": cfg.training.max_epochs,
                 "entropy_disc": cfg.policy.entropy_disc,
                 "entropy_cont": cfg.policy.entropy_cont,
+                "angle_supervision_weight": cfg.policy.angle_supervision_weight,
             },
         )
 
@@ -79,6 +84,17 @@ def _build_scheduler(cfg: GQEConfig):
             frequency=max(1, cfg.training.max_epochs // 2),
         )
     raise ValueError(f"Unknown scheduler {t.scheduler!r}")
+
+
+def rollout_context_tokens(num_qubits: int) -> int:
+    """Return the transformer token window used for rollouts."""
+    numer = 4 ** int(num_qubits) - 3 * int(num_qubits) - 1
+    cnot_lb = max(0, -(-numer // 4))
+    action_budget = max(
+        32,
+        min(DEFAULT_CONTEXT_TOKENS - 1, int(round(7.5 * cnot_lb))),
+    )
+    return action_budget + 1
 
 
 def _make_structure_jit(num_qubits: int, token_qubit0, token_qubit1, token_is_noop):
@@ -215,10 +231,14 @@ class Trainer:
 
         self.bos_token_id = 0
         self.stop_token_id = 1
-        self.gate_token_offset = 2
-        self.pool_token_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
+        self.pad_token_id = 2
+        self.gate_token_offset = 3
+        self.pool_token_names = [
+            "<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]
+        ]
         self.vocab_size = len(self.pool_token_names)
-        self.ngates = cfg.model.max_gates_count
+        self.context_tokens = rollout_context_tokens(cfg.target.num_qubits)
+        self.action_horizon = self.context_tokens - 1
         self.num_samples = cfg.training.num_samples
 
         self.token_qubit0 = np.zeros((self.vocab_size,), dtype=np.int32)
@@ -226,6 +246,7 @@ class Trainer:
         self.token_is_noop = np.zeros((self.vocab_size,), dtype=bool)
         self.token_is_noop[self.bos_token_id] = True
         self.token_is_noop[self.stop_token_id] = True
+        self.token_is_noop[self.pad_token_id] = True
         self.two_qubit_token_mask = np.zeros((self.vocab_size,), dtype=bool)
         for tok_id, name in enumerate(self.pool_token_names):
             if tok_id < self.gate_token_offset:
@@ -240,7 +261,6 @@ class Trainer:
             u_target=u_target,
             num_qubits=cfg.target.num_qubits,
             pool_token_names=self.pool_token_names,
-            max_gates=self.ngates,
         )
         self.token_is_parametric = self.evaluator.token_is_parametric_np
         target_features = np.concatenate(
@@ -255,14 +275,14 @@ class Trainer:
         self.model = HybridPolicy(
             cfg.model.size,
             self.vocab_size,
-            n_positions=self.ngates + 1,
+            n_positions=self.context_tokens,
         )
         self.scheduler = _build_scheduler(cfg)
         self.rng_key = jax.random.PRNGKey(cfg.training.seed)
         self.batch_rng = np.random.default_rng(cfg.training.seed)
 
         self.rng_key, init_key = jax.random.split(self.rng_key)
-        dummy_input = jnp.zeros((1, self.ngates + 1), dtype=jnp.int32)
+        dummy_input = jnp.zeros((1, self.context_tokens), dtype=jnp.int32)
         dummy_mask = jnp.ones_like(dummy_input, dtype=bool)
         variables = self.model.init(
             {"params": init_key},
@@ -293,15 +313,6 @@ class Trainer:
             self.pareto_archive = None
         self._current_epoch = 0
 
-        self._qaser_max_d = max(float(cfg.reward.qaser_init_max_depth), 1.0)
-        self._qaser_max_c = max(float(cfg.reward.qaser_init_max_cnot), 1.0)
-        self._qaser_max_g = max(float(cfg.reward.qaser_init_max_gates), 1.0)
-        self._qaser_initialized = (
-            cfg.reward.qaser_init_max_depth > 0
-            and cfg.reward.qaser_init_max_cnot > 0
-            and cfg.reward.qaser_init_max_gates > 0
-        )
-
         if cfg.policy.inner_refine_steps > 0:
             self.inner_refiner: AngleRefiner | None = AngleRefiner(
                 self.evaluator,
@@ -321,8 +332,10 @@ class Trainer:
         cfg = self.cfg
         bos_id = self.bos_token_id
         stop_id = self.stop_token_id
+        pad_id = self.pad_token_id
         ent_disc = float(cfg.policy.entropy_disc)
         ent_cont = float(cfg.policy.entropy_cont)
+        angle_weight = float(cfg.policy.angle_supervision_weight)
         clip = float(cfg.training.grpo_clip_ratio)
 
         is_param_jax = jnp.asarray(self.token_is_parametric, dtype=bool)
@@ -342,16 +355,16 @@ class Trainer:
             advantages,
             beta,
             old_log_p_d,
-            old_log_p_c,
             target_features,
         ):
             attention_mask = jnp.ones_like(tokens, dtype=bool)
             actions_disc = tokens[:, 1:]
-            actions_cont = angles
+            angle_targets = angles
             T = actions_disc.shape[1]
             param_mask = is_param_jax[actions_disc]
             lengths = compute_lengths_from_tokens(actions_disc, stop_id)
             valid = jnp.arange(T)[None, :] < lengths[:, None]
+            angle_mask = param_mask & valid
 
             def loss_fn(params):
                 logits, mu, log_sigma = state.apply_fn(
@@ -361,28 +374,22 @@ class Trainer:
                     deterministic=True,
                 )
                 aligned_logits = apply_discrete_action_masks(
-                    logits[:, :T, :], bos_token_id=bos_id, stop_token_id=stop_id,
+                    logits[:, :T, :],
+                    bos_token_id=bos_id,
+                    stop_token_id=stop_id,
+                    pad_token_id=pad_id,
                 )
                 logp_all = jax.nn.log_softmax(-beta * aligned_logits, axis=-1)
                 new_log_p_d = jnp.take_along_axis(
                     logp_all, actions_disc[..., None], axis=-1,
                 ).squeeze(-1)
-                new_log_p_c = periodic_gaussian_log_prob(
-                    actions_cont, mu[:, :T], log_sigma[:, :T],
-                )
 
-                cont_contrib_new = jnp.where(
-                    param_mask & valid, new_log_p_c,
-                    jnp.asarray(0.0, dtype=new_log_p_c.dtype),
-                )
-                cont_contrib_old = jnp.where(
-                    param_mask & valid, old_log_p_c,
-                    jnp.asarray(0.0, dtype=old_log_p_c.dtype),
-                )
-                per_tok_new = new_log_p_d + cont_contrib_new
-                per_tok_old = old_log_p_d + cont_contrib_old
+                per_tok_new = new_log_p_d
+                per_tok_old = old_log_p_d
 
-                denom = jnp.maximum(valid.sum(axis=-1).astype(per_tok_new.dtype), 1.0)
+                denom = jnp.maximum(
+                    valid.sum(axis=-1).astype(per_tok_new.dtype), 1.0
+                )
                 seq_new = jnp.sum(jnp.where(valid, per_tok_new, 0.0), axis=-1) / denom
                 seq_old = jnp.sum(jnp.where(valid, per_tok_old, 0.0), axis=-1) / denom
 
@@ -390,9 +397,23 @@ class Trainer:
                 pg_loss = ppo_clipped_loss(seq_new, seq_old, advantages_sg, clip)
 
                 ent_d = categorical_entropy(aligned_logits, beta, valid)
-                ent_c = gaussian_entropy(log_sigma[:, :T], param_mask & valid)
-                total = pg_loss - ent_disc * ent_d - ent_cont * ent_c
-                return total, (pg_loss, ent_d, ent_c)
+                ent_c = gaussian_entropy(log_sigma[:, :T], angle_mask)
+                angle_delta = canonicalize_angle(mu[:, :T] - angle_targets)
+                angle_loss_per = 1.0 - jnp.cos(angle_delta)
+                angle_denom = jnp.maximum(
+                    angle_mask.sum().astype(angle_loss_per.dtype), 1.0
+                )
+                angle_loss = (
+                    jnp.sum(jnp.where(angle_mask, angle_loss_per, 0.0))
+                    / angle_denom
+                )
+                total = (
+                    pg_loss
+                    - ent_disc * ent_d
+                    - ent_cont * ent_c
+                    + angle_weight * angle_loss
+                )
+                return total, (pg_loss, ent_d, ent_c, angle_loss)
 
             (loss_value, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
             state = state.apply_gradients(grads=grads)
@@ -411,7 +432,10 @@ class Trainer:
                 deterministic=True,
             )
             aligned_logits = apply_discrete_action_masks(
-                logits[:, :T, :], bos_token_id=bos_id, stop_token_id=stop_id,
+                logits[:, :T, :],
+                bos_token_id=bos_id,
+                stop_token_id=stop_id,
+                pad_token_id=pad_id,
             )
             logp_all = jax.nn.log_softmax(-beta * aligned_logits, axis=-1)
             log_p_d = jnp.take_along_axis(
@@ -429,9 +453,10 @@ class Trainer:
             n_embd=arch.n_embd,
             vocab_size=self.vocab_size,
             batch_size=self.num_samples,
-            total_len=self.ngates + 1,
+            total_len=self.context_tokens,
             bos_token_id=self.bos_token_id,
             stop_token_id=self.stop_token_id,
+            pad_token_id=self.pad_token_id,
             use_target_conditioning=True,
         )
 
@@ -452,7 +477,6 @@ class Trainer:
         tokens = np.asarray(out["tokens"], dtype=np.int32)
         init_angles = np.asarray(out["angles"], dtype=np.float32)
         log_p_d = np.asarray(out["log_p_d"], dtype=np.float32)
-        log_p_c = np.asarray(out["log_p_c"], dtype=np.float32)
 
         action_tokens = tokens[:, 1:]
         raw_fidelities = self.evaluator.fidelity_batch(action_tokens, init_angles)
@@ -487,10 +511,11 @@ class Trainer:
 
         if self.cfg.reward.enabled:
             costs = self._compute_reward(
-                fidelities, depths, cnot_counts, totals, no_stop=no_stop,
+                fidelities, depths, cnot_counts, lengths=lengths, no_stop=no_stop,
             )
         else:
-            costs = (1.0 - fidelities).astype(np.float32)
+            discounts = self._sequence_discounts(lengths)
+            costs = (1.0 - discounts * fidelities).astype(np.float32)
         advantages = np.asarray(
             grpo_advantages(jnp.asarray(costs, dtype=jnp.float32)), dtype=np.float32,
         )
@@ -498,11 +523,10 @@ class Trainer:
         for i in range(tokens.shape[0]):
             self.buffer.push(BufferEntry(
                 tokens=tokens[i].copy(),
-                angles=init_angles[i].copy(),
+                angles=pareto_angles[i].copy(),
                 cost=float(costs[i]),
                 advantage=float(advantages[i]),
                 log_p_disc=log_p_d[i].copy(),
-                log_p_cont=log_p_c[i].copy(),
             ))
 
         if self.pareto_archive is not None:
@@ -550,68 +574,44 @@ class Trainer:
             "beta": float(np.asarray(beta, dtype=np.float32)),
         }
 
+    def _sequence_discounts(self, lengths: np.ndarray | None) -> np.ndarray | np.float32:
+        if lengths is None:
+            return np.float32(1.0)
+        steps = np.maximum(lengths.astype(np.float32) - 1.0, 0.0)
+        return np.power(
+            np.float32(self.cfg.reward.sequence_discount), steps,
+        ).astype(np.float32)
+
     def _compute_reward(
         self,
         fidelities: np.ndarray,
         depths: np.ndarray,
         cnots: np.ndarray,
-        total_gates: np.ndarray | None = None,
+        lengths: np.ndarray | None = None,
         no_stop: np.ndarray | None = None,
     ) -> np.ndarray:
         r = self.cfg.reward
         F = fidelities.astype(np.float32)
         C = cnots.astype(np.float32)
         D = depths.astype(np.float32)
+        discounts = self._sequence_discounts(lengths)
 
-        G = (
-            total_gates.astype(np.float32)
-            if total_gates is not None
-            else D
+        eps = np.float32(r.lex_infidelity_eps)
+        infidelity = np.clip(1.0 - F + eps, eps, 1.0).astype(np.float32)
+        reward = -np.float32(r.lex_fidelity_weight) * np.log(infidelity)
+        active = (F >= np.float32(r.lex_structure_fidelity_threshold)).astype(
+            np.float32
         )
-        if r.mode == "lexicographic":
-            eps = np.float32(r.lex_infidelity_eps)
-            infidelity = np.maximum(1.0 - F + eps, eps).astype(np.float32)
-            cost = np.float32(r.lex_fidelity_weight) * np.log(infidelity)
-            active = (F >= np.float32(r.lex_structure_fidelity_threshold)).astype(np.float32)
-            cost = cost + active * (
-                np.float32(r.lex_cnot_weight) * C
-                + np.float32(r.lex_depth_weight) * D
-                + np.float32(r.lex_total_gate_weight) * G
+        structure_cost = active * (
+            np.float32(r.lex_cnot_weight) * C
+            + np.float32(r.lex_depth_weight) * D
+        )
+        cost = -(discounts * reward) + structure_cost
+        if no_stop is not None:
+            cost = cost + np.asarray(no_stop, dtype=np.float32) * np.float32(
+                r.lex_no_stop_penalty
             )
-            if no_stop is not None:
-                cost = cost + np.asarray(no_stop, dtype=np.float32) * np.float32(
-                    r.lex_no_stop_penalty
-                )
-            return cost.astype(np.float32)
-
-        batch_max_d = float(D.max()) if D.size else 0.0
-        batch_max_c = float(C.max()) if C.size else 0.0
-        batch_max_g = float(G.max()) if G.size else 0.0
-        if not self._qaser_initialized:
-            self._qaser_max_d = max(batch_max_d, 1.0)
-            self._qaser_max_c = max(batch_max_c, 1.0)
-            self._qaser_max_g = max(batch_max_g, 1.0)
-            self._qaser_initialized = True
-        else:
-            self._qaser_max_d = max(self._qaser_max_d, batch_max_d)
-            self._qaser_max_c = max(self._qaser_max_c, batch_max_c)
-            self._qaser_max_g = max(self._qaser_max_g, batch_max_g)
-        w_d = np.float32(r.qaser_w_depth)
-        w_c = np.float32(r.qaser_w_cnot)
-        w_g = np.float32(r.qaser_w_gates)
-        base = (
-            w_d * np.float32(self._qaser_max_d) / (D + 1.0)
-            + w_c * np.float32(self._qaser_max_c) / (C + 1.0)
-            + w_g * np.float32(self._qaser_max_g) / (G + 1.0)
-        )
-        log_inf_eps = float(r.qaser_log_infidelity_eps)
-        if log_inf_eps > 0.0:
-            eps = np.float32(log_inf_eps)
-            log_inf_mult = (1.0 - np.log(1.0 - F + eps)).astype(np.float32)
-            reward = base ** F * log_inf_mult - 1.0
-        else:
-            reward = base ** F - 1.0
-        return (-reward).astype(np.float32)
+        return cost.astype(np.float32)
 
     def train_epoch(self, beta_val: float) -> list[float]:
         """Run ``buffer.steps_per_epoch`` PPO updates and return per-batch losses."""
@@ -632,7 +632,6 @@ class Trainer:
                 jnp.asarray(batch["advantage"], dtype=jnp.float32),
                 beta,
                 jnp.asarray(batch["log_p_disc"], dtype=jnp.float32),
-                jnp.asarray(batch["log_p_cont"], dtype=jnp.float32),
                 target_features,
             )
             losses.append(float(np.asarray(loss_v, dtype=np.float32)))
@@ -737,11 +736,8 @@ class Trainer:
                         toks, cfg.target.num_qubits,
                         self.token_qubit0, self.token_qubit1, self.token_is_noop,
                     ),
-                    pool_token_names=self.pool_token_names,
                     bos_token_id=self.bos_token_id,
-                    stop_token_id=self.stop_token_id,
-                    apply_simplify=cfg.refinement.apply_simplify,
-                    simplify_max_passes=cfg.refinement.simplify_max_passes,
+                    pad_token_id=self.pad_token_id,
                     verbose=cfg.logging.verbose,
                 )
             elif cfg.logging.verbose:

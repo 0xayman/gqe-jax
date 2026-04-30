@@ -32,7 +32,7 @@ def random_reachable_generator(
     cfg: GQEConfig,
 ) -> Tuple[np.ndarray, str]:
     """Generate a shallow target exactly expressible by the current pool."""
-    depth = min(4, cfg.model.max_gates_count)
+    depth = 4
     rng = np.random.default_rng(cfg.training.seed)
     indices = rng.integers(0, len(pool), size=depth)
     recipe = [pool[i][0] for i in indices]

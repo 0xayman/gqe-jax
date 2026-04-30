@@ -20,8 +20,24 @@ from dotenv import load_dotenv
 from config import GQEConfig, load_config
 from operator_pool import build_operator_pool
 from reporting import circuit_stats
+from simplify import simplify_pareto_archive
 from target import build_target
 from trainer import gqe
+
+
+class _FileLogger:
+    """Mirror log calls to stdout and a log file simultaneously."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = path.open("w", buffering=1)
+
+    def log(self, msg: str = "") -> None:
+        print(msg)
+        self._file.write(msg + "\n")
+
+    def close(self) -> None:
+        self._file.close()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -40,10 +56,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--base-seed", type=int, default=1000,
                    help="Seeds used: base_seed, base_seed+1, ... (default: 1000).")
     p.add_argument("-o", "--output-dir", default="results/benchmarks",
-                   help="Directory for the JSONL + PNG outputs "
+                   help="Directory for the PNG / CSV / log outputs "
                         "(default: results/benchmarks).")
-    p.add_argument("--resume", action="store_true",
-                   help="Skip seeds already present in the JSONL output.")
     p.add_argument("--no-plot", action="store_true",
                    help="Skip plot generation (useful for headless dispatch).")
     p.add_argument("--target-type", choices=["random", "random_reachable", "haar_random", "brickwork"],
@@ -93,8 +107,7 @@ def _override_cfg(
     args: argparse.Namespace,
     seed: int,
 ) -> GQEConfig:
-    """Apply benchmark-specific target, logging, seed, and cap overrides."""
-    from config import default_max_gates_count
+    """Apply benchmark-specific target, logging, and seed overrides."""
     num_qubits = int(args.num_qubits)
     target_type = args.target_type or base_cfg.target.type
     brickwork_depth = (
@@ -110,17 +123,9 @@ def _override_cfg(
         path=None if target_type != "file" else base_cfg.target.path,
     )
     logging = dataclasses.replace(base_cfg.logging, wandb=False)
-    if base_cfg.model.auto_max_gates_count:
-        model = dataclasses.replace(
-            base_cfg.model,
-            max_gates_count=default_max_gates_count(num_qubits),
-            auto_max_gates_count=True,
-        )
-    else:
-        model = base_cfg.model
     training = dataclasses.replace(base_cfg.training, seed=seed)
     return dataclasses.replace(
-        base_cfg, target=target, logging=logging, model=model, training=training,
+        base_cfg, target=target, logging=logging, training=training,
     )
 
 
@@ -591,6 +596,27 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
     t0 = time.time()
     result = gqe(cfg, u_target, pool, logger=None)
     dt = time.time() - t0
+
+    if result.pareto_archive is not None and len(result.pareto_archive) > 0:
+        result.pareto_archive = simplify_pareto_archive(
+            result.pareto_archive, pool, args.num_qubits,
+        )
+
+    pareto_rows: list[dict] = []
+    arc = result.pareto_archive
+    if arc is not None:
+        for pt in arc.to_sorted_list():
+            pareto_rows.append({
+                "seed": seed,
+                "num_qubits": args.num_qubits,
+                "target_type": cfg.target.type,
+                "target_desc": desc,
+                "fidelity": float(pt.fidelity),
+                "cnot_count": int(pt.cnot_count),
+                "depth": int(pt.depth),
+                "total_gates": int(pt.total_gates),
+            })
+
     gqe_b = _gqe_summary(result, thresholds)
 
     row = {
@@ -598,7 +624,6 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
         "num_qubits": args.num_qubits,
         "target_type": cfg.target.type,
         "target_desc": desc,
-        "max_gates_count": int(cfg.model.max_gates_count),
         "elapsed_sec": dt,
         "gqe_F": gqe_b["best_F"],
         "gqe_best_depth": gqe_b["best_depth"],
@@ -628,322 +653,131 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
         "selected_cnot",
         "selected_rule",
     }})
-    return row
+    return row, pareto_rows
 
 
-def _plot_paths(png_path: Path) -> dict[str, Path]:
-    return {
-        "best_fidelity": png_path,
-        "thresholds": png_path.with_name(f"{png_path.stem}.thresholds.png"),
-        "pareto": png_path.with_name(f"{png_path.stem}.pareto.png"),
-    }
+def _plot_main(rows: list[dict], png_path: Path) -> None:
+    """4-panel figure: fidelity / CNOT / depth / total-gates, sorted by GQE best fidelity.
 
-
-def _plot_value_array(
-    rows: list[dict],
-    key: str,
-    *,
-    fallback: str | None = None,
-    missing: float = np.nan,
-) -> np.ndarray:
-    vals = []
-    for row in rows:
-        value = row.get(key)
-        if value is None and fallback is not None:
-            value = row.get(fallback)
-        vals.append(missing if value is None else value)
-    return np.asarray(vals, dtype=np.float64)
-
-
-def _threshold_plot_stats(rows: list[dict], thresholds: list[float]) -> dict[str, list[float]]:
-    stats = {
-        "success": [],
-        "success_lo": [],
-        "success_hi": [],
-        "cnot_delta": [],
-        "depth_delta": [],
-        "total_delta": [],
-        "cnot_no_worse": [],
-        "depth_no_worse": [],
-        "total_no_worse": [],
-    }
-    n = len(rows)
-    for thr in thresholds:
-        key = _threshold_key(thr)
-        passed = [r for r in rows if r.get(f"gqe_success_at_F_{key}", False)]
-        k = len(passed)
-        lo, hi = _success_rate_ci(k, n)
-        stats["success"].append(k / n if n else np.nan)
-        stats["success_lo"].append(0.0 if lo is None else k / n - lo)
-        stats["success_hi"].append(0.0 if hi is None else hi - k / n)
-
-        triplets = [
-            (
-                "cnot_delta",
-                "cnot_no_worse",
-                f"gqe_min_cnot_at_F_{key}",
-                "qiskit_cnot",
-            ),
-            (
-                "depth_delta",
-                "depth_no_worse",
-                f"gqe_min_depth_at_F_{key}",
-                "qiskit_depth",
-            ),
-            (
-                "total_delta",
-                "total_no_worse",
-                f"gqe_min_total_gates_at_F_{key}",
-                "qiskit_total_gates",
-            ),
-        ]
-        for delta_key, frac_key, gqe_col, qiskit_col in triplets:
-            vals = [
-                float(r[gqe_col]) - float(r[qiskit_col])
-                for r in passed
-                if r.get(gqe_col) is not None and r.get(qiskit_col) is not None
-            ]
-            arr = np.asarray(vals, dtype=np.float64)
-            stats[delta_key].append(float(np.median(arr)) if arr.size else np.nan)
-            stats[frac_key].append(float(np.mean(arr <= 0.0)) if arr.size else np.nan)
-    return stats
-
-
-def _plot_best_fidelity(rows: list[dict], png_path: Path, thresholds: list[float]) -> None:
+    All four panels are built from the same sorted list of per-circuit records so that
+    column i in every panel always refers to the identical circuit.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     rows = [r for r in rows if r.get("gqe_F") is not None]
     if not rows:
-        print("No rows to plot — aborting best-fidelity plot.")
+        print("No rows to plot.")
         return
 
-    n = len(rows)
-    fidelity_threshold = thresholds[0]
-    f = _plot_value_array(rows, "gqe_F")
-    gqe_cnot = _plot_value_array(rows, "gqe_best_cnot", fallback="gqe_cnot")
-    gqe_depth = _plot_value_array(rows, "gqe_best_depth", fallback="gqe_depth")
-    gqe_total = _plot_value_array(rows, "gqe_best_total_gates", fallback="gqe_total_gates")
-    qk_f = _plot_value_array(rows, "qiskit_F")
-    qk_cnot = _plot_value_array(rows, "qiskit_cnot")
-    qk_depth = _plot_value_array(rows, "qiskit_depth")
-    qk_total = _plot_value_array(rows, "qiskit_total_gates")
-
-    order = np.argsort(f)
-    xs = np.arange(n)
     n_qubits = int(rows[0]["num_qubits"])
     target_type = rows[0]["target_type"]
-    numer = 4 ** n_qubits - 3 * n_qubits - 1
-    cnot_lb = max(0, -(-numer // 4))
+
+    def _v(row: dict, key: str) -> float:
+        val = row.get(key)
+        return float(val) if val is not None else np.nan
+
+    # Sort all per-circuit data together as a single unit — this is the guarantee
+    # that column i in every panel below shows the same circuit.
+    records = sorted(
+        [
+            {
+                "seed":     row.get("seed"),
+                "f":        _v(row, "gqe_F"),
+                "gqe_cnot": _v(row, "gqe_best_cnot"),
+                "gqe_dep":  _v(row, "gqe_best_depth"),
+                "gqe_tot":  _v(row, "gqe_best_total_gates"),
+                "qk_cnot":  _v(row, "qiskit_cnot"),
+                "qk_dep":   _v(row, "qiskit_depth"),
+                "qk_tot":   _v(row, "qiskit_total_gates"),
+            }
+            for row in rows
+        ],
+        key=lambda d: d["f"],
+    )
+
+    n         = len(records)
+    seeds     = [d["seed"] for d in records]
+    f         = np.array([d["f"]        for d in records])
+    gqe_cnot  = np.array([d["gqe_cnot"] for d in records])
+    gqe_dep   = np.array([d["gqe_dep"]  for d in records])
+    gqe_tot   = np.array([d["gqe_tot"]  for d in records])
+    qk_cnot   = np.array([d["qk_cnot"]  for d in records])
+    qk_dep    = np.array([d["qk_dep"]   for d in records])
+    qk_tot    = np.array([d["qk_tot"]   for d in records])
+
+    xs = np.arange(n)
+    width = 0.4
 
     fig, axes = plt.subplots(
-        4, 1, sharex=True, figsize=(12, 10),
+        4, 1, sharex=True,
+        figsize=(max(10, n * 0.32 + 2), 12),
         gridspec_kw={"height_ratios": [1.5, 1, 1, 1]},
     )
 
+    # Panel 1 — fidelity (each dot = same circuit as bars directly below it)
     ax = axes[0]
-    ax.scatter(xs, f[order], color="C0", s=22, zorder=3, label="GQE best fidelity")
-    ax.axhline(float(np.nanmedian(qk_f)), color="C1", linestyle="--", linewidth=1.2,
-               label=f"Qiskit median F={np.nanmedian(qk_f):.4f}")
-    for thr in thresholds:
-        ax.axhline(thr, linestyle=":", linewidth=1.0, label=f"F={thr:g}")
+    ax.scatter(xs, f, color="C0", s=30, zorder=3, label="GQE best fidelity")
+    ax.axhline(float(np.nanmedian(f)), color="C0", linestyle="--", linewidth=1.0,
+               alpha=0.6, label=f"GQE median {np.nanmedian(f):.4f}")
     ax.set_ylabel("Process fidelity")
     ax.set_ylim(max(0.0, float(np.nanmin(f)) - 0.02), 1.005)
-    ax.legend(loc="lower right", fontsize=8, ncol=2)
-
-    stats = (
-        "Lower panels use the same GQE circuit that achieved best fidelity.\n"
-        f"N={n}; best-F mean={np.nanmean(f):.5f}; median={np.nanmedian(f):.5f}; "
-        f"min={np.nanmin(f):.5f}\n"
-        f"Success at F>={fidelity_threshold:g}: "
-        f"{int(np.sum(f >= fidelity_threshold))}/{n}"
+    ax.legend(loc="lower right", fontsize=8)
+    ax.set_title(
+        f"GQE best-fidelity circuits vs Qiskit — {n} {target_type} {n_qubits}q targets",
+        fontsize=12,
+    )
+    stats_txt = (
+        f"N={n}  mean={np.nanmean(f):.5f}  median={np.nanmedian(f):.5f}  "
+        f"min={np.nanmin(f):.5f}"
     )
     ax.text(
-        0.02, 0.05, stats, transform=ax.transAxes, fontsize=8.5,
+        0.02, 0.05, stats_txt, transform=ax.transAxes, fontsize=8,
         verticalalignment="bottom",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.88, edgecolor="0.7"),
     )
 
-    width = 0.4
+    # Panels 2-4 — metrics of the SAME circuit whose fidelity dot sits above
     panels = [
-        (axes[1], gqe_cnot, qk_cnot, "CNOT count", cnot_lb),
-        (axes[2], gqe_depth, qk_depth, "Circuit depth", None),
-        (axes[3], gqe_total, qk_total, "Total gates", None),
+        (axes[1], gqe_cnot, qk_cnot, "CNOT count"),
+        (axes[2], gqe_dep,  qk_dep,  "Circuit depth"),
+        (axes[3], gqe_tot,  qk_tot,  "Total gates"),
     ]
-    for ax, gqe_vals, qk_vals, ylabel, lower_bound in panels:
-        ax.bar(xs - width / 2, gqe_vals[order], width, color="C0", label="GQE best-F circuit")
-        ax.bar(xs + width / 2, qk_vals[order], width, color="C1", label="Qiskit")
-        if lower_bound:
-            ax.axhline(lower_bound, color="0.4", linestyle="--", linewidth=1.0,
-                       label=f"K-G optimum = {lower_bound}")
+    for ax, gqe_v, qk_v, ylabel in panels:
+        ax.bar(xs - width / 2, gqe_v, width, color="C0", label="GQE")
+        ax.bar(xs + width / 2, qk_v,  width, color="C1", label="Qiskit")
         ax.set_ylabel(ylabel)
         ax.legend(loc="upper right", fontsize=8)
-    axes[-1].set_xlabel("Unitary index (sorted by GQE best fidelity, ascending)")
-    fig.suptitle(
-        f"Best-fidelity GQE circuits vs Qiskit on {n} {target_type} {n_qubits}-qubit targets",
-        fontsize=12,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+
+    # x-axis: seed labels so each column is traceable to the JSONL / Pareto CSV
+    step = max(1, n // 20)
+    tick_xs    = xs[::step]
+    tick_seeds = seeds[::step]
+    axes[-1].set_xticks(tick_xs)
+    axes[-1].set_xticklabels([str(s) for s in tick_seeds], rotation=45, ha="right", fontsize=7)
+    axes[-1].set_xlabel("Seed (sorted by GQE best fidelity, ascending)")
+
+    fig.tight_layout()
     fig.savefig(png_path, dpi=140)
     plt.close(fig)
-    print(f"Saved best-fidelity plot → {png_path}")
+    print(f"Saved plot → {png_path}")
 
 
-def _plot_thresholds(rows: list[dict], png_path: Path, thresholds: list[float]) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    rows = [r for r in rows if r.get("gqe_F") is not None]
-    if not rows:
-        print("No rows to plot — aborting threshold plot.")
+def _write_pareto_csv(pareto_rows: list[dict], csv_path: Path) -> None:
+    """Write one row per Pareto-front point across all benchmark circuits."""
+    import csv
+    if not pareto_rows:
+        print("No Pareto points recorded — skipping CSV.")
         return
-
-    stats = _threshold_plot_stats(rows, thresholds)
-    labels = [f"{thr:g}" for thr in thresholds]
-    xs = np.arange(len(thresholds))
-    width = 0.25
-    n_qubits = int(rows[0]["num_qubits"])
-    target_type = rows[0]["target_type"]
-
-    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-
-    axes[0].bar(
-        xs,
-        stats["success"],
-        color="C2",
-        yerr=[stats["success_lo"], stats["success_hi"]],
-        capsize=4,
-    )
-    axes[0].set_ylim(0.0, 1.05)
-    axes[0].set_ylabel("Success rate")
-    axes[0].set_title("Threshold-constrained Pareto-front metrics")
-
-    axes[1].bar(xs - width, stats["cnot_delta"], width, label="min CNOT circuit", color="C0")
-    axes[1].bar(xs, stats["depth_delta"], width, label="min depth circuit", color="C3")
-    axes[1].bar(xs + width, stats["total_delta"], width, label="min total-gates circuit", color="C4")
-    axes[1].axhline(0.0, color="0.35", linewidth=1.0)
-    axes[1].set_ylabel("Median delta vs Qiskit")
-    axes[1].legend(loc="best", fontsize=8)
-
-    axes[2].plot(xs, stats["cnot_no_worse"], marker="o", label="CNOT no worse")
-    axes[2].plot(xs, stats["depth_no_worse"], marker="o", label="Depth no worse")
-    axes[2].plot(xs, stats["total_no_worse"], marker="o", label="Total gates no worse")
-    axes[2].set_ylim(0.0, 1.05)
-    axes[2].set_ylabel("Fraction <= Qiskit")
-    axes[2].set_xlabel("Fidelity threshold")
-    axes[2].set_xticks(xs, labels)
-    axes[2].legend(loc="best", fontsize=8)
-
-    fig.suptitle(
-        f"Threshold tradeoffs on {len(rows)} {target_type} {n_qubits}-qubit targets",
-        fontsize=12,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(png_path, dpi=140)
-    plt.close(fig)
-    print(f"Saved threshold plot → {png_path}")
-
-
-def _boxplot_data(rows: list[dict], keys: list[str]) -> list[np.ndarray]:
-    data = []
-    for key in keys:
-        arr = _finite_values(rows, key)
-        data.append(arr if arr.size else np.asarray([np.nan]))
-    return data
-
-
-def _plot_pareto(rows: list[dict], png_path: Path, thresholds: list[float]) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    rows = [r for r in rows if r.get("gqe_F") is not None]
-    if not rows:
-        print("No rows to plot — aborting Pareto plot.")
-        return
-
-    labels = ["best-F"] + [f"F>={thr:g}" for thr in thresholds]
-    cnot_keys = ["gqe_best_cnot"] + [
-        f"gqe_min_cnot_at_F_{_threshold_key(thr)}" for thr in thresholds
-    ]
-    depth_keys = ["gqe_best_depth"] + [
-        f"gqe_min_depth_at_F_{_threshold_key(thr)}" for thr in thresholds
-    ]
-    total_keys = ["gqe_best_total_gates"] + [
-        f"gqe_min_total_gates_at_F_{_threshold_key(thr)}" for thr in thresholds
-    ]
-    n_qubits = int(rows[0]["num_qubits"])
-    target_type = rows[0]["target_type"]
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    axes = axes.ravel()
-
-    size = _finite_values(rows, "gqe_pareto_size")
-    hv = _finite_values(rows, "gqe_pareto_hv_cnot")
-    best_f = _finite_values(rows, "gqe_F")
-    if size.size:
-        axes[0].hist(size, bins=min(20, max(5, int(np.sqrt(size.size)))), color="C0", alpha=0.8)
-        axes[0].set_xlabel("Archive size")
-        axes[0].set_ylabel("Targets")
-    else:
-        axes[0].text(0.5, 0.5, "Archive size unavailable", ha="center", va="center")
-    axes[0].set_title("Pareto archive size")
-
-    if hv.size == best_f.size and hv.size:
-        axes[1].scatter(hv, best_f, color="C2", s=24)
-        axes[1].set_xlabel("Fidelity-CNOT hypervolume")
-        axes[1].set_ylabel("Best fidelity")
-    else:
-        axes[1].text(0.5, 0.5, "Hypervolume unavailable", ha="center", va="center")
-    axes[1].set_title("Archive quality")
-
-    axes[2].boxplot(_boxplot_data(rows, cnot_keys), labels=labels, showfliers=False)
-    axes[2].axhline(np.nanmedian(_plot_value_array(rows, "qiskit_cnot")), color="C1",
-                    linestyle="--", linewidth=1.0, label="Qiskit median")
-    axes[2].set_ylabel("CNOT count")
-    axes[2].tick_params(axis="x", rotation=20)
-    axes[2].legend(loc="best", fontsize=8)
-
-    axes[3].boxplot(_boxplot_data(rows, depth_keys), labels=labels, showfliers=False)
-    axes[3].axhline(np.nanmedian(_plot_value_array(rows, "qiskit_depth")), color="C1",
-                    linestyle="--", linewidth=1.0, label="Qiskit median depth")
-    axes[3].set_ylabel("Depth")
-    axes[3].tick_params(axis="x", rotation=20)
-    ax2 = axes[3].twinx()
-    med_total = [
-        float(np.nanmedian(vals)) if np.isfinite(vals).any() else np.nan
-        for vals in _boxplot_data(rows, total_keys)
-    ]
-    ax2.plot(np.arange(1, len(labels) + 1), med_total, color="C4", marker="o",
-             label="Median total gates")
-    ax2.set_ylabel("Median total gates")
-    handles, labs = axes[3].get_legend_handles_labels()
-    handles2, labs2 = ax2.get_legend_handles_labels()
-    axes[3].legend(handles + handles2, labs + labs2, loc="best", fontsize=8)
-
-    fig.suptitle(
-        f"Pareto/archive diagnostics on {len(rows)} {target_type} {n_qubits}-qubit targets",
-        fontsize=12,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(png_path, dpi=140)
-    plt.close(fig)
-    print(f"Saved Pareto plot → {png_path}")
-
-
-def _plot(rows: list[dict], png_path: Path, *, thresholds: list[float]) -> dict[str, Path]:
-    """Write distinct plots for best-fidelity, threshold, and archive views."""
-    plot_paths = _plot_paths(png_path)
-    rows = [r for r in rows if r.get("gqe_F") is not None]
-    if not rows:
-        print("No rows to plot — aborting plot step.")
-        return plot_paths
-    _plot_best_fidelity(rows, plot_paths["best_fidelity"], thresholds)
-    _plot_thresholds(rows, plot_paths["thresholds"], thresholds)
-    _plot_pareto(rows, plot_paths["pareto"], thresholds)
-    return plot_paths
+    fields = ["seed", "num_qubits", "target_type", "target_desc",
+              "fidelity", "cnot_count", "depth", "total_gates"]
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(pareto_rows)
+    print(f"Saved Pareto CSV → {csv_path} ({len(pareto_rows)} points across {len({r['seed'] for r in pareto_rows})} circuits)")
 
 
 def _write_benchmark_metadata(
@@ -986,7 +820,6 @@ def _write_benchmark_metadata(
         git_commit = None
 
     target_type = benchmark_cfg.target.type
-    plot_paths = _plot_paths(png_path)
     payload = {
         "kind": "benchmark",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1025,7 +858,6 @@ def _write_benchmark_metadata(
         "outputs": {
             "jsonl": str(jsonl_path),
             "png": str(png_path),
-            "plots": {name: str(path) for name, path in plot_paths.items()},
             "summary_json": str(summary_path),
         },
         "config": _config_snapshot(benchmark_cfg),
@@ -1054,79 +886,61 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    jsonl_path = output_dir / (
-        f"benchmark_{args.num_qubits}q_{target_type}_{stamp}.jsonl"
-    )
-    png_path = jsonl_path.with_suffix(".png")
-    meta_path = jsonl_path.with_suffix(".meta.json")
-    summary_path = jsonl_path.with_suffix(".summary.json")
+    stem     = output_dir / f"benchmark_{args.num_qubits}q_{target_type}_{stamp}"
+    png_path = stem.with_suffix(".png")
+    csv_path = Path(str(stem) + ".pareto.csv")
+    log_path = stem.with_suffix(".log.txt")
 
-    if args.resume:
-        existing = sorted(output_dir.glob(
-            f"benchmark_{args.num_qubits}q_{target_type}_*.jsonl"
-        ))
-        if existing:
-            jsonl_path = existing[-1]
-            png_path = jsonl_path.with_suffix(".png")
-            meta_path = jsonl_path.with_suffix(".meta.json")
-            summary_path = jsonl_path.with_suffix(".summary.json")
-            print(f"Resuming into existing file: {jsonl_path}")
-
-    done = _completed_seeds(jsonl_path) if args.resume else set()
     all_seeds = [args.base_seed + i for i in range(args.num_circuits)]
-    pending = [s for s in all_seeds if s not in done]
-    plot_paths = _plot_paths(png_path)
 
-    print(f"Benchmark configuration:")
-    print(f"  Qubits:               {args.num_qubits}")
-    print(f"  Target type:          {target_type}  (from {args.config})")
+    logger = _FileLogger(log_path)
+
+    # ── metadata header ───────────────────────────────────────────────────
+    logger.log("=" * 70)
+    logger.log("BENCHMARK METADATA")
+    logger.log("=" * 70)
+    logger.log(f"Timestamp (UTC):      {datetime.utcnow().isoformat(timespec='seconds')}")
+    logger.log(f"Config:               {args.config}")
+    logger.log(f"Qubits:               {args.num_qubits}")
+    logger.log(f"Target type:          {target_type}")
     if target_type == "brickwork":
-        depth = benchmark_cfg.target.brickwork_depth or (2 * args.num_qubits)
-        print(f"  Brickwork depth:      {depth}")
-    print(f"  Max gate cap:         {benchmark_cfg.model.max_gates_count}")
-    print(f"  Fidelity thresholds:  {thresholds}")
-    print(f"  Total circuits:       {args.num_circuits}")
-    print(f"  Already completed:    {len(done)}")
-    print(f"  Pending:              {len(pending)}")
-    print(f"  Output JSONL:         {jsonl_path}")
-    print(f"  Output best-F PNG:    {plot_paths['best_fidelity']}")
-    print(f"  Output threshold PNG: {plot_paths['thresholds']}")
-    print(f"  Output Pareto PNG:    {plot_paths['pareto']}")
-    print(f"  Output meta:          {meta_path}")
-    print(f"  Output summary:       {summary_path}")
-    print()
+        bd = benchmark_cfg.target.brickwork_depth or (2 * args.num_qubits)
+        logger.log(f"Brickwork depth:      {bd}")
+    logger.log(f"Fidelity thresholds:  {thresholds}")
+    logger.log(f"Base seed:            {args.base_seed}")
+    logger.log(f"Total circuits:       {args.num_circuits}")
+    logger.log(f"Qiskit seed(s):       {_parse_int_list(args.qiskit_seeds, args.qiskit_seed)}")
+    logger.log("")
+    logger.log("Output files:")
+    logger.log(f"  Plot (PNG):         {png_path}")
+    logger.log(f"  Pareto CSV:         {csv_path}")
+    logger.log(f"  Log (this file):    {log_path}")
+    logger.log("=" * 70)
+    logger.log("")
 
-    _write_benchmark_metadata(
-        meta_path=meta_path,
-        args=args,
-        benchmark_cfg=benchmark_cfg,
-        all_seeds=all_seeds,
-        already_done=sorted(done),
-        jsonl_path=jsonl_path,
-        png_path=png_path,
-        summary_path=summary_path,
-        thresholds=thresholds,
-    )
-
+    # ── main training loop ────────────────────────────────────────────────
+    all_rows: list[dict] = []
+    all_pareto_rows: list[dict] = []
     durations: list[float] = []
-    for i, seed in enumerate(pending, start=1):
-        print(f"[{i}/{len(pending)}] seed={seed}", flush=True)
-        try:
-            row = _run_one(args, base_cfg, seed)
-        except Exception as e:
-            print(f"  FAILED: {e!r}")
-            continue
-        durations.append(row["elapsed_sec"])
 
-        with jsonl_path.open("a") as f:
-            f.write(json.dumps(row) + "\n")
+    for i, seed in enumerate(all_seeds, start=1):
+        logger.log(f"[{i}/{len(all_seeds)}] seed={seed}")
+        try:
+            row, pareto_rows = _run_one(args, base_cfg, seed)
+        except Exception as e:
+            logger.log(f"  FAILED: {e!r}")
+            continue
+
+        all_rows.append(row)
+        durations.append(row["elapsed_sec"])
+        all_pareto_rows.extend(pareto_rows)
 
         mean_dt = sum(durations) / len(durations)
-        remaining = len(pending) - i
+        remaining = len(all_seeds) - i
         eta_sec = int(mean_dt * remaining)
         eta_h, rem = divmod(eta_sec, 3600)
         eta_m = rem // 60
-        print(
+        logger.log(
             f"  done in {row['elapsed_sec']:.1f}s  |  "
             f"GQE F={row['gqe_F']:.4f} CX={row['gqe_cnot']} D={row['gqe_depth']} "
             f"({row['gqe_selection']})  |  "
@@ -1135,13 +949,21 @@ def main():
             f"ETA {eta_h:d}h{eta_m:02d}m"
         )
 
-    print(f"\nBenchmark complete. Wrote {len(pending)} new rows to {jsonl_path}.")
+    logger.log("")
+    logger.log(f"Benchmark complete. {len(all_rows)} circuits run.")
+
+    # ── write the three output files ──────────────────────────────────────
+    _write_pareto_csv(all_pareto_rows, csv_path)
 
     if not args.no_plot:
-        rows = _load_rows(jsonl_path)
-        _plot(rows, png_path, thresholds=thresholds)
-    rows = _load_rows(jsonl_path)
-    _write_summary(rows, thresholds, summary_path)
+        _plot_main(all_rows, png_path)
+
+    logger.log("")
+    logger.log("Outputs written:")
+    logger.log(f"  {png_path}")
+    logger.log(f"  {csv_path}")
+    logger.log(f"  {log_path}")
+    logger.close()
 
 
 if __name__ == "__main__":

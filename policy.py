@@ -2,8 +2,8 @@
 
 The model predicts one gate token and one angle distribution per sequence
 position. Angle likelihoods use a wrapped normal because circuit rotations are
-2*pi-periodic. STOP is a normal action after the first gate; once every row in
-the rollout batch has stopped, generation exits before reaching the safety cap.
+2*pi-periodic. STOP terminates a row after the first gate; PAD occupies the
+inactive suffix and is never sampled as an active action.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ _SIZES: dict[str, _ArchConfig] = {
 VALID_MODEL_SIZES = frozenset(_SIZES)
 _INIT_STDDEV = 0.02
 _LAYER_NORM_EPS = 1.0e-5
-_N_POSITIONS = 1024
+DEFAULT_CONTEXT_TOKENS = 1024
 _DROPOUT_RATE = 0.1
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
@@ -117,7 +117,7 @@ class HybridPolicy(nn.Module):
 
     size: str
     vocab_size: int
-    n_positions: int = _N_POSITIONS
+    n_positions: int = DEFAULT_CONTEXT_TOKENS
 
     @nn.compact
     def __call__(
@@ -201,10 +201,13 @@ def apply_discrete_action_masks(
     logits: jax.Array,
     bos_token_id: int,
     stop_token_id: int,
+    pad_token_id: int | None = None,
 ) -> jax.Array:
     """Mask token logits before applying the ``softmax(-beta * logits)`` policy."""
     pos_inf = jnp.asarray(jnp.inf, dtype=logits.dtype)
     logits = logits.at[..., bos_token_id].set(pos_inf)
+    if pad_token_id is not None:
+        logits = logits.at[..., pad_token_id].set(pos_inf)
     seq_len = logits.shape[-2]
     pos = jnp.arange(seq_len, dtype=jnp.int32)
     stop_bias = jnp.where(pos == 0, pos_inf, jnp.asarray(0.0, dtype=logits.dtype))
@@ -256,6 +259,7 @@ def build_rollout_fn(
     total_len: int,
     bos_token_id: int = 0,
     stop_token_id: int = 1,
+    pad_token_id: int = 2,
     use_target_conditioning: bool = False,
 ):
     """Build a JIT sampler that shares parameters with ``HybridPolicy``."""
@@ -333,17 +337,16 @@ def build_rollout_fn(
         v_cache = jnp.zeros_like(k_cache)
         init_token = jnp.full((batch_size,), bos_token_id, dtype=jnp.int32)
         init_stopped = jnp.zeros((batch_size,), dtype=bool)
-        toks = jnp.full((batch_size, n_steps), stop_token_id, dtype=jnp.int32)
+        toks = jnp.full((batch_size, n_steps), pad_token_id, dtype=jnp.int32)
         angles = jnp.zeros((batch_size, n_steps), dtype=dtype)
         log_p_d = jnp.zeros((batch_size, n_steps), dtype=dtype)
-        log_p_c = jnp.zeros((batch_size, n_steps), dtype=dtype)
 
         def cond_fun(carry):
-            step_idx, _k_c, _v_c, _prev_token, stopped, _rng, _t, _a, _lpd, _lpc = carry
+            step_idx, _k_c, _v_c, _prev_token, stopped, _rng, _t, _a, _lpd = carry
             return (step_idx < n_steps) & (~jnp.all(stopped))
 
         def body(carry):
-            step_idx, k_c, v_c, prev_token, stopped, rng, toks_c, angles_c, lpd_c, lpc_c = carry
+            step_idx, k_c, v_c, prev_token, stopped, rng, toks_c, angles_c, lpd_c = carry
             rng, k_disc, k_cont = jax.random.split(rng, 3)
             k_c, v_c, logits, mu, log_sigma = decode_step(
                 params,
@@ -355,6 +358,7 @@ def build_rollout_fn(
             )
             pos_inf = jnp.asarray(jnp.inf, dtype=logits.dtype)
             logits = logits.at[:, bos_token_id].set(pos_inf)
+            logits = logits.at[:, pad_token_id].set(pos_inf)
             stop_bias = jnp.where(
                 step_idx == 0, pos_inf, jnp.asarray(0.0, dtype=logits.dtype)
             )
@@ -362,25 +366,33 @@ def build_rollout_fn(
 
             scaled = -beta * logits
             sampled = jax.random.categorical(k_disc, scaled, axis=-1).astype(jnp.int32)
-            tok_next = jnp.where(stopped, stop_token_id, sampled)
+            tok_next = jnp.where(stopped, pad_token_id, sampled)
             new_stopped = stopped | (tok_next == stop_token_id)
 
             log_p_disc_all = jax.nn.log_softmax(scaled, axis=-1)
             log_p_disc = jnp.take_along_axis(
                 log_p_disc_all,
-                tok_next[:, None],
+                sampled[:, None],
                 axis=-1,
             ).squeeze(-1)
+            log_p_disc = jnp.where(
+                stopped,
+                jnp.asarray(0.0, dtype=log_p_disc.dtype),
+                log_p_disc,
+            )
 
             sigma = jnp.exp(log_sigma)
             noise = jax.random.normal(k_cont, shape=mu.shape, dtype=mu.dtype)
             angle_next = canonicalize_angle(mu + sigma * noise)
-            log_p_cont = periodic_gaussian_log_prob(angle_next, mu, log_sigma)
+            angle_next = jnp.where(
+                stopped,
+                jnp.asarray(0.0, dtype=angle_next.dtype),
+                angle_next,
+            )
 
             toks_c = toks_c.at[:, step_idx].set(tok_next)
             angles_c = angles_c.at[:, step_idx].set(angle_next)
             lpd_c = lpd_c.at[:, step_idx].set(log_p_disc)
-            lpc_c = lpc_c.at[:, step_idx].set(log_p_cont)
 
             return (
                 step_idx + 1,
@@ -392,7 +404,6 @@ def build_rollout_fn(
                 toks_c,
                 angles_c,
                 lpd_c,
-                lpc_c,
             )
 
         init_carry = (
@@ -405,9 +416,8 @@ def build_rollout_fn(
             toks,
             angles,
             log_p_d,
-            log_p_c,
         )
-        (_, _, _, _, _, _, toks, angles, log_p_d, log_p_c) = jax.lax.while_loop(
+        (_, _, _, _, _, _, toks, angles, log_p_d) = jax.lax.while_loop(
             cond_fun,
             body,
             init_carry,
@@ -419,7 +429,6 @@ def build_rollout_fn(
             "tokens": full_tokens,
             "angles": angles,
             "log_p_d": log_p_d,
-            "log_p_c": log_p_c,
         }
 
     return jax.jit(rollout)
@@ -435,6 +444,7 @@ def hybrid_log_probs(
     beta: jax.Array,
     bos_token_id: int,
     stop_token_id: int,
+    pad_token_id: int | None = None,
 ):
     """Recompute per-position action log-probs for a stored rollout batch."""
     seq_len = actions_disc.shape[1]
@@ -442,6 +452,7 @@ def hybrid_log_probs(
         discrete_logits[:, :seq_len, :],
         bos_token_id=bos_token_id,
         stop_token_id=stop_token_id,
+        pad_token_id=pad_token_id,
     )
     log_p_all = jax.nn.log_softmax(-beta * aligned_logits, axis=-1)
     log_p_disc = jnp.take_along_axis(
