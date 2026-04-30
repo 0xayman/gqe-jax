@@ -1,24 +1,9 @@
-"""Hybrid-action policy: GPT-2 backbone + discrete (token) and continuous
-(angle) heads, plus KV-cached rollout and log-probability evaluation.
+"""Target-conditioned hybrid policy and rollout-time sampling utilities.
 
-At each sequence position the policy emits:
-  - a discrete action: a vocab token id (BOS / STOP / one of the pool gates)
-  - a continuous action: a real-valued rotation angle (used iff the discrete
-    token denotes a parametric rotation, ignored otherwise — but always
-    sampled so the action shape stays regular)
-
-The continuous head shares the transformer backbone with the discrete head and
-predicts ``(mu, log_sigma)`` per position. The angle is sampled from
-``Normal(mu, exp(log_sigma))``. Sampling is unbounded — rotation angles are
-2π-periodic so there is no need to squash to a finite interval, and using a
-plain Gaussian keeps the log-prob exact (no Tanh-correction) and the
-PPO-importance ratio numerically stable.
-
-Vocabulary layout: ``[BOS=0, STOP=1, gate_2, ..., gate_{V-1}]``.
-
-  - BOS sits at position 0 of every sequence and is unsamplable elsewhere.
-  - STOP is unsamplable at the very first decision (so circuits have ≥ 1 gate)
-    and is forced to fill all positions after a sample's first STOP.
+The model predicts one gate token and one angle distribution per sequence
+position. Angle likelihoods use a wrapped normal because circuit rotations are
+2*pi-periodic. STOP is a normal action after the first gate; once every row in
+the rollout batch has stopped, generation exits before reaching the safety cap.
 """
 
 from __future__ import annotations
@@ -32,8 +17,6 @@ from flax import linen as nn
 
 import jax_setup  # noqa: F401
 
-# ── Architecture sizes ──────────────────────────────────────────────────────
-
 
 @dataclass(frozen=True)
 class _ArchConfig:
@@ -43,7 +26,6 @@ class _ArchConfig:
 
 
 _SIZES: dict[str, _ArchConfig] = {
-    # "tiny":   _ArchConfig(n_layer=2,  n_head=2,  n_embd=128),
     "tiny": _ArchConfig(n_layer=2, n_head=2, n_embd=384),
     "small": _ArchConfig(n_layer=6, n_head=6, n_embd=384),
     "medium": _ArchConfig(n_layer=12, n_head=12, n_embd=768),
@@ -55,8 +37,6 @@ _INIT_STDDEV = 0.02
 _LAYER_NORM_EPS = 1.0e-5
 _N_POSITIONS = 1024
 _DROPOUT_RATE = 0.1
-# Bounds on the continuous-head log-std. Lower bound prevents collapse to
-# delta-policy; upper bound prevents log-prob from blowing up early.
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 
@@ -68,9 +48,6 @@ def _gelu_new(x: jax.Array) -> jax.Array:
 
 def _init():
     return nn.initializers.normal(stddev=_INIT_STDDEV)
-
-
-# ── Transformer blocks ───────────────────────────────────────────────────────
 
 
 class _CausalSelfAttention(nn.Module):
@@ -136,20 +113,20 @@ class _Block(nn.Module):
 
 
 class HybridPolicy(nn.Module):
-    """GPT-2 with a discrete (token) and a continuous (angle) head.
-
-    Returns ``(discrete_logits, mu, log_sigma)``:
-      - ``discrete_logits``: ``(B, T, V)``  raw logits over the vocab.
-      - ``mu``:              ``(B, T)``     mean of the angle Gaussian.
-      - ``log_sigma``:       ``(B, T)``     log-std, clipped to a safe range.
-    """
+    """Causal transformer with tied token logits and wrapped-angle parameters."""
 
     size: str
     vocab_size: int
     n_positions: int = _N_POSITIONS
 
     @nn.compact
-    def __call__(self, input_ids, attention_mask=None, deterministic=False):
+    def __call__(
+        self,
+        input_ids,
+        attention_mask=None,
+        target_features=None,
+        deterministic=False,
+    ):
         if self.size not in _SIZES:
             raise ValueError(f"Unknown model size {self.size!r}")
         arch = _SIZES[self.size]
@@ -162,6 +139,13 @@ class HybridPolicy(nn.Module):
             self.n_positions, arch.n_embd, embedding_init=_init(), name="wpe"
         )
         x = wte(input_ids) + wpe(jnp.arange(T, dtype=jnp.int32)[None, :])
+        if target_features is not None:
+            target_cond = nn.Dense(
+                arch.n_embd,
+                kernel_init=_init(),
+                name="target_proj",
+            )(target_features)
+            x = x + target_cond[:, None, :]
         x = nn.Dropout(rate=_DROPOUT_RATE)(x, deterministic=deterministic)
 
         for i in range(arch.n_layer):
@@ -172,18 +156,14 @@ class HybridPolicy(nn.Module):
             )
 
         x = nn.LayerNorm(epsilon=_LAYER_NORM_EPS, name="ln_f")(x)
-        discrete_logits = wte.attend(x)  # tied weights
+        discrete_logits = wte.attend(x)
 
-        # Continuous head: small MLP -> (mu, log_sigma) per position.
         h = nn.Dense(arch.n_embd, kernel_init=_init(), name="cont_fc")(x)
         h = _gelu_new(h)
         params = nn.Dense(2, kernel_init=_init(), name="cont_out")(h)
         mu = params[..., 0]
         log_sigma = jnp.clip(params[..., 1], LOG_STD_MIN, LOG_STD_MAX)
         return discrete_logits, mu, log_sigma
-
-
-# ── Helpers shared by training-mode and rollout-mode evaluation ──────────────
 
 
 def gaussian_log_prob(
@@ -194,16 +174,35 @@ def gaussian_log_prob(
     return -0.5 * (jnp.log(2.0 * jnp.pi) + 2.0 * log_sigma + (value - mu) ** 2 / var)
 
 
+def canonicalize_angle(value: jax.Array) -> jax.Array:
+    """Map angles to the canonical interval [-pi, pi)."""
+    two_pi = jnp.asarray(2.0 * jnp.pi, dtype=value.dtype)
+    pi = jnp.asarray(jnp.pi, dtype=value.dtype)
+    return jnp.mod(value + pi, two_pi) - pi
+
+
+def periodic_gaussian_log_prob(
+    value: jax.Array,
+    mu: jax.Array,
+    log_sigma: jax.Array,
+    *,
+    wrap_radius: int = 2,
+) -> jax.Array:
+    """Wrapped-normal log-probability for 2*pi-periodic angle actions."""
+    value = canonicalize_angle(value)
+    offsets = jnp.arange(
+        -wrap_radius, wrap_radius + 1, dtype=value.dtype,
+    ) * jnp.asarray(2.0 * jnp.pi, dtype=value.dtype)
+    terms = gaussian_log_prob(value[..., None] + offsets, mu[..., None], log_sigma[..., None])
+    return jax.nn.logsumexp(terms, axis=-1)
+
+
 def apply_discrete_action_masks(
     logits: jax.Array,
     bos_token_id: int,
     stop_token_id: int,
 ) -> jax.Array:
-    """Make BOS unsamplable everywhere; STOP unsamplable at position 0.
-
-    Sampling uses ``softmax(-beta * logits)``, so a logit of ``+inf`` becomes
-    ``-inf`` after the sign flip and is fully suppressed.
-    """
+    """Mask token logits before applying the ``softmax(-beta * logits)`` policy."""
     pos_inf = jnp.asarray(jnp.inf, dtype=logits.dtype)
     logits = logits.at[..., bos_token_id].set(pos_inf)
     seq_len = logits.shape[-2]
@@ -218,7 +217,7 @@ def reduce_sequence_log_probs(
     token_log_probs: jax.Array,
     lengths: jax.Array,
 ) -> jax.Array:
-    """Length-normalised mean of per-token log-probs (zero-mass beyond length)."""
+    """Average per-token log-probs up to each row's STOP-derived length."""
     if token_log_probs.ndim <= 1:
         return token_log_probs
     max_len = token_log_probs.shape[-1]
@@ -240,15 +239,6 @@ def compute_lengths_from_tokens(token_ids: jax.Array, stop_token_id: int) -> jax
     return jnp.minimum(first_stop + 1, n).astype(jnp.int32)
 
 
-# ── KV-cache rollout ─────────────────────────────────────────────────────────
-#
-# The training-mode forward (``HybridPolicy.__call__``) processes the full
-# sequence in one pass — fine for loss evaluation, O(N^2) for generation. For
-# rollout we want O(N) by caching per-layer (K, V). We read weights directly
-# from the Flax params dict; layout matches ``HybridPolicy`` (and
-# ``model.GPT2`` historically).
-
-
 def _layernorm(x, scale, bias):
     mean = x.mean(axis=-1, keepdims=True)
     var = x.var(axis=-1, keepdims=True)
@@ -266,30 +256,23 @@ def build_rollout_fn(
     total_len: int,
     bos_token_id: int = 0,
     stop_token_id: int = 1,
+    use_target_conditioning: bool = False,
 ):
-    """Return a JIT'd rollout function for the hybrid policy.
-
-    The returned callable has signature ``(params, rng_key, beta) -> dict`` with
-    keys:
-        ``tokens``    (B, total_len)              — int32, BOS at position 0,
-                                                    STOP padding after first STOP
-        ``angles``    (B, max_gates=total_len-1)  — float, sampled angles per step
-        ``log_p_d``   (B, max_gates)              — discrete per-step log-prob
-        ``log_p_c``   (B, max_gates)              — continuous per-step log-prob
-
-    ``beta`` is the discrete inverse-temperature; the continuous head is
-    sampled from its native ``Normal(mu, exp(log_sigma))`` regardless.
-    """
+    """Build a JIT sampler that shares parameters with ``HybridPolicy``."""
     head_dim = n_embd // n_head
     assert head_dim * n_head == n_embd
-    n_steps = total_len - 1  # tokens after BOS
+    n_steps = total_len - 1
 
-    def decode_step(params, k_cache, v_cache, prev_token, step_idx):
+    def decode_step(params, k_cache, v_cache, prev_token, step_idx, target_features):
         wte = params["wte"]["embedding"]
         wpe = params["wpe"]["embedding"]
-        x = (wte[prev_token] + wpe[step_idx])[:, None, :]  # (B, 1, D)
+        x = (wte[prev_token] + wpe[step_idx])[:, None, :]
+        if use_target_conditioning:
+            tp = params["target_proj"]
+            target_cond = target_features @ tp["kernel"] + tp["bias"]
+            x = x + target_cond[:, None, :]
         positions = jnp.arange(total_len, dtype=jnp.int32)
-        key_mask = positions <= step_idx  # (T,)
+        key_mask = positions <= step_idx
 
         for i in range(n_layer):
             block = params[f"h_{i}"]
@@ -331,20 +314,18 @@ def build_rollout_fn(
 
         x = _layernorm(x, params["ln_f"]["scale"], params["ln_f"]["bias"])
 
-        # Discrete head (tied with wte).
-        discrete_logits = (x @ wte.T)[:, 0, :]  # (B, V)
+        discrete_logits = (x @ wte.T)[:, 0, :]
 
-        # Continuous head: 2-layer MLP -> (mu, log_sigma).
         cont_fc = params["cont_fc"]
         cont_out = params["cont_out"]
         h = x @ cont_fc["kernel"] + cont_fc["bias"]
         h = _gelu_new(h)
-        h = h @ cont_out["kernel"] + cont_out["bias"]  # (B, 1, 2)
+        h = h @ cont_out["kernel"] + cont_out["bias"]
         mu = h[:, 0, 0]
         log_sigma = jnp.clip(h[:, 0, 1], LOG_STD_MIN, LOG_STD_MAX)
         return k_cache, v_cache, discrete_logits, mu, log_sigma
 
-    def rollout(params, rng_key, beta):
+    def rollout(params, rng_key, beta, target_features=None):
         dtype = params["wte"]["embedding"].dtype
         k_cache = jnp.zeros(
             (n_layer, batch_size, n_head, total_len, head_dim), dtype=dtype
@@ -352,9 +333,17 @@ def build_rollout_fn(
         v_cache = jnp.zeros_like(k_cache)
         init_token = jnp.full((batch_size,), bos_token_id, dtype=jnp.int32)
         init_stopped = jnp.zeros((batch_size,), dtype=bool)
+        toks = jnp.full((batch_size, n_steps), stop_token_id, dtype=jnp.int32)
+        angles = jnp.zeros((batch_size, n_steps), dtype=dtype)
+        log_p_d = jnp.zeros((batch_size, n_steps), dtype=dtype)
+        log_p_c = jnp.zeros((batch_size, n_steps), dtype=dtype)
 
-        def body(carry, step_idx):
-            k_c, v_c, prev_token, stopped, rng = carry
+        def cond_fun(carry):
+            step_idx, _k_c, _v_c, _prev_token, stopped, _rng, _t, _a, _lpd, _lpc = carry
+            return (step_idx < n_steps) & (~jnp.all(stopped))
+
+        def body(carry):
+            step_idx, k_c, v_c, prev_token, stopped, rng, toks_c, angles_c, lpd_c, lpc_c = carry
             rng, k_disc, k_cont = jax.random.split(rng, 3)
             k_c, v_c, logits, mu, log_sigma = decode_step(
                 params,
@@ -362,9 +351,8 @@ def build_rollout_fn(
                 v_c,
                 prev_token,
                 step_idx,
+                target_features,
             )
-            # Mask BOS and (at first step) STOP. Convention: sampling uses
-            # softmax(-beta * logits), so +inf suppresses.
             pos_inf = jnp.asarray(jnp.inf, dtype=logits.dtype)
             logits = logits.at[:, bos_token_id].set(pos_inf)
             stop_bias = jnp.where(
@@ -372,13 +360,11 @@ def build_rollout_fn(
             )
             logits = logits.at[:, stop_token_id].add(stop_bias)
 
-            # Discrete sample under temperature ``beta``: p ∝ softmax(-beta * logits).
             scaled = -beta * logits
             sampled = jax.random.categorical(k_disc, scaled, axis=-1).astype(jnp.int32)
             tok_next = jnp.where(stopped, stop_token_id, sampled)
             new_stopped = stopped | (tok_next == stop_token_id)
 
-            # Discrete log-prob under the same scaled distribution.
             log_p_disc_all = jax.nn.log_softmax(scaled, axis=-1)
             log_p_disc = jnp.take_along_axis(
                 log_p_disc_all,
@@ -386,29 +372,46 @@ def build_rollout_fn(
                 axis=-1,
             ).squeeze(-1)
 
-            # Continuous sample from N(mu, exp(log_sigma)).
             sigma = jnp.exp(log_sigma)
             noise = jax.random.normal(k_cont, shape=mu.shape, dtype=mu.dtype)
-            angle_next = mu + sigma * noise
-            log_p_cont = gaussian_log_prob(angle_next, mu, log_sigma)
+            angle_next = canonicalize_angle(mu + sigma * noise)
+            log_p_cont = periodic_gaussian_log_prob(angle_next, mu, log_sigma)
 
-            return (k_c, v_c, tok_next, new_stopped, rng), (
+            toks_c = toks_c.at[:, step_idx].set(tok_next)
+            angles_c = angles_c.at[:, step_idx].set(angle_next)
+            lpd_c = lpd_c.at[:, step_idx].set(log_p_disc)
+            lpc_c = lpc_c.at[:, step_idx].set(log_p_cont)
+
+            return (
+                step_idx + 1,
+                k_c,
+                v_c,
                 tok_next,
-                angle_next,
-                log_p_disc,
-                log_p_cont,
+                new_stopped,
+                rng,
+                toks_c,
+                angles_c,
+                lpd_c,
+                lpc_c,
             )
 
-        (_, _, _, _, _), (toks, angles, log_p_d, log_p_c) = jax.lax.scan(
-            body,
-            (k_cache, v_cache, init_token, init_stopped, rng_key),
-            jnp.arange(n_steps, dtype=jnp.int32),
+        init_carry = (
+            jnp.asarray(0, dtype=jnp.int32),
+            k_cache,
+            v_cache,
+            init_token,
+            init_stopped,
+            rng_key,
+            toks,
+            angles,
+            log_p_d,
+            log_p_c,
         )
-        # scan stacks along leading axis -> transpose to (B, T).
-        toks = toks.T
-        angles = angles.T
-        log_p_d = log_p_d.T
-        log_p_c = log_p_c.T
+        (_, _, _, _, _, _, toks, angles, log_p_d, log_p_c) = jax.lax.while_loop(
+            cond_fun,
+            body,
+            init_carry,
+        )
 
         bos_col = jnp.full((batch_size, 1), bos_token_id, dtype=jnp.int32)
         full_tokens = jnp.concatenate([bos_col, toks], axis=1)
@@ -422,12 +425,6 @@ def build_rollout_fn(
     return jax.jit(rollout)
 
 
-# ── Training-mode log-prob recomputation ─────────────────────────────────────
-#
-# Given a stored (tokens, angles) batch, recompute the *current* policy's
-# discrete + continuous per-token log-probs. Used by the PPO loss.
-
-
 def hybrid_log_probs(
     discrete_logits: jax.Array,
     mu: jax.Array,
@@ -439,11 +436,7 @@ def hybrid_log_probs(
     bos_token_id: int,
     stop_token_id: int,
 ):
-    """Per-position discrete + continuous log-probs for the recorded actions.
-
-    Inputs are aligned to the *output* positions (i.e. excluding the BOS prefix).
-    Returns ``(log_p_disc, log_p_cont)`` each with shape ``(B, max_gates)``.
-    """
+    """Recompute per-position action log-probs for a stored rollout batch."""
     seq_len = actions_disc.shape[1]
     aligned_logits = apply_discrete_action_masks(
         discrete_logits[:, :seq_len, :],
@@ -459,5 +452,5 @@ def hybrid_log_probs(
 
     mu_a = mu[:, :seq_len]
     log_sigma_a = log_sigma[:, :seq_len]
-    log_p_cont = gaussian_log_prob(actions_cont, mu_a, log_sigma_a)
+    log_p_cont = periodic_gaussian_log_prob(actions_cont, mu_a, log_sigma_a)
     return log_p_disc, log_p_cont

@@ -11,15 +11,8 @@
 
 set -euo pipefail
 
-# ── VM coordinates (matches: gcloud compute ssh --zone "us-central1-f" \
-#    "instance-20260429-120033" --project "aymantarig-project") ──────────────
-PROJECT_ID="aymantarig-project"
-ZONE="us-central1-f"
-INSTANCE="instance-20260429-120033"
-VM_USER="aymantarig_aims_ac_za"
-REMOTE_DIR="~/work/gqe-torch"
-
-LOCAL_PROJECT_DIR="$HOME/Downloads/Quantum/project/gqe-torch"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/vm_instance_config.sh"
 
 DELETE_FLAG=""
 for arg in "$@"; do

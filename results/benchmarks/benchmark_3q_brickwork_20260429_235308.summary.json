@@ -1,0 +1,87 @@
+{
+  "num_rows": 50,
+  "gqe_fidelity": {
+    "mean": 0.9999282836914063,
+    "median": 0.9999991655349731,
+    "min": 0.9987591505050659
+  },
+  "qiskit_fidelity": {
+    "mean": 1.0,
+    "median": 1.0,
+    "min": 0.9999999999999987
+  },
+  "thresholds": {
+    "0p99": {
+      "threshold": 0.99,
+      "success_count": 50,
+      "success_rate": 1.0,
+      "success_rate_ci95": [
+        0.9286524008666414,
+        1.0
+      ],
+      "paired_count": 50,
+      "median_cnot_delta_gqe_minus_qiskit": -2.0,
+      "median_cnot_delta_ci95": [
+        -2.5,
+        -1.5
+      ],
+      "wilcoxon_cnot_delta_pvalue": 1.41414059473465e-08,
+      "median_depth_delta_gqe_minus_qiskit": -18.5,
+      "median_depth_delta_ci95": [
+        -20.0,
+        -18.0
+      ],
+      "wilcoxon_depth_delta_pvalue": 7.075734588130395e-10,
+      "fraction_cnot_no_worse_than_qiskit": 0.96,
+      "fraction_depth_no_worse_than_qiskit": 1.0
+    },
+    "0p999": {
+      "threshold": 0.999,
+      "success_count": 49,
+      "success_rate": 0.98,
+      "success_rate_ci95": [
+        0.8950455641036219,
+        0.9964607407283539
+      ],
+      "paired_count": 49,
+      "median_cnot_delta_gqe_minus_qiskit": 0.0,
+      "median_cnot_delta_ci95": [
+        0.0,
+        0.024999999999863576
+      ],
+      "wilcoxon_cnot_delta_pvalue": 0.18074909791848182,
+      "median_depth_delta_gqe_minus_qiskit": -13.0,
+      "median_depth_delta_ci95": [
+        -14.0,
+        -12.0
+      ],
+      "wilcoxon_depth_delta_pvalue": 9.614567313964112e-10,
+      "fraction_cnot_no_worse_than_qiskit": 0.6326530612244898,
+      "fraction_depth_no_worse_than_qiskit": 1.0
+    },
+    "0p9999": {
+      "threshold": 0.9999,
+      "success_count": 42,
+      "success_rate": 0.84,
+      "success_rate_ci95": [
+        0.7148578393696501,
+        0.916625793219666
+      ],
+      "paired_count": 42,
+      "median_cnot_delta_gqe_minus_qiskit": 2.0,
+      "median_cnot_delta_ci95": [
+        2.0,
+        2.5
+      ],
+      "wilcoxon_cnot_delta_pvalue": 4.576976231268142e-07,
+      "median_depth_delta_gqe_minus_qiskit": -10.0,
+      "median_depth_delta_ci95": [
+        -10.5,
+        -9.0
+      ],
+      "wilcoxon_depth_delta_pvalue": 2.3932909684678206e-08,
+      "fraction_cnot_no_worse_than_qiskit": 0.16666666666666666,
+      "fraction_depth_no_worse_than_qiskit": 0.9523809523809523
+    }
+  }
+}

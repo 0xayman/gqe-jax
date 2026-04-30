@@ -1,4 +1,4 @@
-"""Process-fidelity cost functions for quantum unitary compilation."""
+"""Small process-fidelity utilities shared by reporting and utility paths."""
 
 from __future__ import annotations
 
@@ -40,19 +40,12 @@ def build_cost_fn(u_target: np.ndarray) -> Callable[[List[np.ndarray]], float]:
 
 def process_fidelity_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array:
     d = u_target.shape[0]
-    # trace(A^H B) == sum_ij conj(A_ij) B_ij — O(d^2) vs the O(d^3) matmul-then-trace.
     trace = jnp.sum(jnp.conjugate(u_target) * u_circuit)
     return jnp.clip((jnp.abs(trace) ** 2) / (d**2), 0.0, 1.0)
 
 
 def linear_trace_cost_jax(u_target: jax.Array, u_circuit: jax.Array) -> jax.Array:
-    """``1 − |Tr(U_target^H U_circ)| / d`` — paper-faithful refinement loss.
-
-    Compared with ``1 − F = 1 − |Tr|² / d²``, this cost is linear in the trace
-    deviation rather than quadratic, so its gradient does not flatten as the
-    circuit approaches the target. That stronger late-stage signal is what
-    drives the final 10⁻³ → 10⁻⁸ infidelity range in arXiv:2601.03123.
-    """
+    """Linear trace-distance surrogate used for angle refinement."""
     d = u_target.shape[0]
     trace = jnp.sum(jnp.conjugate(u_target) * u_circuit)
     return 1.0 - jnp.abs(trace) / d

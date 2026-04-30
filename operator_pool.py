@@ -4,9 +4,6 @@ from typing import Iterable, List, Tuple
 import numpy as np
 from qiskit.circuit.library import CXGate, RXGate, RYGate, RZGate, SXGate
 
-# Placeholder angle stored in pool matrices for rotation gates.
-# Only used for the pure-discrete evaluation path (continuous_opt disabled).
-# Adam initialises from this value when continuous_opt is enabled.
 _DEFAULT_ANGLE = np.pi / 4
 
 
@@ -37,10 +34,7 @@ def _embed_single_qubit(
     qubit: int,
     num_qubits: int,
 ) -> np.ndarray:
-    """Embed a 2×2 gate into the full n-qubit Hilbert space via Kronecker product.
-
-    Qiskit convention: qubit 0 is the most significant bit (leftmost).
-    """
+    """Embed a one-qubit gate using the project's MSB-first qubit convention."""
     factors = [
         gate_2x2 if q == qubit else np.eye(2, dtype=np.complex128)
         for q in range(num_qubits)
@@ -57,11 +51,7 @@ def _embed_two_qubit(
     target: int,
     num_qubits: int,
 ) -> np.ndarray:
-    """Embed a 4×4 two-qubit gate into the full n-qubit Hilbert space.
-
-    Handles non-adjacent qubits correctly for num_qubits > 2.
-    Qiskit convention: qubit 0 is the most significant bit.
-    """
+    """Embed a two-qubit gate for arbitrary ordered control and target qubits."""
     d = 2**num_qubits
     full = np.zeros((d, d), dtype=np.complex128)
 
@@ -114,23 +104,12 @@ def build_operator_pool(
     num_qubits: int,
     rotation_gates: Iterable[str] | None = None,
 ) -> List[Tuple[str, np.ndarray]]:
-    """Build the compilation operator pool.
+    """Return the gate-token vocabulary and reference matrices.
 
-    Each rotation gate type (RX/RY/RZ) appears once per qubit. The stored
-    matrix uses _DEFAULT_ANGLE as a placeholder; when continuous optimization
-    is enabled, Adam will find the optimal angle during training.
-
-    Returns a list of (name, matrix) tuples ordered as:
-      1. Configured rotation gates for each qubit (one token per axis/qubit)
-      2. SX for each qubit
-      3. CNOT for each ordered (control, target) qubit pair
-
-    Args:
-        num_qubits: Number of qubits in the system (determines matrix dimension 2^n).
-        rotation_gates: Rotation gates to include in the pool, e.g. ("rz", "ry").
-
-    Returns:
-        List of (name, 2^n × 2^n complex128 unitary matrix) tuples.
+    The trainer uses token names for circuit evaluation. The matrices remain
+    useful for target construction and Qiskit-facing utilities; rotation
+    matrices use a fixed placeholder angle because sampled angles live in the
+    policy output, not in the pool.
     """
     rotation_axes = _normalize_rotation_axes(rotation_gates)
     pool: List[Tuple[str, np.ndarray]] = []

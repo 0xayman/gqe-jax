@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-PROJECT_ID="aymantarig-project"
-ZONE="us-central1-f"
-INSTANCE="instance-20260429-120033"
-VM_USER="aymantarig_aims_ac_za"
-
-LOCAL_PROJECT_DIR="$HOME/Downloads/Quantum/project/gqe-torch"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/vm_instance_config.sh"
 
 echo "Configuring SSH..."
 gcloud compute config-ssh --project "$PROJECT_ID"
@@ -25,7 +21,7 @@ rsync -avz --delete \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
   --exclude='.git' \
-  ./ "$VM_USER@$INSTANCE.$ZONE.$PROJECT_ID:~/work/gqe-torch/"
+  ./ "$VM_USER@$INSTANCE.$ZONE.$PROJECT_ID:$REMOTE_DIR/"
 
 echo "Setting up VM environment..."
 gcloud compute ssh --zone "$ZONE" "$INSTANCE" --project "$PROJECT_ID" -- '

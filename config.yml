@@ -1,8 +1,4 @@
-# config.yml — Hybrid-Action GQE Quantum Compilation
-#
-# RL-only training: the policy emits both gate tokens AND initial angles each
-# step. Fidelity is evaluated directly from sampled angles — no GD inner loop.
-# After training, the Pareto archive is refined with a few Adam steps.
+# Default single-target GQE experiment configuration.
 
 target:
   num_qubits: 3
@@ -13,18 +9,12 @@ pool:
   rotation_gates: ["rz", "ry"] # any subset of rz | rx | ry; ordering preserved
 
 model:
-  # Tiny is calibrated for 2-3q (≤ ~150 tokens) — appropriate for n=3 Haar.
   size: "tiny" # tiny | small | medium | large
-  # Leave `max_gates_count` unset → falls back to the per-n heuristic in
-  # config.default_max_gates_count (1.5× a Qiskit-style 5·CNOT_lb estimate,
-  # floored at 32, capped at 1023). Approximate values:
-  #   n=2 → 32   n=3 → 105   n=4 → 458
-  # Override here only when you need a tighter / looser budget for a
-  # specific target.
+  # Safety cap only; rollout stops early when all samples emit STOP.
   # max_gates_count: 105
 
 training:
-  max_epochs: 200 # tight budget — 3q converges fast, this is enough for ~F=0.99+
+  max_epochs: 200
   num_samples: 1024 # circuits sampled per epoch
   batch_size: 256 # gradient-step batch size
   lr: 1.0e-4
@@ -36,12 +26,7 @@ training:
 policy:
   entropy_disc: 0.005 # categorical-entropy regularisation weight
   entropy_cont: 0.005 # Gaussian-entropy regularisation weight
-  # HyRLQAS-style inner refinement: each rollout sample's angles get this many
-  # Adam steps initialised at the RL-suggested angles. The reward then
-  # reflects the post-refinement fidelity, so the policy learns to suggest
-  # *initial* angles that converge fast rather than the optimum directly.
-  # Set to 0 for pure RL (no inner loop). With a tiny model 12-16 helps
-  # compensate for limited capacity; 5-10 is enough for small/medium models.
+  # Optional Adam refinement applied before scoring each rollout sample.
   inner_refine_steps: 12
   inner_refine_lr: 0.1
 
@@ -62,72 +47,40 @@ logging:
 
 refinement:
   enabled: true
-  # n=3 Haar reaches cost ≈ 1e-3 around step ~150 and 1e-8 around ~800-1500
-  # (smaller system, faster convergence than 4q). With early-stop in place
-  # the budget is safe — bad skeletons bail out on the plateau.
   steps: 1000
   lr: 0.1
-  # With adaptive_restarts on (paper: good skeletons converge first try),
-  # 4 is enough for n=3 — only 3 random restarts fire on rows still below
-  # restart_fidelity_threshold after the RL-init run.
   num_restarts: 4
   apply_simplify: true # simplify each archive circuit before re-optim
-  # ── Paper-derived knobs (arXiv:2601.03123) ─────────────────────────────
-  # Linear-trace loss (1−|Tr|/d) instead of HS infidelity (1−|Tr|²/d²): the
-  # quadratic form flattens near the optimum and stalls the last 1e-3→1e-8
-  # window; linear keeps gradient magnitude constant.
   use_linear_trace_loss: true
-  # Early-stop: bail out of Adam when no relative improvement ≥ rel_tol for
-  # `patience` consecutive steps. Critical because underparameterised
-  # skeletons plateau forever near 1e-3 and waste the full step budget.
   early_stop_patience: 50
   early_stop_rel_tol: 1.0e-6
-  # Skip random restarts on rows already past the threshold.
   adaptive_restarts: true
   restart_fidelity_threshold: 0.999
-  # Closed-form per-parameter sweep polish (DMRG-style atan2 update, Sec
-  # 3.2.1). Two passes are usually enough to drive the residual infidelity
-  # to floating-point floor on adequately parameterised circuits.
   sweep_passes: 2
-  # Fixed-point iteration of the structural simplifier — captures cascade
-  # merges that a single forward scan misses.
   simplify_max_passes: 3
 
 reward:
   enabled: true
-  # QASER reward: base = w_d * M_D/(D+1) + w_c * M_C/(C+1) + w_g * M_G/(G+1)
-  #               R    = base ** F - 1
-  #               (M_*: running maxima; F as exponent → structure savings count near F=1)
-  # Leave the qaser_init_max_* values at 0 to auto-init the running maxima
-  # from the first rollout's observed worst case.
+  # Fidelity-first reward; structure penalties activate above the threshold.
+  mode: "lexicographic" # lexicographic | qaser
+  lex_fidelity_weight: 1.0
+  lex_infidelity_eps: 1.0e-8
+  lex_cnot_weight: 0.01
+  lex_depth_weight: 0.001
+  lex_total_gate_weight: 0.001
+  lex_structure_fidelity_threshold: 0.99
+  lex_no_stop_penalty: 1.0
+  # QASER-mode parameters are ignored unless reward.mode is "qaser".
   qaser_init_max_depth: 0.0
   qaser_init_max_cnot: 0.0
   qaser_init_max_gates: 0.0
-  # Per-axis weights for the tiny model's limited topological capacity.
-  # For n=3 the optimal CNOT lower bound is ~14 (Shende-Markov-Bullock) and
-  # the agent can search this space well with the tiny model. w_c=2.0
-  # encourages compactness without locking onto the first valid layout.
   qaser_w_depth: 1.0
   qaser_w_cnot: 2.0
   qaser_w_gates: 1.5
-  # Log-infidelity multiplier: R *= (1 - log(1 - F + eps)).
-  # Set 0 for the paper-faithful QASER form. Setting eps > 0 (1e-3 typical)
-  # gives an unbounded marginal pull as F → 1, escaping the F ≈ 0.98 plateau
-  # observed on harder targets where pure base^F flattens out. Doesn't change
-  # behaviour at low/mid F (multiplier ≈ 1 there).
   qaser_log_infidelity_eps: 1.0e-3
-  # fidelity_floor must be reachable during training, otherwise the Pareto
-  # archive stays empty and the post-training Adam refinement has nothing
-  # to polish. Setting it too low (e.g. 0.0) floods the front with trivially
-  # short low-fidelity circuits (a depth-1 F=0.08 circuit is "non-dominated
-  # on compactness"). 0.5 keeps the Pareto useful while staying reachable.
+  # Archive admission floor; lower values keep more exploratory circuits.
   fidelity_floor: 0.5
   max_archive_size: 500
-  fidelity_threshold: 0.99 # "best by CNOT/depth at F >= threshold" reporting
-  # CNOT-pair-repetition admission filter (arXiv:2601.03123 Sec 4.1).
-  # K_3 has only 3 distinct edges and no 1-factorisation (odd-vertex
-  # complete graph), so the paper's "rapid mixing via 1-factorisation"
-  # argument doesn't apply cleanly at n=3 — disabling the filter avoids
-  # over-rejecting otherwise-valid layouts. Re-enable for n>=4.
+  fidelity_threshold: 0.99
   pair_repeat_window: 0
   pair_repeat_max: 1

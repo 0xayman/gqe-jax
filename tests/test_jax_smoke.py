@@ -98,14 +98,12 @@ def _build_trainer(*, pareto_enabled: bool = False) -> tuple[Trainer, list]:
 
 
 def dataclasses_replace_policy(cfg: GQEConfig, **kwargs) -> GQEConfig:
-    """Frozen-dataclass helper: return ``cfg`` with ``policy`` fields overridden."""
+    """Return ``cfg`` with selected policy fields replaced."""
     import dataclasses
     return dataclasses.replace(
         cfg, policy=dataclasses.replace(cfg.policy, **kwargs),
     )
 
-
-# ── End-to-end smoke tests ──────────────────────────────────────────────────
 
 def test_gqe_smoke_no_pareto():
     cfg = _tiny_cfg(pareto_enabled=False)
@@ -127,21 +125,12 @@ def test_gqe_smoke_with_pareto_and_refinement():
 
     result = gqe(cfg, u_target, pool, logger=None)
 
-    # With reward enabled, cost = -reward = -(F - lambda * structure / L_max),
-    # so it can be negative if fidelity outweighs the structural penalty.
     assert np.isfinite(result.best_cost)
     assert result.pareto_archive is not None
 
 
-# ── Circuit / fidelity ──────────────────────────────────────────────────────
-
 def test_circuit_evaluator_recovers_self_built_target():
-    """Build a target with the evaluator itself, then verify F == 1.
-
-    The evaluator and Qiskit-reconstruction path agree on conventions; the
-    operator_pool stored matrices use a different (LSB-first) convention and
-    are not used in the new training pipeline.
-    """
+    """Verify that a unitary built by the evaluator is scored as exact."""
     import jax.numpy as jnp
 
     num_qubits = 2
@@ -149,8 +138,6 @@ def test_circuit_evaluator_recovers_self_built_target():
     pool_token_names = ["<BOS>", "<STOP>", *[name for name, _ in pool]]
     name_to_id = {n: i for i, n in enumerate(pool_token_names)}
 
-    # Use the evaluator with an identity target just to access the unitary
-    # builder; then re-instantiate with that built unitary as the actual target.
     seed_evaluator = CircuitEvaluator(
         u_target=np.eye(2 ** num_qubits, dtype=np.complex128),
         num_qubits=num_qubits, pool_token_names=pool_token_names, max_gates=8,
@@ -208,8 +195,6 @@ def test_parametric_mask_marks_only_rotations():
     assert mask.tolist() == [False, True, False, False, False]
 
 
-# ── Gaussian helpers ────────────────────────────────────────────────────────
-
 def test_gaussian_log_prob_matches_scipy():
     from math import sqrt, log, pi
     mu = jnp.asarray([0.0, 1.0])
@@ -222,17 +207,12 @@ def test_gaussian_log_prob_matches_scipy():
     np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
 
 
-# ── Loss helpers ────────────────────────────────────────────────────────────
-
 def test_joint_sequence_log_prob_masks_padding_and_non_parametric():
     log_p_d = jnp.asarray([[-0.5, -1.0, -2.0, -2.0]], dtype=jnp.float32)
     log_p_c = jnp.asarray([[-0.1, -0.2, -10.0, -10.0]], dtype=jnp.float32)
     lengths = jnp.asarray([2], dtype=jnp.int32)
     parametric = jnp.asarray([[True, False, True, True]], dtype=bool)
     score = joint_sequence_log_prob(log_p_d, log_p_c, lengths, parametric)
-    # Position 0: log_p_d + log_p_c (parametric, valid)
-    # Position 1: log_p_d (non-parametric, valid)
-    # Positions 2-3: ignored (beyond length).
     expected = (-0.5 + -0.1 + -1.0) / 2
     np.testing.assert_allclose(np.asarray(score), [expected], rtol=1e-6, atol=1e-6)
 
@@ -257,18 +237,13 @@ def test_reduce_per_token_mean_over_valid_positions():
     np.testing.assert_allclose(float(reduce_per_token(per_tok, mask)[0]), 1.5, atol=1e-6)
 
 
-# ── Policy / rollout ────────────────────────────────────────────────────────
-
 def test_apply_discrete_action_masks_blocks_bos_and_first_stop():
-    """Sampling uses softmax(-beta * logits): +inf in a slot suppresses it."""
+    """BOS is never sampled and STOP is blocked for the first action."""
     logits = jnp.zeros((1, 3, 4), dtype=jnp.float32)
     masked = apply_discrete_action_masks(logits, bos_token_id=0, stop_token_id=1)
     arr = np.asarray(masked)
-    # BOS at every position should be +inf (suppressed under softmax(-beta * x)).
     assert np.isposinf(arr[0, :, 0]).all()
-    # STOP at position 0 should be +inf (suppressed at first decision).
     assert np.isposinf(arr[0, 0, 1])
-    # STOP at later positions should be unaffected.
     assert arr[0, 1, 1] == 0.0
     assert arr[0, 2, 1] == 0.0
 
@@ -311,8 +286,6 @@ def test_trainer_train_epoch_changes_params():
     )
 
 
-# ── Schedulers ──────────────────────────────────────────────────────────────
-
 def test_fixed_scheduler_is_constant():
     s = FixedScheduler(0.5)
     s.update(costs=np.asarray([0.1, 0.2], dtype=np.float32))
@@ -325,8 +298,6 @@ def test_linear_scheduler_clamps_to_max():
     s.update()
     assert s.get_inverse_temperature() == 0.8
 
-
-# ── Reward ──────────────────────────────────────────────────────────────────
 
 def test_reward_prefers_higher_fidelity_at_same_structure():
     trainer, _ = _build_trainer(pareto_enabled=True)
@@ -349,13 +320,12 @@ def test_reward_prefers_better_structure_at_same_fidelity():
 
 
 def test_qaser_log_infidelity_strengthens_high_fidelity_gradient():
-    """With qaser_log_infidelity_eps > 0, the marginal reward at high F is
-    much larger than with the paper-faithful (eps=0) form.
-    """
+    """QASER log-infidelity mode increases pressure near perfect fidelity."""
     import dataclasses
     cfg = _tiny_cfg(pareto_enabled=True)
     cfg = dataclasses.replace(
         cfg, reward=dataclasses.replace(cfg.reward,
+                                        mode="qaser",
                                         qaser_init_max_depth=20,
                                         qaser_init_max_cnot=10,
                                         qaser_init_max_gates=40),
@@ -363,7 +333,6 @@ def test_qaser_log_infidelity_strengthens_high_fidelity_gradient():
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
 
-    # Paper-faithful (eps=0): cost gap between F=0.99 and F=0.999 is small.
     cfg_off = dataclasses.replace(
         cfg, reward=dataclasses.replace(cfg.reward, qaser_log_infidelity_eps=0.0),
     )
@@ -376,7 +345,6 @@ def test_qaser_log_infidelity_strengthens_high_fidelity_gradient():
     )
     gap_off = abs(float(c_off[0] - c_off[1]))
 
-    # Log-inf enabled: the gradient near F=1 should be much larger.
     cfg_on = dataclasses.replace(
         cfg, reward=dataclasses.replace(cfg.reward, qaser_log_infidelity_eps=1e-3),
     )
@@ -388,10 +356,7 @@ def test_qaser_log_infidelity_strengthens_high_fidelity_gradient():
         np.asarray([10, 10], dtype=np.int32),
     )
     gap_on = abs(float(c_on[0] - c_on[1]))
-    assert gap_on > gap_off * 5  # at least ~5× steeper near F=1
-    # F=0 should give a tiny reward (≈ -log(1+eps) ≈ +eps cost), not collapse
-    # to a huge magnitude that would zero-out GRPO advantages by dominating
-    # the batch.
+    assert gap_on > gap_off * 5
     c_zero = trainer_on._compute_reward(
         np.asarray([0.0], dtype=np.float32),
         np.asarray([5], dtype=np.int32),
@@ -402,11 +367,12 @@ def test_qaser_log_infidelity_strengthens_high_fidelity_gradient():
 
 
 def test_qaser_reward_strongly_rewards_compact_high_fidelity():
-    """QASER reward: structure savings only matter once F is high."""
+    """QASER structural terms still prefer compact high-fidelity circuits."""
     import dataclasses
     cfg = _tiny_cfg(pareto_enabled=True)
     cfg = dataclasses.replace(
         cfg, reward=dataclasses.replace(cfg.reward,
+                                        mode="qaser",
                                         qaser_init_max_depth=20,
                                         qaser_init_max_cnot=10),
     )
@@ -414,16 +380,14 @@ def test_qaser_reward_strongly_rewards_compact_high_fidelity():
     u_target, _ = build_target(pool, cfg)
     trainer = Trainer(cfg, u_target, pool, logger=None)
 
-    # At high F, compact circuit should beat bloated circuit.
     costs_high_F = trainer._compute_reward(
         np.asarray([0.99, 0.99], dtype=np.float32),
-        np.asarray([20, 5], dtype=np.int32),    # bloated vs compact depth
-        np.asarray([10, 2], dtype=np.int32),    # bloated vs compact cnots
-        np.asarray([40, 8], dtype=np.int32),    # bloated vs compact total gates
+        np.asarray([20, 5], dtype=np.int32),
+        np.asarray([10, 2], dtype=np.int32),
+        np.asarray([40, 8], dtype=np.int32),
     )
     assert costs_high_F[1] < costs_high_F[0]
 
-    # At low F, the reward collapses (≈ 0 for both); structure barely matters.
     costs_low_F = trainer._compute_reward(
         np.asarray([0.05, 0.05], dtype=np.float32),
         np.asarray([20, 5], dtype=np.int32),
@@ -435,8 +399,6 @@ def test_qaser_reward_strongly_rewards_compact_high_fidelity():
     assert spread_high > spread_low * 5
 
 
-# ── Replay buffer ───────────────────────────────────────────────────────────
-
 def test_replay_buffer_iterates_full_batches_with_log_probs():
     buffer = ReplayBuffer(size=8)
     for i in range(4):
@@ -444,21 +406,23 @@ def test_replay_buffer_iterates_full_batches_with_log_probs():
             tokens=np.asarray([0, 2, 3], dtype=np.int32),
             angles=np.asarray([0.1, 0.2], dtype=np.float32),
             cost=0.1 * i,
+            advantage=float(i),
             log_p_disc=np.asarray([-1.5, -0.5], dtype=np.float32),
             log_p_cont=np.asarray([-0.2, -0.3], dtype=np.float32),
         ))
 
     dataset = BufferDataset(buffer, repetition=1)
     batch = next(dataset.iter_batches(2, shuffle=True, rng=np.random.default_rng(0)))
-    assert set(batch) == {"tokens", "angles", "cost", "log_p_disc", "log_p_cont"}
+    assert set(batch) == {
+        "tokens", "angles", "cost", "advantage", "log_p_disc", "log_p_cont",
+    }
     assert batch["tokens"].shape == (2, 3)
     assert batch["angles"].shape == (2, 2)
     assert batch["cost"].shape == (2,)
+    assert batch["advantage"].shape == (2,)
     assert batch["log_p_disc"].shape == (2, 2)
     assert batch["log_p_cont"].shape == (2, 2)
 
-
-# ── Pareto ──────────────────────────────────────────────────────────────────
 
 def test_select_report_prefers_pareto_best_depth():
     raw_best = np.asarray([0, 2, 2, 2], dtype=np.int32)
@@ -480,7 +444,22 @@ def test_select_report_prefers_pareto_best_depth():
     assert source.startswith("Pareto best depth")
 
 
-# ── Misc ────────────────────────────────────────────────────────────────────
+def test_pareto_dominance_includes_total_gates():
+    bloated = np.asarray([0, 2, 3, 1], dtype=np.int32)
+    compact = np.asarray([0, 2, 1, 1], dtype=np.int32)
+    archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
+    assert archive.update(ParetoPoint(
+        fidelity=0.99, depth=5, total_gates=3, cnot_count=1,
+        token_sequence=bloated, epoch=0,
+    ))
+    assert archive.update(ParetoPoint(
+        fidelity=0.99, depth=5, total_gates=2, cnot_count=1,
+        token_sequence=compact, epoch=1,
+    ))
+    points = archive.to_sorted_list()
+    assert len(points) == 1
+    assert points[0].total_gates == 2
+
 
 def test_basis_gates_include_configured_rotations():
     assert _basis_gates(("ry", "rz")) == ["ry", "rz", "sx", "cx"]
@@ -550,18 +529,14 @@ def test_row_structure_metrics_skips_noop_tokens():
     assert cnots == 1
 
 
-# ── Refinement ──────────────────────────────────────────────────────────────
-
 def test_inner_refinement_lifts_rollout_fidelity():
-    """With inner_refine_steps>0 the post-refinement fidelity should be at
-    least as good as the raw RL fidelity for every rollout sample."""
+    """Inner refinement should not lower rollout fidelity."""
     cfg = _tiny_cfg(pareto_enabled=True)
     cfg = dataclasses_replace_policy(cfg, inner_refine_steps=4)
     pool = build_operator_pool(cfg.target.num_qubits, cfg.pool.rotation_gates)
     u_target, _ = build_target(pool, cfg)
     trainer = Trainer(cfg, u_target, pool, logger=None)
     roll = trainer.collect_rollout()
-    # post-refinement F is always >= raw F (we clip overshoots).
     assert (roll["fidelities"] >= roll["raw_fidelities"] - 1e-6).all()
 
 
@@ -584,8 +559,8 @@ def test_angle_refiner_does_not_decrease_fidelity():
     angles = np.zeros((1, cfg.model.max_gates_count), dtype=np.float32)
     tokens[0, 0] = name_to_id["RZ_q0"]
     tokens[0, 1] = name_to_id["SX_q1"]
-    tokens[0, 2:] = 1  # STOP
-    angles[0, 0] = 0.0  # bad initial guess
+    tokens[0, 2:] = 1
+    angles[0, 0] = 0.0
 
     init_fids = evaluator.fidelity_batch(tokens, angles)
     refined_fids, _ = refiner.refine_batch(tokens, angles)

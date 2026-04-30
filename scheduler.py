@@ -1,4 +1,4 @@
-"""Temperature schedulers for GQE training."""
+"""Inverse-temperature schedules for discrete action sampling."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from abc import ABC, abstractmethod
 class TemperatureScheduler(ABC):
     @abstractmethod
     def get_inverse_temperature(self) -> float:
-        """Return current inverse temperature beta."""
+        """Return the beta value used for the next rollout."""
 
     @abstractmethod
     def update(self, **kwargs) -> None:
-        """Update the scheduler state after each rollout."""
+        """Advance the schedule after PPO has consumed the rollout."""
 
 
 class FixedScheduler(TemperatureScheduler):
@@ -46,7 +46,6 @@ class LinearScheduler(TemperatureScheduler):
             self.current_temperature = min(self.maximum, self.current_temperature)
 
 
-# Backwards-compatible alias for older imports.
 DefaultScheduler = FixedScheduler
 
 
@@ -66,4 +65,3 @@ class CosineScheduler(TemperatureScheduler):
         self.current_temperature = (self.maximum + self.minimum) / 2 - (
             self.maximum - self.minimum
         ) / 2 * math.cos(2 * math.pi * self.current_iter / self.frequency)
-

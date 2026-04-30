@@ -1,9 +1,4 @@
-"""Post-training reporting helpers.
-
-Renders the chosen circuit as a Qiskit ``QuantumCircuit``, recomputes its
-process fidelity from the materialised gate matrices, and persists the full
-Pareto front to JSON for offline inspection.
-"""
+"""Reporting utilities for selected circuits and run artifacts."""
 
 from __future__ import annotations
 
@@ -16,10 +11,7 @@ from config import GQEConfig
 from cost import process_fidelity
 
 
-GATE_TOKEN_OFFSET = 2  # BOS=0, STOP=1, real gates start at 2
-
-
-# ── Token-sequence helpers ──────────────────────────────────────────────────
+GATE_TOKEN_OFFSET = 2
 
 def gate_indices_from_token_sequence(token_sequence) -> list[int]:
     return [
@@ -39,7 +31,7 @@ def select_report_token_sequence(
     pareto_archive,
     min_fidelity: float,
 ):
-    """Pick a circuit to report: prefer Pareto best-depth at F >= threshold."""
+    """Select the shallowest archive circuit above threshold, with fallbacks."""
     if pareto_archive is not None and len(pareto_archive) > 0:
         entries = pareto_archive.to_sorted_list()
         index_by_id = {id(p): i for i, p in enumerate(entries)}
@@ -74,7 +66,7 @@ def select_report_token_sequence(
 
 
 def select_best_fidelity_token_sequence(best_indices, best_angles, pareto_archive):
-    """Pick the highest-fidelity archive entry (ignores structural objectives)."""
+    """Select the archive circuit with the highest fidelity, with fallback."""
     if pareto_archive is not None and len(pareto_archive) > 0:
         bf = pareto_archive.best_by_fidelity()
         if bf is not None:
@@ -94,8 +86,6 @@ def select_best_fidelity_token_sequence(best_indices, best_angles, pareto_archiv
     )
 
 
-# ── Qiskit reconstruction ───────────────────────────────────────────────────
-
 def _map_qubit(q: int, num_qubits: int) -> int:
     """Convert internal MSB-first qubit index to Qiskit's LSB-first numbering."""
     return num_qubits - 1 - q
@@ -107,13 +97,7 @@ def build_qiskit_circuit_from_actions(
     pool,
     num_qubits: int,
 ):
-    """Render a (token, angle) sequence as a ``qiskit.QuantumCircuit``.
-
-    Tokens below ``GATE_TOKEN_OFFSET`` (BOS / STOP / padding) are skipped.
-    ``angles_full`` is the full ``(max_gates,)`` angle vector aligned to the
-    non-BOS portion of ``token_sequence``; positions whose token is not
-    parametric are ignored.
-    """
+    """Render a token sequence and aligned angle vector as a Qiskit circuit."""
     from qiskit import QuantumCircuit
 
     qc = QuantumCircuit(num_qubits)
@@ -162,8 +146,7 @@ def build_reported_circuit(
     report_angles,
     report_fidelity,
 ) -> ReportedCircuit:
-    """Materialise the reported (token, angle) sequence as a Qiskit circuit
-    and verify its fidelity against ``u_target``."""
+    """Build the selected Qiskit circuit and verify its process fidelity."""
     from qiskit.quantum_info import Operator
 
     num_qubits = cfg.target.num_qubits
@@ -190,7 +173,7 @@ def build_reported_circuit(
 
 
 def _run_metadata(cfg: GQEConfig, target_desc: str, n_epochs: int) -> dict:
-    """Lightweight run-level metadata: when, where, and what experiment."""
+    """Return host and experiment metadata for a run artifact."""
     import getpass
     import platform
     import socket
@@ -218,17 +201,22 @@ def _run_metadata(cfg: GQEConfig, target_desc: str, n_epochs: int) -> dict:
 
 
 def _config_snapshot(cfg: GQEConfig) -> dict:
-    """Serialise the parts of cfg most useful for reproducing a run."""
+    """Serialize the full experiment configuration into JSON-safe values."""
     return {
         "target": {
             "type": cfg.target.type,
             "num_qubits": int(cfg.target.num_qubits),
             "path": cfg.target.path,
+            "brickwork_depth": (
+                int(cfg.target.brickwork_depth)
+                if cfg.target.brickwork_depth is not None else None
+            ),
         },
         "pool": {"rotation_gates": list(cfg.pool.rotation_gates)},
         "model": {
             "size": cfg.model.size,
             "max_gates_count": int(cfg.model.max_gates_count),
+            "auto_max_gates_count": bool(cfg.model.auto_max_gates_count),
         },
         "training": {
             "max_epochs": int(cfg.training.max_epochs),
@@ -263,9 +251,28 @@ def _config_snapshot(cfg: GQEConfig) -> dict:
             "lr": float(cfg.refinement.lr),
             "num_restarts": int(cfg.refinement.num_restarts),
             "apply_simplify": bool(cfg.refinement.apply_simplify),
+            "use_linear_trace_loss": bool(cfg.refinement.use_linear_trace_loss),
+            "early_stop_patience": int(cfg.refinement.early_stop_patience),
+            "early_stop_rel_tol": float(cfg.refinement.early_stop_rel_tol),
+            "adaptive_restarts": bool(cfg.refinement.adaptive_restarts),
+            "restart_fidelity_threshold": float(
+                cfg.refinement.restart_fidelity_threshold
+            ),
+            "sweep_passes": int(cfg.refinement.sweep_passes),
+            "simplify_max_passes": int(cfg.refinement.simplify_max_passes),
         },
         "reward": {
             "enabled": bool(cfg.reward.enabled),
+            "mode": cfg.reward.mode,
+            "lex_fidelity_weight": float(cfg.reward.lex_fidelity_weight),
+            "lex_infidelity_eps": float(cfg.reward.lex_infidelity_eps),
+            "lex_cnot_weight": float(cfg.reward.lex_cnot_weight),
+            "lex_depth_weight": float(cfg.reward.lex_depth_weight),
+            "lex_total_gate_weight": float(cfg.reward.lex_total_gate_weight),
+            "lex_structure_fidelity_threshold": float(
+                cfg.reward.lex_structure_fidelity_threshold
+            ),
+            "lex_no_stop_penalty": float(cfg.reward.lex_no_stop_penalty),
             "qaser_init_max_depth": float(cfg.reward.qaser_init_max_depth),
             "qaser_init_max_cnot": float(cfg.reward.qaser_init_max_cnot),
             "qaser_init_max_gates": float(cfg.reward.qaser_init_max_gates),
@@ -276,6 +283,8 @@ def _config_snapshot(cfg: GQEConfig) -> dict:
             "fidelity_floor": float(cfg.reward.fidelity_floor),
             "max_archive_size": int(cfg.reward.max_archive_size),
             "fidelity_threshold": float(cfg.reward.fidelity_threshold),
+            "pair_repeat_window": int(cfg.reward.pair_repeat_window),
+            "pair_repeat_max": int(cfg.reward.pair_repeat_max),
         },
     }
 
@@ -289,20 +298,10 @@ def save_run_artifact(
     epoch_logs: list[dict] | None,
     output_path: str,
 ) -> int:
-    """Persist a single end-of-run artifact: target unitary, training logs,
-    and the slim Pareto-front table.
-
-    Per the user's spec the per-circuit gate names, token sequences, optimised
-    angles and QASM are intentionally NOT included — only the structural
-    summary (F, depth, total_gates, cnot_count, epoch). Use the live
-    ``pareto_archive`` object in-process if you need the full circuit.
-
-    Returns the number of Pareto entries written.
-    """
+    """Write target, config, logs, and Pareto summaries to one JSON artifact."""
     import json
     import os
 
-    # ── Pareto summary (no per-circuit gate lists) ──────────────────────────
     if pareto_archive is None or len(pareto_archive) == 0:
         pareto_payload: dict = {
             "num_circuits": 0,
@@ -335,7 +334,6 @@ def save_run_artifact(
         }
         n_entries = len(circuits)
 
-    # ── Target unitary (split into real / imaginary so the JSON is plain) ───
     u = np.asarray(u_target, dtype=np.complex128)
     target_payload = {
         "type": cfg.target.type,
@@ -362,7 +360,7 @@ def save_run_artifact(
 
 
 def circuit_stats(qc) -> tuple[int, int, int]:
-    """(depth, total_gates, two_qubit_gate_count)."""
+    """Return ``(depth, total_gates, two_qubit_gate_count)`` for a Qiskit circuit."""
     depth = qc.depth()
     total = sum(qc.count_ops().values())
     two_q = sum(1 for inst in qc.data if len(inst.qubits) >= 2)

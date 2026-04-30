@@ -1,34 +1,4 @@
-"""Closed-form sweep refinement (DMRG-style) for token-based PQCs.
-
-After Adam refinement, we still want to drive the residual infidelity from
-~1e-4 down to the floating-point floor on the survivors that are worth the
-effort. arXiv:2601.03123 Sec 3.2.1 motivates an SVD-based "manifold-aware"
-update: per single-qubit slot, one closed-form step replaces dozens of
-gradient steps and removes learning-rate dependence.
-
-Their trick is for a *generic* SU(2) slot with three Euler angles. Our
-circuit emits one specific axis rotation (R_X / R_Y / R_Z) per token, which
-makes the per-token closed form even simpler: for a fixed rotation axis σ,
-
-    Tr(M · R_σ(θ)) = a · cos(θ/2) + b · sin(θ/2)
-
-with ``a = Tr(A)`` and ``b = −i · Tr(σ · A)``, where A is the partial trace
-of ``M = L · U_target^H · R`` onto the gate's qubit and L / R are the running
-products of the gates strictly before / after the slot.
-
-Maximising |Tr|² over θ gives
-
-    θ* = atan2( 2 Re(a* b) ,  |a|² − |b|² )
-
-so the optimal angle is computed in closed form per parameter. Sweeping
-forward through the circuit while caching L (forward partial product) and
-the precomputed R (backward partial products) brings the per-sweep cost to
-O(L · d³). Two sweeps reliably push 1e-4 → 1e-8 for adequately
-parameterised skeletons.
-
-Non-parametric tokens (CNOT / SX / NOOP / BOS / STOP) are left in place;
-their stored matrices just feed into L for downstream slots.
-"""
+"""Host-side closed-form sweep updates for single-axis rotation tokens."""
 
 from __future__ import annotations
 
@@ -59,11 +29,7 @@ _PAULI_BY_AXIS = {
 
 
 def _build_static_cache(evaluator) -> dict:
-    """Pre-build per-token static information for CPU sweep refinement.
-
-    Pulled once per refiner instance — re-uses the evaluator's vocab tables
-    to avoid duplicating gate metadata across modules.
-    """
+    """Cache evaluator metadata needed by the sweep implementation."""
     n = int(evaluator.num_qubits)
     d = 2 ** n
     gate_types = np.asarray(evaluator._tok_gate_type, dtype=np.int32)
@@ -114,11 +80,7 @@ def _gate_full(tok: int, angle: float, cache: dict) -> np.ndarray:
 
 
 def _partial_trace_to_qubit(M: np.ndarray, qubit: int, n: int) -> np.ndarray:
-    """Trace out all qubits except ``qubit``; return 2x2.
-
-    Convention matches ``_embed_single_qubit``: qubit 0 is the most-significant
-    bit (axis 0 of the (2,)*(2n) reshape).
-    """
+    """Trace out every qubit except the selected one."""
     Mr = M.reshape((2,) * (2 * n))
     perm = list(range(2 * n))
     perm.remove(qubit)
@@ -159,8 +121,6 @@ def sweep_refine_one(
 
     for _ in range(int(num_sweeps)):
         gates = [_gate_full(int(token_ids[i]), float(angles[i]), cache) for i in range(L)]
-        # R[p] = product of gates with index strictly > p.
-        # R[L-1] = I (no gates after the last). R[p] = R[p+1] @ G_{p+1}.
         R = [None] * L
         if L > 0:
             R[L - 1] = np.eye(d, dtype=np.complex128)
@@ -189,13 +149,7 @@ def sweep_refine_batch(
     *,
     num_sweeps: int = 2,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run sweep refinement on each row.
-
-    Returns ``(refined_angles, refined_fidelities)``. Operates on the host
-    in numpy — sweeping is intrinsically sequential per parameter, which
-    fights JAX vmap, and the polish stage is only meaningful for the small
-    set of survivors at the end of training.
-    """
+    """Run sequential sweep refinement on each row and return angles plus fidelity."""
     cache = _build_static_cache(evaluator)
     B, T = angles_batch.shape
     out_angles = np.array(angles_batch, dtype=np.float32).copy()

@@ -1,4 +1,4 @@
-"""Configuration schema and loader for the hybrid-action GQE training run."""
+"""Typed configuration for target-conditioned hybrid-action GQE runs."""
 
 from __future__ import annotations
 
@@ -12,18 +12,11 @@ def _require_bool(name: str, value) -> None:
         raise ValueError(f"{name} must be a boolean")
 
 
-# ── Sub-configs ──────────────────────────────────────────────────────────────
-
 @dataclass(frozen=True)
 class TargetConfig:
     num_qubits: int
     type: str
     path: str | None = None
-    # Brickwork-target depth (number of brick layers). Each layer applies
-    # Haar-random 2-qubit gates on adjacent pairs, alternating between even
-    # offsets (0,1)(2,3)... and odd offsets (1,2)(3,4).... If None, defaults
-    # to ``2 * num_qubits`` — enough scrambling to make the resulting unitary
-    # behave Haar-like on small systems without becoming gratuitously deep.
     brickwork_depth: int | None = None
 
 
@@ -36,40 +29,16 @@ class PoolConfig:
 class ModelConfig:
     size: str
     max_gates_count: int
+    auto_max_gates_count: bool = False
 
 
 def default_max_gates_count(num_qubits: int) -> int:
-    """Heuristic gate budget per circuit, scaling with qubit count.
+    """Return the fallback rollout cap used when YAML omits ``max_gates_count``.
 
-    Anchored on the Shende-Markov-Bullock CNOT lower bound for an arbitrary
-    n-qubit unitary::
-
-        cnot_lb(n) = ceil((4^n - 3n - 1) / 4)
-
-    A Qiskit-style decomposition typically wraps each CNOT in ~4 single-qubit
-    basis rotations (Euler angles + basis change), so a near-optimal circuit
-    needs roughly ``5 * cnot_lb`` total gates. We multiply by 1.5 for agent
-    exploration slack — tight enough to discourage bloat but loose enough to
-    let the policy still find compact decompositions.
-
-    Floored at 32 (small problems still need a few extra slots beyond the
-    minimum) and capped at 1023 (transformer positional-embedding limit
-    minus the BOS slot).
-
-    Approximate values produced:
-
-    +------+-------------------+-----------------+
-    |  n   |  default budget   |  Qiskit ref     |
-    +------+-------------------+-----------------+
-    |  1   |        32         |       3         |
-    |  2   |        32         |      ~24        |
-    |  3   |       105         |      ~96        |
-    |  4   |       458         |    ~400-700     |
-    +------+-------------------+-----------------+
-
-    Override via ``model.max_gates_count`` in YAML for non-Haar workloads.
+    This value is an engineering ceiling for tensor shapes and runaway
+    generation, not a statement about the optimal circuit length. Rollout code
+    stops as soon as all sampled rows emit STOP.
     """
-    # Ceiling division: cnot_lb(n) = ⌈(4^n - 3n - 1) / 4⌉
     numer = 4 ** num_qubits - 3 * num_qubits - 1
     cnot_lb = max(0, -(-numer // 4))
     raw = int(round(1.5 * 5 * cnot_lb))
@@ -111,16 +80,7 @@ class LoggingConfig:
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    """Hybrid-action policy hyperparameters.
-
-    - ``entropy_disc`` / ``entropy_cont``: entropy-regularisation weights for
-      the categorical and Gaussian heads.
-    - ``inner_refine_steps``: per-rollout Adam iterations on the sampled angles
-      before scoring (0 = pure RL). The buffer stores the RL-sampled angles so
-      the PPO ratio is computed against the actually sampled actions; the
-      Pareto archive stores the refined angles.
-    - ``inner_refine_lr``: passed to AngleRefiner.
-    """
+    """Exploration and optional per-rollout angle-refinement settings."""
 
     entropy_disc: float = 0.0
     entropy_cont: float = 0.0
@@ -130,30 +90,7 @@ class PolicyConfig:
 
 @dataclass(frozen=True)
 class RefinementConfig:
-    """Post-training continuous-parameter refinement of the Pareto archive.
-
-    Each entry's angles get up to ``steps`` iterations of Adam, run once from
-    the RL-suggested angles and ``num_restarts - 1`` more times from
-    Uniform[-π, π] initialisations; the best per circuit is kept.
-    ``enabled=False`` reports the archive as-is.
-
-    Knobs added per arXiv:2601.03123 (Meiburg & Gomathi):
-
-    - ``use_linear_trace_loss``: minimise ``1 − |Tr|/d`` instead of HS
-      infidelity ``1 − |Tr|²/d²``. Linear in trace deviation → stronger
-      gradient near the optimum.
-    - ``early_stop_patience`` / ``early_stop_rel_tol``: bail out of Adam when
-      the loss has not relatively-improved by ``rel_tol`` for ``patience``
-      consecutive steps. Critical because underparameterised skeletons plateau
-      near 1e-3 forever (Sec 4 / Appendix B).
-    - ``adaptive_restarts`` / ``restart_fidelity_threshold``: skip random
-      restarts on circuits that already cleared the threshold; the paper
-      reports random init reliably converges first try for adequate skeletons.
-    - ``sweep_passes``: per-parameter closed-form sweep refinement (Sec 3.2.1
-      "DMRG-style" updates) applied after Adam. 0 disables.
-    - ``simplify_max_passes``: number of fixed-point iterations of the
-      structural simplifier; cascades may unlock further merges.
-    """
+    """Classical angle refinement applied after training and optionally inside rollouts."""
 
     enabled: bool = True
     steps: int = 50
@@ -171,22 +108,23 @@ class RefinementConfig:
 
 @dataclass(frozen=True)
 class RewardConfig:
-    """QASER reward (inspired by `arXiv:2511.16272`_)::
+    """Reward and Pareto-archive settings.
 
-        base = w_d * M_D/(D+1) + w_c * M_C/(C+1) + w_g * M_G/(G+1)
-        R    = base ** F * (1 - log(1 - F + eps)) - 1     # if eps > 0
-        R    = base ** F - 1                              # if eps == 0
-
-    M_D, M_C, M_G are running maxima of depth, CNOT count, and total gate
-    count. ``qaser_log_infidelity_eps > 0`` adds an unbounded F → 1 gradient
-    on top of the otherwise-saturating ``base ** F`` term. The Pareto archive
-    is reporting-only and does not feed back into the reward.
-
-    .. _arXiv\\:2511.16272: https://arxiv.org/abs/2511.16272
+    ``lexicographic`` is the standard training reward. It optimizes fidelity
+    first, then applies structural penalties only after the configured
+    fidelity band is reached. ``qaser`` is a running-max scalarisation kept
+    for controlled ablations.
     """
 
     enabled: bool = True
-    # If <= 0, running maxima are auto-initialised from the first rollout.
+    mode: str = "lexicographic"
+    lex_fidelity_weight: float = 1.0
+    lex_infidelity_eps: float = 1.0e-8
+    lex_cnot_weight: float = 0.01
+    lex_depth_weight: float = 0.001
+    lex_total_gate_weight: float = 0.001
+    lex_structure_fidelity_threshold: float = 0.99
+    lex_no_stop_penalty: float = 1.0
     qaser_init_max_depth: float = 0.0
     qaser_init_max_cnot: float = 0.0
     qaser_init_max_gates: float = 0.0
@@ -197,13 +135,6 @@ class RewardConfig:
     fidelity_floor: float = 0.0
     max_archive_size: int = 500
     fidelity_threshold: float = 0.99
-    # CNOT-pair-repetition admission filter (arXiv:2601.03123, Sec 4.1).
-    # When the same (control, target) pair recurs ``> pair_repeat_max`` times
-    # within any sliding window of ``pair_repeat_window`` consecutive CNOTs,
-    # the structure is "effectively underparameterised" — symmetries collapse
-    # parameters in that block and refinement plateaus around 10⁻³. Such
-    # rollouts are skipped at Pareto admission to save refinement compute.
-    # ``pair_repeat_window <= 0`` disables the filter.
     pair_repeat_window: int = 0
     pair_repeat_max: int = 1
 
@@ -222,14 +153,13 @@ class GQEConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
 
 
-# ── Validation ──────────────────────────────────────────────────────────────
-
 VALID_TARGET_TYPES = {
     "random", "random_reachable", "haar_random", "brickwork", "file",
 }
 VALID_MODEL_SIZES = {"tiny", "small", "medium", "large"}
 VALID_SCHEDULERS = {"fixed", "linear", "cosine"}
 VALID_ROTATION_GATES = {"rz", "rx", "ry"}
+VALID_REWARD_MODES = {"lexicographic", "qaser"}
 
 
 def normalize_rotation_gates(value) -> tuple[str, ...]:
@@ -353,6 +283,27 @@ def validate_config(raw: dict) -> None:
     rw = raw.get("reward", {})
     if rw:
         _require_bool("reward.enabled", rw.get("enabled", True))
+        if rw.get("mode", "lexicographic") not in VALID_REWARD_MODES:
+            raise ValueError(
+                f"Invalid reward.mode: {rw.get('mode')!r}. "
+                f"Allowed: {sorted(VALID_REWARD_MODES)}"
+            )
+        if rw.get("lex_fidelity_weight", 1.0) < 0.0:
+            raise ValueError("reward.lex_fidelity_weight must be >= 0")
+        if rw.get("lex_infidelity_eps", 1.0e-8) <= 0.0:
+            raise ValueError("reward.lex_infidelity_eps must be positive")
+        if rw.get("lex_cnot_weight", 0.01) < 0.0:
+            raise ValueError("reward.lex_cnot_weight must be >= 0")
+        if rw.get("lex_depth_weight", 0.001) < 0.0:
+            raise ValueError("reward.lex_depth_weight must be >= 0")
+        if rw.get("lex_total_gate_weight", 0.001) < 0.0:
+            raise ValueError("reward.lex_total_gate_weight must be >= 0")
+        if not (0.0 <= rw.get("lex_structure_fidelity_threshold", 0.99) <= 1.0):
+            raise ValueError(
+                "reward.lex_structure_fidelity_threshold must be in [0, 1]"
+            )
+        if rw.get("lex_no_stop_penalty", 1.0) < 0.0:
+            raise ValueError("reward.lex_no_stop_penalty must be >= 0")
         if rw.get("qaser_init_max_depth", 0.0) < 0.0:
             raise ValueError("reward.qaser_init_max_depth must be >= 0")
         if rw.get("qaser_init_max_cnot", 0.0) < 0.0:
@@ -391,8 +342,10 @@ def load_config(path: str) -> GQEConfig:
 
     num_qubits = int(raw["target"]["num_qubits"])
     model_raw = dict(raw["model"])
+    auto_max_gates = model_raw.get("max_gates_count") is None
     if model_raw.get("max_gates_count") is None:
         model_raw["max_gates_count"] = default_max_gates_count(num_qubits)
+    model_raw["auto_max_gates_count"] = auto_max_gates
 
     return GQEConfig(
         target=TargetConfig(**raw["target"]),

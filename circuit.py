@@ -1,24 +1,4 @@
-"""Quantum circuit unitary construction and process-fidelity evaluation.
-
-A small, reusable JAX kernel for composing circuit unitaries from
-(token_id, angle) pairs and computing process fidelity against a target.
-
-This module is the single source of truth for circuit→unitary mapping. It is
-called both:
-
-  - during RL training (forward-only fidelity for sampled (token, angle)
-    pairs — no optimisation), and
-  - during post-training refinement (with optax Adam wrapped around the
-    same forward pass).
-
-Tokens are encoded by id from a fixed vocab ``[BOS, STOP, gate_1, ..., gate_V]``;
-BOS / STOP / out-of-range ids decode to NOOP and contribute identity.
-
-Conventions:
-    Qubit 0 is the most-significant bit (Qiskit ordering).
-    Composition is left-multiplication: U_final = G_T @ ... @ G_1.
-    Process fidelity F(U, V) = |tr(U^H V)|^2 / d^2.
-"""
+"""JAX circuit evaluator for token and angle sequences."""
 
 from __future__ import annotations
 
@@ -30,7 +10,6 @@ import jax.numpy as jnp
 import numpy as np
 
 
-# Gate-type ids used by the JIT'd builder. BOS / STOP / padding map to NOOP.
 GATE_TYPE_RX = 0
 GATE_TYPE_RY = 1
 GATE_TYPE_RZ = 2
@@ -38,8 +17,6 @@ GATE_TYPE_SX = 3
 GATE_TYPE_CNOT = 4
 GATE_TYPE_NOOP = 5
 
-# A rotation angle is "unused" for non-parametric gates; we still pass
-# something through the angle vector so shapes stay regular.
 DEFAULT_ANGLE = float(np.pi / 4)
 
 
@@ -78,7 +55,6 @@ _GATE_TYPE_TO_ID = {
 }
 
 
-# ── 2x2 / 4x4 constants ──────────────────────────────────────────────────────
 _PAULI_X = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
 _PAULI_Y = np.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=np.complex128)
 _PAULI_Z = np.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
@@ -92,11 +68,6 @@ _CNOT = np.asarray(
 )
 
 
-# ── Custom VJP for permutation ───────────────────────────────────────────────
-# ``U[perm]`` autodiff defaults to scatter-add on the backward pass, which is
-# 2-3x slower than a gather. ``perm`` is always a bijection here so the adjoint
-# is exactly ``grad[inv_perm]`` — a single gather. ~50% backward speed-up for
-# the qubit-local circuit builder.
 @jax.custom_vjp
 def _permute_rows(U: jax.Array, perm: jax.Array, inv_perm: jax.Array) -> jax.Array:
     return U[perm]
@@ -113,8 +84,6 @@ def _permute_rows_bwd(res, g):
 
 _permute_rows.defvjp(_permute_rows_fwd, _permute_rows_bwd)
 
-
-# ── Embedding helpers (numpy-side, used to build constant matrices once) ─────
 
 def _embed_single_qubit(gate_2x2: np.ndarray, qubit: int, num_qubits: int) -> np.ndarray:
     eye = np.eye(2, dtype=gate_2x2.dtype)
@@ -183,15 +152,8 @@ def _build_pair_perms(
     return perm, inv
 
 
-# ── The main builder class ───────────────────────────────────────────────────
-
 class CircuitEvaluator:
-    """JIT'd evaluator: ``(token_ids, angles) -> circuit unitary -> fidelity``.
-
-    Reused both during training (forward-only, batched fidelity) and during
-    post-training refinement (the same forward pass under value-and-grad,
-    wrapped in optax Adam).
-    """
+    """Compile token metadata into JIT functions for fidelity and angle gradients."""
 
     def __init__(
         self,
@@ -213,13 +175,11 @@ class CircuitEvaluator:
 
         self.u_target = jnp.asarray(u_target, dtype=self._complex_dtype)
 
-        # CNOT pair index table (used to look up the 4x4 / perm for each pair).
         self._cnot_pairs = [
             (c, t) for c in range(num_qubits) for t in range(num_qubits) if c != t
         ]
         self._cnot_pair_to_idx = {pair: i for i, pair in enumerate(self._cnot_pairs)}
 
-        # Precomputed (qubit) and (pair) permutations for gather-based apply.
         perm_1q, inv_perm_1q = _build_qubit_perms(num_qubits)
         perm_2q, inv_perm_2q = _build_pair_perms(self._cnot_pairs, num_qubits)
         self._perm_1q = jnp.asarray(perm_1q, dtype=jnp.int32)
@@ -227,7 +187,6 @@ class CircuitEvaluator:
         self._perm_2q = jnp.asarray(perm_2q, dtype=jnp.int32)
         self._inv_perm_2q = jnp.asarray(inv_perm_2q, dtype=jnp.int32)
 
-        # 2x2 / 4x4 constants in the active dtype.
         self._eye_2 = jnp.eye(2, dtype=self._complex_dtype)
         self._sx_2x2 = jnp.asarray(_SX, dtype=self._complex_dtype)
         self._cnot_4x4 = jnp.asarray(_CNOT, dtype=self._complex_dtype)
@@ -241,7 +200,6 @@ class CircuitEvaluator:
         )
         self._imag_unit = jnp.asarray(1.0j, dtype=self._complex_dtype)
 
-        # Vocab → (gate_type_id, qubit0, cnot_pair_idx, is_parametric) tables.
         gate_type_ids = np.full((self.vocab_size,), GATE_TYPE_NOOP, dtype=np.int32)
         qubit0 = np.zeros((self.vocab_size,), dtype=np.int32)
         cnot_pair = np.zeros((self.vocab_size,), dtype=np.int32)
@@ -256,23 +214,13 @@ class CircuitEvaluator:
         self._tok_gate_type = jnp.asarray(gate_type_ids, dtype=jnp.int32)
         self._tok_qubit0 = jnp.asarray(qubit0, dtype=jnp.int32)
         self._tok_cnot_pair = jnp.asarray(cnot_pair, dtype=jnp.int32)
-        self.token_is_parametric_np = is_parametric  # numpy view for the host
+        self.token_is_parametric_np = is_parametric
 
         self._build_jit_fns()
-
-    # ── public numpy views ───────────────────────────────────────────────────
 
     @property
     def cnot_pairs(self) -> list[tuple[int, int]]:
         return list(self._cnot_pairs)
-
-    # ── Qubit-local apply ────────────────────────────────────────────────────
-    # Applying a 2x2 gate G to qubit k of (d, d) U is:
-    #   U_p = U[perm_1q[k]]            # group rows by bit-k
-    #   Y0  = G[0,0]*U_p[:h] + G[0,1]*U_p[h:]
-    #   Y1  = G[1,0]*U_p[:h] + G[1,1]*U_p[h:]
-    #   U'  = concat(Y0, Y1)[inv_perm_1q[k]]
-    # O(d^2) per gate vs O(d^3) for a (d,d) @ (d,d) matmul.
 
     def _apply_1q(self, U: jax.Array, G: jax.Array, qubit: jax.Array) -> jax.Array:
         d = 2 ** self.num_qubits
@@ -300,21 +248,13 @@ class CircuitEvaluator:
         Y = jnp.concatenate([Y00, Y01, Y10, Y11], axis=0)
         return _permute_rows(Y, inv, perm)
 
-    # ── Forward unitary build from (token_ids, angles) ──────────────────────
-
     def _build_unitary(self, token_ids: jax.Array, angles: jax.Array) -> jax.Array:
-        """Compose the circuit unitary for one sample.
-
-        ``token_ids`` shape ``(T,)`` int32, ``angles`` shape ``(T,)`` float.
-        Both are full-length (max_gates); STOP / BOS / padding token ids decode
-        to NOOP and leave the running U unchanged.
-        """
+        """Compose one full-length token row into a unitary matrix."""
         d = 2 ** self.num_qubits
-        gate_type_ids = self._tok_gate_type[token_ids]   # (T,)
-        qubit0 = self._tok_qubit0[token_ids]             # (T,)
-        cnot_pair = self._tok_cnot_pair[token_ids]       # (T,)
+        gate_type_ids = self._tok_gate_type[token_ids]
+        qubit0 = self._tok_qubit0[token_ids]
+        cnot_pair = self._tok_cnot_pair[token_ids]
 
-        # ── Precompute the (T, 2, 2) per-step 2x2 gate ──────────────────────
         half = angles.astype(self._real_dtype) * jnp.asarray(0.5, dtype=self._real_dtype)
         cos_h = jnp.cos(half).astype(self._complex_dtype)
         sin_h = jnp.sin(half).astype(self._complex_dtype)
@@ -350,7 +290,6 @@ class CircuitEvaluator:
         return jnp.clip((jnp.abs(overlap) ** 2) / (d ** 2), 0.0, 1.0)
 
     def _linear_trace_cost(self, U: jax.Array) -> jax.Array:
-        # ``1 − |Tr(U_target^H U)| / d`` — see cost.linear_trace_cost_jax.
         d = U.shape[0]
         overlap = jnp.sum(jnp.conjugate(self.u_target) * U)
         return 1.0 - jnp.abs(overlap) / d
@@ -376,18 +315,12 @@ class CircuitEvaluator:
             jax.vmap(jax.value_and_grad(linear_loss_one), in_axes=(0, 0))
         )
 
-    # ── Public entrypoints ───────────────────────────────────────────────────
-
     def fidelity_batch(
         self,
         token_ids_batch: np.ndarray,
         angles_batch: np.ndarray,
     ) -> np.ndarray:
-        """Return process fidelity for each (token sequence, angle vector) row.
-
-        Both inputs must have shape ``(B, max_gates)``. Out-of-range / STOP /
-        BOS token ids decode to NOOP and contribute identity.
-        """
+        """Return process fidelity for each row in a token/angle batch."""
         if token_ids_batch.shape[0] == 0:
             return np.zeros((0,), dtype=np.float32)
         token_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)

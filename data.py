@@ -1,12 +1,4 @@
-"""Replay buffer for hybrid-action GQE training.
-
-Each entry stores the full sample needed to recompute a PPO update:
-  - ``tokens``     (T+1,) int32  — BOS-prefixed discrete action sequence
-  - ``angles``     (T,)   float  — continuous action sequence (per token)
-  - ``cost``       scalar float  — scalarised reward (negated)
-  - ``log_p_disc`` (T,)   float  — old discrete per-position log-probs
-  - ``log_p_cont`` (T,)   float  — old continuous per-position log-probs
-"""
+"""Replay samples used by PPO updates."""
 
 from __future__ import annotations
 
@@ -23,12 +15,13 @@ class BufferEntry:
     tokens: np.ndarray
     angles: np.ndarray
     cost: float
+    advantage: float
     log_p_disc: np.ndarray
     log_p_cont: np.ndarray
 
 
 class ReplayBuffer:
-    """Bounded FIFO buffer of :class:`BufferEntry` rows."""
+    """Fixed-size FIFO store for complete rollout samples."""
 
     def __init__(self, size: int):
         self.size = size
@@ -45,7 +38,7 @@ class ReplayBuffer:
 
 
 class BufferDataset:
-    """Repeat-and-shuffle view over a :class:`ReplayBuffer`."""
+    """Batch iterator over replay rows, with optional repetition and shuffling."""
 
     def __init__(self, buffer: ReplayBuffer, repetition: int):
         self.buffer = buffer
@@ -66,11 +59,11 @@ class BufferDataset:
         if n == 0:
             return
 
-        # One snapshot of all rows so we don't pay deque indexing per item.
         rows = list(self.buffer.buf)
         tokens = np.stack([r.tokens for r in rows], axis=0).astype(np.int32)
         angles = np.stack([r.angles for r in rows], axis=0).astype(np.float32)
         costs = np.asarray([r.cost for r in rows], dtype=np.float32)
+        advantages = np.asarray([r.advantage for r in rows], dtype=np.float32)
         log_p_d = np.stack([r.log_p_disc for r in rows], axis=0).astype(np.float32)
         log_p_c = np.stack([r.log_p_cont for r in rows], axis=0).astype(np.float32)
 
@@ -92,6 +85,7 @@ class BufferDataset:
                 "tokens": tokens[sel],
                 "angles": angles[sel],
                 "cost": costs[sel],
+                "advantage": advantages[sel],
                 "log_p_disc": log_p_d[sel],
                 "log_p_cont": log_p_c[sel],
             }

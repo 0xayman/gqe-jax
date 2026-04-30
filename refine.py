@@ -1,33 +1,4 @@
-"""Post-training continuous-parameter refinement.
-
-After RL training has converged we still want to squeeze the last bit of
-fidelity out of the best discovered circuits. The RL policy supplied initial
-angles; here we run a fixed-budget Adam loop initialised at those angles.
-Adam is cheap (one ``value_and_grad`` per step, no line search) and converges
-fast from a warm RL-suggested init, which is what the policy is trained to
-provide.
-
-Operates on an entire ``ParetoArchive``: each surviving entry is re-optimised
-in a single batched JAX call, then re-inserted into a fresh archive (so any
-entries dominated after refinement are evicted).
-
-Per arXiv:2601.03123 (Meiburg & Gomathi):
-
-  - **Early stop on plateau** — underparameterised skeletons plateau at
-    cost ≈ 1e-3 forever. We bail out when no improvement is observed for
-    ``early_stop_patience`` consecutive steps so they don't burn the full
-    step budget.
-  - **Linear-trace loss** (``1 − |Tr|/d``) — keeps gradient magnitude
-    constant near the optimum, unlike HS infidelity (``1 − |Tr|²/d²``)
-    which flattens quadratically.
-  - **Adaptive restarts** — random restarts only run on circuits whose
-    best fidelity is below ``restart_fidelity_threshold``. The paper's
-    main result is that good skeletons converge first try, so restarts
-    are pure waste on those.
-  - **Sweep polish** (optional) — after Adam, run per-parameter closed-form
-    updates (``polish.sweep_refine``) for the final 10⁻³→10⁻⁸ window where
-    the linear loss alone still benefits from manifold-aware updates.
-"""
+"""Angle refinement and Pareto-archive rebuilding after policy rollouts."""
 
 from __future__ import annotations
 
@@ -45,22 +16,7 @@ from simplify import build_token_axis, simplify_token_sequence
 
 
 class AngleRefiner:
-    """Adam refinement of angle vectors for a batch of circuits.
-
-    PQC loss landscapes are notoriously non-convex, so single-shot Adam from
-    one starting point can get stuck. ``num_restarts > 1`` runs Adam from
-    ``num_restarts - 1`` random Uniform[-π, π] initialisations on top of the
-    RL-suggested angles. With ``adaptive_restarts=True``, those restarts only
-    fire on rows whose best fidelity is still below
-    ``restart_fidelity_threshold`` — circuits that already converged on the
-    first run do not pay for further restarts.
-
-    Each Adam invocation runs at most ``steps`` iterations but bails out
-    early when the loss has not relatively-improved by ``early_stop_rel_tol``
-    for ``early_stop_patience`` consecutive steps. This is the dominant
-    runtime saving on a Pareto archive that mixes well- and badly-
-    parameterised candidates.
-    """
+    """Batched Adam refinement with optional restarts and sweep polish."""
 
     def __init__(
         self,
@@ -125,12 +81,12 @@ class AngleRefiner:
             opt_state = self._adam.init(angles)
             init_loss, _ = value_and_grad_one(angles, token_ids)
             init_carry = (
-                angles,                       # current angles
-                opt_state,                    # adam state
-                jnp.int32(0),                 # step counter
-                init_loss,                    # best loss so far
-                angles,                       # best angles so far
-                jnp.int32(0),                 # steps since last improvement
+                angles,
+                opt_state,
+                jnp.int32(0),
+                init_loss,
+                angles,
+                jnp.int32(0),
             )
 
             def cond(c):
@@ -142,12 +98,7 @@ class AngleRefiner:
                 v, g = value_and_grad_one(a, token_ids)
                 u, st_new = self._adam.update(g, st, a)
                 a_next = optax.apply_updates(a, u)
-                # Per-element activity: under vmap the loop runs while ANY
-                # element wants to continue, so we gate writes on this.
                 active = jnp.logical_and(step < max_steps, ss < patience)
-                # "Improved enough to reset patience" requires a relative
-                # decrease ≥ rel_tol (so float jitter at the noise floor
-                # doesn't mask a real plateau).
                 rel_thresh = rel_tol * jnp.maximum(
                     jnp.abs(best), jnp.asarray(1e-12, dtype=best.dtype),
                 )
@@ -166,12 +117,10 @@ class AngleRefiner:
                 return (new_a, st_new, new_step, new_best, new_ba, new_ss)
 
             final_carry = jax.lax.while_loop(cond, body, init_carry)
-            return final_carry[4]  # best angles seen
+            return final_carry[4]
 
         self._refine_batch = jax.jit(jax.vmap(adam_refine_one, in_axes=(0, 0)))
         self._rng_seed = 0
-
-    # ── Adam stage ─────────────────────────────────────────────────────────
 
     def _run_adam(
         self,
@@ -180,9 +129,6 @@ class AngleRefiner:
     ) -> tuple[np.ndarray, np.ndarray]:
         real_dtype = self.evaluator._real_dtype
         token_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)
-        # ``np.asarray`` on a JAX device array yields a zero-copy read-only
-        # numpy view — we need writable buffers for the adaptive-restart
-        # in-place row updates downstream, so force a copy here.
         out = np.array(
             self._refine_batch(
                 jnp.asarray(init_angles_batch, dtype=real_dtype),
@@ -203,15 +149,7 @@ class AngleRefiner:
         token_ids_batch: np.ndarray,
         init_angles_batch: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(refined_fidelities, refined_angles)`` for a batch.
-
-        With ``num_restarts > 1`` runs Adam from the supplied initialisation
-        AND from up to ``num_restarts − 1`` random Uniform[-π, π] vectors per
-        circuit, then keeps the best refined fidelity per row. With
-        ``adaptive_restarts=True`` (default), each random restart skips rows
-        that already cleared ``restart_fidelity_threshold`` — saving
-        compute on circuits that converged first try.
-        """
+        """Return the best refined fidelity and angles for each circuit row."""
         if token_ids_batch.shape[0] == 0:
             return (
                 np.zeros((0,), dtype=np.float32),
@@ -219,12 +157,10 @@ class AngleRefiner:
             )
         B, T = init_angles_batch.shape
 
-        # First Adam run from the supplied (RL-suggested) angles.
         best_fids, best_angles = self._run_adam(
             token_ids_batch, init_angles_batch.astype(np.float32)
         )
 
-        # Random restarts.
         rng = np.random.default_rng(self._rng_seed)
         self._rng_seed += 1
         for _ in range(self.num_restarts - 1):
@@ -254,7 +190,6 @@ class AngleRefiner:
                 best_fids = np.where(improved, fids, best_fids)
                 best_angles = np.where(improved[:, None], refined, best_angles)
 
-        # Optional closed-form sweep polish (DMRG-style per-parameter atan2).
         if self.sweep_passes > 0:
             from polish import sweep_refine_batch
             polished_angles, polished_fids = sweep_refine_batch(
@@ -284,17 +219,7 @@ def refine_pareto_archive(
     simplify_max_passes: int = 3,
     verbose: bool = False,
 ) -> ParetoArchive:
-    """Refine every entry in ``archive`` in-place; return the rebuilt archive.
-
-    ``structure_metrics_fn(tokens_no_bos) -> (depth, total_gates, cnot_count)``
-    so the refiner can recompute structural objectives if simplification
-    changes the gate count.
-
-    When ``apply_simplify`` is True, each entry's token sequence is first run
-    through the simplifier (which marks merged/cancelled positions as STOP).
-    Because we re-optimise the angles afterwards, simplification is lossless
-    even when the merge rule pools angle contributions.
-    """
+    """Refine archive entries and return a fresh non-dominated archive."""
     if archive is None or len(archive) == 0:
         return archive
 
@@ -303,7 +228,6 @@ def refine_pareto_archive(
     max_gates = refiner.evaluator.max_gates
 
     token_axis = build_token_axis(pool_token_names) if apply_simplify else None
-    # Build per-token (q0, q1) lookup from pool names — q1 = -1 for non-CNOT.
     if apply_simplify:
         from circuit import parse_gate_name
         token_q0 = np.zeros((len(pool_token_names),), dtype=np.int32)
@@ -340,8 +264,6 @@ def refine_pareto_archive(
     )
     for i, p in enumerate(entries):
         new_f = float(refined_fids[i])
-        # Refinement should not regress fidelity, but Adam can occasionally
-        # overshoot — fall back to the stored fidelity in that case.
         if new_f < float(p.fidelity):
             new_f = float(p.fidelity)
             new_angles = (

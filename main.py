@@ -1,4 +1,4 @@
-"""CLI entrypoint for hybrid-action GQE training."""
+"""Run one configured target-conditioned GQE synthesis experiment."""
 
 from __future__ import annotations
 
@@ -156,8 +156,6 @@ def main():
             f"{result.refined_raw_fidelity:.6f}"
         )
 
-    # Prefer to report the post-refinement view of the best raw circuit when
-    # the Pareto archive is empty (fidelity_floor too high to populate).
     pareto_empty = (
         result.pareto_archive is None or len(result.pareto_archive) == 0
     )

@@ -1,19 +1,4 @@
-"""Hybrid-action GQE training loop.
-
-Per-epoch:
-  1. Roll out ``num_samples`` circuits with the current policy. Each circuit
-     comes with both discrete tokens and per-position angle samples plus the
-     per-position log-probabilities under the current (behavior) policy.
-  2. Optionally refine the sampled angles with a few Adam steps
-     (``policy.inner_refine_steps``); evaluate process fidelity from the
-     resulting (token, angle) pairs and compute structural metrics.
-  3. Score each sample with the scalarised reward and push it into the
-     replay buffer.
-  4. For ``buffer.steps_per_epoch`` passes, sample mini-batches from the
-     buffer and step PPO on the joint discrete + continuous action space.
-
-After the final epoch, refine the Pareto archive with multi-restart Adam.
-"""
+"""Training loop for one target-conditioned hybrid-action synthesis run."""
 
 from __future__ import annotations
 
@@ -44,13 +29,11 @@ from policy import (
     apply_discrete_action_masks,
     build_rollout_fn,
     compute_lengths_from_tokens,
-    gaussian_log_prob,
+    periodic_gaussian_log_prob,
 )
 from refine import AngleRefiner, refine_pareto_archive
 from scheduler import CosineScheduler, FixedScheduler, LinearScheduler
 
-
-# ── Logger ───────────────────────────────────────────────────────────────────
 
 class _WandbLogger:
     def __init__(self, cfg: GQEConfig):
@@ -98,10 +81,8 @@ def _build_scheduler(cfg: GQEConfig):
     raise ValueError(f"Unknown scheduler {t.scheduler!r}")
 
 
-# ── Structural metrics ──────────────────────────────────────────────────────
-
 def _make_structure_jit(num_qubits: int, token_qubit0, token_qubit1, token_is_noop):
-    """JIT'd batched (depth, total_gates) for token-id sequences."""
+    """Return a batched JIT function for circuit depth and total gate count."""
     q0_jax = jnp.asarray(token_qubit0, dtype=jnp.int32)
     q1_jax = jnp.asarray(token_qubit1, dtype=jnp.int32)
     noop_jax = jnp.asarray(token_is_noop, dtype=bool)
@@ -144,7 +125,7 @@ def _row_structure_metrics(
     token_qubit1,
     token_is_noop,
 ) -> tuple[int, int, int]:
-    """Pure-numpy (depth, total_gates, cnot_count) for one row."""
+    """Return ``(depth, total_gates, cnot_count)`` for one token row."""
     if token_ids.size == 0:
         return 0, 0, 0
     qubit_depths = np.zeros((num_qubits,), dtype=np.int32)
@@ -173,15 +154,7 @@ def _cnot_pair_max_repetition(
     token_qubit1,
     window: int,
 ) -> int:
-    """Max count of any (control, target) CNOT pair in any sliding window.
-
-    Per arXiv:2601.03123 Sec 4.1: when the same CNOT pair recurs ``k`` times
-    inside a window of width comparable to the qubit count, layer symmetries
-    collapse parameters and the resulting "effectively underparameterised"
-    skeleton plateaus far above the desired precision regardless of how long
-    you optimise. This metric returns that ``k`` so callers can reject the
-    structure cheaply.
-    """
+    """Return the largest repeated directed CNOT-pair count in any window."""
     if window <= 1 or token_ids.size == 0:
         return 0
     pairs: list[tuple[int, int]] = []
@@ -211,29 +184,22 @@ def _cnot_pair_max_repetition(
     return int(best)
 
 
-# ── Trainer ──────────────────────────────────────────────────────────────────
-
 @dataclass
 class TrainResult:
     best_cost: float
     best_tokens: list[int] | None
     best_angles: np.ndarray | None
     pareto_archive: ParetoArchive | None
-    # Best raw rollout, kept independently of Pareto archive: the agent's
-    # highest-fidelity sample regardless of structure penalty.
     best_raw_fidelity: float = float("nan")
     best_raw_tokens: list[int] | None = None
     best_raw_angles: np.ndarray | None = None
-    # Post-refinement view of ``best_raw_*`` (None when refinement disabled).
     refined_raw_fidelity: float | None = None
     refined_raw_angles: np.ndarray | None = None
-    # Per-epoch metric dictionaries (the same payloads logged to W&B), in
-    # epoch order. Captured even when W&B logging is off.
     epoch_logs: list[dict] = None  # type: ignore[assignment]
 
 
 class Trainer:
-    """Encapsulates the full training run for a single target unitary."""
+    """Owns rollout collection, PPO updates, archive updates, and refinement."""
 
     def __init__(
         self,
@@ -247,7 +213,6 @@ class Trainer:
         self.pool = pool
         self.logger = logger
 
-        # ── Vocabulary layout ────────────────────────────────────────────────
         self.bos_token_id = 0
         self.stop_token_id = 1
         self.gate_token_offset = 2
@@ -256,7 +221,6 @@ class Trainer:
         self.ngates = cfg.model.max_gates_count
         self.num_samples = cfg.training.num_samples
 
-        # ── Token metadata (vocab-sized) ─────────────────────────────────────
         self.token_qubit0 = np.zeros((self.vocab_size,), dtype=np.int32)
         self.token_qubit1 = np.full((self.vocab_size,), -1, dtype=np.int32)
         self.token_is_noop = np.zeros((self.vocab_size,), dtype=bool)
@@ -272,7 +236,6 @@ class Trainer:
                 self.token_qubit1[tok_id] = int(parts[2][1:])
                 self.two_qubit_token_mask[tok_id] = True
 
-        # ── Circuit evaluator (used for fidelity at sampled angles) ──────────
         self.evaluator = CircuitEvaluator(
             u_target=u_target,
             num_qubits=cfg.target.num_qubits,
@@ -280,9 +243,20 @@ class Trainer:
             max_gates=self.ngates,
         )
         self.token_is_parametric = self.evaluator.token_is_parametric_np
+        target_features = np.concatenate(
+            [np.real(u_target).reshape(-1), np.imag(u_target).reshape(-1)]
+        ).astype(np.float32)
+        self.target_features = target_features
+        self._target_features_single = jnp.asarray(target_features[None, :], dtype=jnp.float32)
+        self._target_features_rollout = jnp.repeat(
+            self._target_features_single, self.num_samples, axis=0,
+        )
 
-        # ── Policy / model + optimiser ───────────────────────────────────────
-        self.model = HybridPolicy(cfg.model.size, self.vocab_size)
+        self.model = HybridPolicy(
+            cfg.model.size,
+            self.vocab_size,
+            n_positions=self.ngates + 1,
+        )
         self.scheduler = _build_scheduler(cfg)
         self.rng_key = jax.random.PRNGKey(cfg.training.seed)
         self.batch_rng = np.random.default_rng(cfg.training.seed)
@@ -294,6 +268,7 @@ class Trainer:
             {"params": init_key},
             dummy_input,
             attention_mask=dummy_mask,
+            target_features=self._target_features_single,
             deterministic=True,
         )
         tx = optax.chain(
@@ -307,10 +282,8 @@ class Trainer:
         )
 
         self.buffer = ReplayBuffer(cfg.buffer.max_size)
-        # Captured per-epoch metric dicts (also fed to W&B if enabled).
         self.epoch_logs: list[dict] = []
 
-        # ── Pareto archive ───────────────────────────────────────────────────
         if cfg.reward.enabled:
             self.pareto_archive: ParetoArchive | None = ParetoArchive(
                 max_size=cfg.reward.max_archive_size,
@@ -320,9 +293,6 @@ class Trainer:
             self.pareto_archive = None
         self._current_epoch = 0
 
-        # ── QASER reward running maxima ─────────────────────────────────────
-        # Maintained across rollouts. Values <= 0 in config mean "auto-init
-        # from the first rollout"; until then we use 1.0 as a safe fallback.
         self._qaser_max_d = max(float(cfg.reward.qaser_init_max_depth), 1.0)
         self._qaser_max_c = max(float(cfg.reward.qaser_init_max_cnot), 1.0)
         self._qaser_max_g = max(float(cfg.reward.qaser_init_max_gates), 1.0)
@@ -332,18 +302,7 @@ class Trainer:
             and cfg.reward.qaser_init_max_gates > 0
         )
 
-        # ── Per-rollout angle refiner (HyRLQAS-style hybrid loop) ───────────
-        # When enabled, every rollout sample runs ``inner_refine_steps``
-        # iterations of Adam initialised at the RL-sampled angles.
-        # The PPO buffer stores the *initial* (RL-sampled) angles so the
-        # importance ratio is computed against the actually sampled action;
-        # cost / Pareto archive use the refined fidelity / refined angles so
-        # the reward signal reflects the well-conditioned init the agent found.
         if cfg.policy.inner_refine_steps > 0:
-            # Inner (per-rollout) refinement uses the same upgraded loss
-            # / early-stop machinery as the post-training refiner. Sweep
-            # polish stays off here — the budget per rollout is too small to
-            # benefit and Adam alone covers the warm-start regime.
             self.inner_refiner: AngleRefiner | None = AngleRefiner(
                 self.evaluator,
                 steps=cfg.policy.inner_refine_steps,
@@ -359,8 +318,6 @@ class Trainer:
 
         self._compile_jit_fns()
 
-    # ── JIT-compiled hot functions ───────────────────────────────────────────
-
     def _compile_jit_fns(self) -> None:
         cfg = self.cfg
         bos_id = self.bos_token_id
@@ -371,14 +328,24 @@ class Trainer:
 
         is_param_jax = jnp.asarray(self.token_is_parametric, dtype=bool)
 
-        def model_forward(params, input_ids, attention_mask):
+        def model_forward(params, input_ids, attention_mask, target_features):
             return self.state.apply_fn(
                 {"params": params}, input_ids,
-                attention_mask=attention_mask, deterministic=True,
+                attention_mask=attention_mask,
+                target_features=target_features,
+                deterministic=True,
             )
 
-        def ppo_step(state, tokens, angles, costs, beta, old_log_p_d, old_log_p_c):
-            # tokens shape (B, T+1) BOS-prefixed; angles/log-probs (B, T).
+        def ppo_step(
+            state,
+            tokens,
+            angles,
+            advantages,
+            beta,
+            old_log_p_d,
+            old_log_p_c,
+            target_features,
+        ):
             attention_mask = jnp.ones_like(tokens, dtype=bool)
             actions_disc = tokens[:, 1:]
             actions_cont = angles
@@ -390,7 +357,9 @@ class Trainer:
             def loss_fn(params):
                 logits, mu, log_sigma = state.apply_fn(
                     {"params": params}, tokens,
-                    attention_mask=attention_mask, deterministic=True,
+                    attention_mask=attention_mask,
+                    target_features=target_features,
+                    deterministic=True,
                 )
                 aligned_logits = apply_discrete_action_masks(
                     logits[:, :T, :], bos_token_id=bos_id, stop_token_id=stop_id,
@@ -399,7 +368,7 @@ class Trainer:
                 new_log_p_d = jnp.take_along_axis(
                     logp_all, actions_disc[..., None], axis=-1,
                 ).squeeze(-1)
-                new_log_p_c = gaussian_log_prob(
+                new_log_p_c = periodic_gaussian_log_prob(
                     actions_cont, mu[:, :T], log_sigma[:, :T],
                 )
 
@@ -418,11 +387,11 @@ class Trainer:
                 seq_new = jnp.sum(jnp.where(valid, per_tok_new, 0.0), axis=-1) / denom
                 seq_old = jnp.sum(jnp.where(valid, per_tok_old, 0.0), axis=-1) / denom
 
-                advantages = jax.lax.stop_gradient(grpo_advantages(costs))
-                pg_loss = ppo_clipped_loss(seq_new, seq_old, advantages, clip)
+                advantages_sg = jax.lax.stop_gradient(advantages)
+                pg_loss = ppo_clipped_loss(seq_new, seq_old, advantages_sg, clip)
 
                 ent_d = categorical_entropy(aligned_logits, beta, valid)
-                ent_c = gaussian_entropy(log_sigma[:, :T], valid)
+                ent_c = gaussian_entropy(log_sigma[:, :T], param_mask & valid)
                 total = pg_loss - ent_disc * ent_d - ent_cont * ent_c
                 return total, (pg_loss, ent_d, ent_c)
 
@@ -432,15 +401,15 @@ class Trainer:
 
         self._ppo_step = jax.jit(ppo_step)
 
-        # Behaviour-policy log-probs at rollout time (used to recompute the old
-        # log-probs when the buffer entries were stored under the same params).
-        def rollout_log_probs(params, tokens, angles, beta):
+        def rollout_log_probs(params, tokens, angles, beta, target_features):
             actions_disc = tokens[:, 1:]
             T = actions_disc.shape[1]
             attention_mask = jnp.ones_like(tokens, dtype=bool)
             logits, mu, log_sigma = self.state.apply_fn(
                 {"params": params}, tokens,
-                attention_mask=attention_mask, deterministic=True,
+                attention_mask=attention_mask,
+                target_features=target_features,
+                deterministic=True,
             )
             aligned_logits = apply_discrete_action_masks(
                 logits[:, :T, :], bos_token_id=bos_id, stop_token_id=stop_id,
@@ -449,12 +418,11 @@ class Trainer:
             log_p_d = jnp.take_along_axis(
                 logp_all, actions_disc[..., None], axis=-1,
             ).squeeze(-1)
-            log_p_c = gaussian_log_prob(angles, mu[:, :T], log_sigma[:, :T])
+            log_p_c = periodic_gaussian_log_prob(angles, mu[:, :T], log_sigma[:, :T])
             return log_p_d, log_p_c
 
         self._rollout_log_probs = jax.jit(rollout_log_probs)
 
-        # KV-cached rollout sampler.
         arch = _POLICY_SIZES[self.cfg.model.size]
         self._rollout_fn = build_rollout_fn(
             n_layer=arch.n_layer,
@@ -465,6 +433,7 @@ class Trainer:
             total_len=self.ngates + 1,
             bos_token_id=self.bos_token_id,
             stop_token_id=self.stop_token_id,
+            use_target_conditioning=True,
         )
 
         self._structure_jit = _make_structure_jit(
@@ -474,32 +443,25 @@ class Trainer:
             token_is_noop=self.token_is_noop,
         )
 
-    # ── Per-epoch primitives ─────────────────────────────────────────────────
-
     def collect_rollout(self) -> dict:
         beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
         self.rng_key, sub = jax.random.split(self.rng_key)
-        out = self._rollout_fn(self.state.params, sub, beta)
+        out = self._rollout_fn(
+            self.state.params, sub, beta, self._target_features_rollout,
+        )
 
-        tokens = np.asarray(out["tokens"], dtype=np.int32)              # (B, T+1)
-        init_angles = np.asarray(out["angles"], dtype=np.float32)       # (B, T)
-        log_p_d = np.asarray(out["log_p_d"], dtype=np.float32)          # (B, T)
-        log_p_c = np.asarray(out["log_p_c"], dtype=np.float32)          # (B, T)
+        tokens = np.asarray(out["tokens"], dtype=np.int32)
+        init_angles = np.asarray(out["angles"], dtype=np.float32)
+        log_p_d = np.asarray(out["log_p_d"], dtype=np.float32)
+        log_p_c = np.asarray(out["log_p_c"], dtype=np.float32)
 
-        action_tokens = tokens[:, 1:]                                   # (B, T)
+        action_tokens = tokens[:, 1:]
         raw_fidelities = self.evaluator.fidelity_batch(action_tokens, init_angles)
 
-        # ── Inner refinement (HyRLQAS-style) ─────────────────────────────────
-        # If enabled, each sample's angles get a few classical-optimiser steps
-        # initialised at the RL-sampled angles. Reward and Pareto archive use
-        # the refined values; the PPO buffer stores the RL-sampled (initial)
-        # angles so the importance ratio is computed against the actual action.
         if self.inner_refiner is not None:
             refined_fidelities, refined_angles = self.inner_refiner.refine_batch(
                 action_tokens, init_angles,
             )
-            # Refinement shouldn't decrease fidelity, but Adam can briefly
-            # overshoot; clip to monotone non-decreasing.
             improved = refined_fidelities >= raw_fidelities
             fidelities = np.where(improved, refined_fidelities, raw_fidelities)
             pareto_angles = np.where(
@@ -522,32 +484,30 @@ class Trainer:
             compute_lengths_from_tokens(jnp.asarray(action_tokens), self.stop_token_id),
             dtype=np.int32,
         )
+        no_stop = ~np.any(action_tokens == self.stop_token_id, axis=1)
 
         if self.cfg.reward.enabled:
-            costs = self._compute_reward(fidelities, depths, cnot_counts, totals)
+            costs = self._compute_reward(
+                fidelities, depths, cnot_counts, totals, no_stop=no_stop,
+            )
         else:
             costs = (1.0 - fidelities).astype(np.float32)
+        advantages = np.asarray(
+            grpo_advantages(jnp.asarray(costs, dtype=jnp.float32)), dtype=np.float32,
+        )
 
-        # Buffer stores INITIAL (RL-sampled) angles — that is the action whose
-        # log-prob the PPO ratio refers to.
         for i in range(tokens.shape[0]):
             self.buffer.push(BufferEntry(
                 tokens=tokens[i].copy(),
                 angles=init_angles[i].copy(),
                 cost=float(costs[i]),
+                advantage=float(advantages[i]),
                 log_p_disc=log_p_d[i].copy(),
                 log_p_cont=log_p_c[i].copy(),
             ))
 
-        # Anneal scheduler with raw-fidelity costs (so its scale doesn't drift
-        # with the structure-penalty term).
-        self.scheduler.update(costs=jnp.asarray(1.0 - fidelities, dtype=jnp.float32))
-
         if self.pareto_archive is not None:
             keep = np.flatnonzero(fidelities >= self.pareto_archive.fidelity_floor)
-            # Optional CNOT-pair-repetition admission filter — drop rollouts
-            # whose CNOT layout is "effectively underparameterised" (the same
-            # pair recurring densely, per arXiv:2601.03123 Sec 4.1).
             window = int(self.cfg.reward.pair_repeat_window)
             max_rep = int(self.cfg.reward.pair_repeat_max)
             if window > 1 and keep.size:
@@ -577,15 +537,18 @@ class Trainer:
 
         return {
             "tokens": tokens,
-            "angles": pareto_angles,        # what the eventual best circuit uses
-            "init_angles": init_angles,     # what the policy sampled (PPO action)
-            "fidelities": fidelities,       # post-refinement (or raw if disabled)
+            "angles": pareto_angles,
+            "init_angles": init_angles,
+            "fidelities": fidelities,
             "raw_fidelities": raw_fidelities,
             "depths": depths,
             "totals": totals,
             "cnots": cnot_counts,
             "lengths": lengths,
+            "no_stop": no_stop,
             "costs": costs,
+            "advantages": advantages,
+            "beta": float(np.asarray(beta, dtype=np.float32)),
         }
 
     def _compute_reward(
@@ -594,6 +557,7 @@ class Trainer:
         depths: np.ndarray,
         cnots: np.ndarray,
         total_gates: np.ndarray | None = None,
+        no_stop: np.ndarray | None = None,
     ) -> np.ndarray:
         r = self.cfg.reward
         F = fidelities.astype(np.float32)
@@ -605,6 +569,22 @@ class Trainer:
             if total_gates is not None
             else D
         )
+        if r.mode == "lexicographic":
+            eps = np.float32(r.lex_infidelity_eps)
+            infidelity = np.maximum(1.0 - F + eps, eps).astype(np.float32)
+            cost = np.float32(r.lex_fidelity_weight) * np.log(infidelity)
+            active = (F >= np.float32(r.lex_structure_fidelity_threshold)).astype(np.float32)
+            cost = cost + active * (
+                np.float32(r.lex_cnot_weight) * C
+                + np.float32(r.lex_depth_weight) * D
+                + np.float32(r.lex_total_gate_weight) * G
+            )
+            if no_stop is not None:
+                cost = cost + np.asarray(no_stop, dtype=np.float32) * np.float32(
+                    r.lex_no_stop_penalty
+                )
+            return cost.astype(np.float32)
+
         batch_max_d = float(D.max()) if D.size else 0.0
         batch_max_c = float(C.max()) if C.size else 0.0
         batch_max_g = float(G.max()) if G.size else 0.0
@@ -643,19 +623,21 @@ class Trainer:
             self.cfg.training.batch_size,
             drop_last=True, shuffle=True, rng=self.batch_rng,
         ):
+            target_features = jnp.repeat(
+                self._target_features_single, batch["tokens"].shape[0], axis=0,
+            )
             self.state, loss_v, _aux = self._ppo_step(
                 self.state,
                 jnp.asarray(batch["tokens"], dtype=jnp.int32),
                 jnp.asarray(batch["angles"], dtype=jnp.float32),
-                jnp.asarray(batch["cost"], dtype=jnp.float32),
+                jnp.asarray(batch["advantage"], dtype=jnp.float32),
                 beta,
                 jnp.asarray(batch["log_p_disc"], dtype=jnp.float32),
                 jnp.asarray(batch["log_p_cont"], dtype=jnp.float32),
+                target_features,
             )
             losses.append(float(np.asarray(loss_v, dtype=np.float32)))
         return losses
-
-    # ── Top-level run() ──────────────────────────────────────────────────────
 
     def run(self) -> TrainResult:
         cfg = self.cfg
@@ -663,12 +645,10 @@ class Trainer:
         best_tokens = None
         best_angles = None
         best_fidelity = float("nan")
-        # Track the highest-fidelity raw sample independently — the
-        # structure-penalised cost can prefer shorter / lower-fidelity circuits
-        # so "best by cost" and "best by fidelity" diverge.
         best_raw_fidelity = -1.0
         best_raw_tokens = None
         best_raw_angles = None
+        best_seen_fidelity = -1.0
         run_start = time.perf_counter()
 
         for epoch in range(cfg.training.max_epochs):
@@ -678,6 +658,8 @@ class Trainer:
             roll = self.collect_rollout()
             costs = roll["costs"]
             fids = roll["fidelities"]
+            raw_fids = roll["raw_fidelities"]
+            beta_val = float(roll["beta"])
             best_idx = int(np.argmin(costs))
             if costs[best_idx] < best_cost:
                 best_cost = float(costs[best_idx])
@@ -685,15 +667,18 @@ class Trainer:
                 best_angles = roll["angles"][best_idx].copy()
                 best_fidelity = float(fids[best_idx])
 
-            raw_idx = int(np.argmax(fids))
-            if float(fids[raw_idx]) > best_raw_fidelity:
-                best_raw_fidelity = float(fids[raw_idx])
-                best_raw_tokens = roll["tokens"][raw_idx].copy()
-                best_raw_angles = roll["angles"][raw_idx].copy()
+            best_seen_fidelity = max(best_seen_fidelity, float(np.max(fids)))
 
-            beta_val = float(self.scheduler.get_inverse_temperature())
+            raw_idx = int(np.argmax(raw_fids))
+            if float(raw_fids[raw_idx]) > best_raw_fidelity:
+                best_raw_fidelity = float(raw_fids[raw_idx])
+                best_raw_tokens = roll["tokens"][raw_idx].copy()
+                best_raw_angles = roll["init_angles"][raw_idx].copy()
+
             losses = self.train_epoch(beta_val)
             avg_loss = float(np.mean(losses)) if losses else float("nan")
+
+            self.scheduler.update(costs=jnp.asarray(1.0 - fids, dtype=jnp.float32))
 
             elapsed = time.perf_counter() - run_start
             epoch_dt = time.perf_counter() - epoch_start
@@ -701,15 +686,16 @@ class Trainer:
             self._log_epoch(
                 epoch=epoch, avg_loss=avg_loss, beta_val=beta_val,
                 roll=roll, best_cost=best_cost, best_fidelity=best_fidelity,
+                best_raw_fidelity=best_raw_fidelity,
+                best_seen_fidelity=best_seen_fidelity,
                 best_tokens=best_tokens, epoch_time=epoch_dt, elapsed=elapsed,
             )
 
-            if cfg.training.early_stop and best_fidelity >= 1.0 - 1e-8:
+            if cfg.training.early_stop and best_seen_fidelity >= 1.0 - 1e-8:
                 if cfg.logging.verbose:
                     print(f"Early stop: fidelity 1.0 reached at epoch {epoch + 1:03d}")
                 break
 
-        # Post-training refinement.
         refined_raw_fidelity: float | None = None
         refined_raw_angles: np.ndarray | None = None
         if cfg.refinement.enabled:
@@ -726,8 +712,6 @@ class Trainer:
                 sweep_passes=cfg.refinement.sweep_passes,
             )
 
-            # 1. Always refine the best raw rollout, even if the Pareto archive
-            #    is empty (the most useful single circuit to report).
             if best_raw_tokens is not None:
                 if cfg.logging.verbose:
                     print(
@@ -745,7 +729,6 @@ class Trainer:
                         f"{refined_raw_fidelity:.4f}"
                     )
 
-            # 2. Refine the Pareto archive (no-op if empty).
             if self.pareto_archive is not None and len(self.pareto_archive) > 0:
                 if cfg.logging.verbose:
                     print(
@@ -788,11 +771,9 @@ class Trainer:
             epoch_logs=list(self.epoch_logs),
         )
 
-    # ── Logging helpers ──────────────────────────────────────────────────────
-
     def _log_epoch(
         self, *, epoch, avg_loss, beta_val, roll, best_cost, best_fidelity,
-        best_tokens, epoch_time, elapsed,
+        best_raw_fidelity, best_seen_fidelity, best_tokens, epoch_time, elapsed,
     ):
         cfg = self.cfg
         costs = roll["costs"]
@@ -800,11 +781,12 @@ class Trainer:
         raw_fids = roll["raw_fidelities"]
         epoch_best = int(np.argmin(costs))
         epoch_best_F = float(fids[epoch_best])
+        epoch_best_seen_F = float(np.max(fids)) if fids.size else float("nan")
+        epoch_best_raw_F = float(np.max(raw_fids)) if raw_fids.size else float("nan")
         epoch_best_cnot = int(roll["cnots"][epoch_best])
         epoch_best_depth = int(roll["depths"][epoch_best])
         epoch_best_total = int(roll["totals"][epoch_best])
         mean_len = float(roll["lengths"].mean()) if roll["lengths"].size else float("nan")
-        # How much the inner refiner is lifting fidelity (0 if disabled).
         mean_inner_lift = (
             float((fids - raw_fids).mean()) if self.inner_refiner is not None else 0.0
         )
@@ -855,6 +837,7 @@ class Trainer:
                 f" | loss={avg_loss:.4f}"
                 f" | beta={beta_val:.3f}"
                 f" | F_epoch_best={epoch_best_F:.4f}"
+                f" | F_seen={best_seen_fidelity:.4f}"
                 f" | cnot_epoch={epoch_best_cnot}"
                 f" | depth_epoch={epoch_best_depth}"
                 f" | mean_len={mean_len:.1f}"
@@ -865,15 +848,22 @@ class Trainer:
                 f" | dt={epoch_time:.1f}s | elapsed={elapsed:.0f}s"
             )
 
-        # Build the per-epoch metric record. Captured regardless of whether
-        # W&B is enabled so it can be persisted into the run-artifact JSON.
         metrics: dict = {
             "epoch": int(epoch),
             "loss": float(avg_loss) if np.isfinite(avg_loss) else None,
             "inverse_temperature": float(beta_val),
             "cost_best": float(best_cost) if np.isfinite(best_cost) else None,
-            "raw_fidelity_best": float(best_fidelity) if np.isfinite(best_fidelity) else None,
-            "raw_fidelity_epoch_best": float(epoch_best_F),
+            "best_cost_fidelity": (
+                float(best_fidelity) if np.isfinite(best_fidelity) else None
+            ),
+            "best_seen_fidelity": (
+                float(best_seen_fidelity) if np.isfinite(best_seen_fidelity) else None
+            ),
+            "raw_fidelity_best": (
+                float(best_raw_fidelity) if np.isfinite(best_raw_fidelity) else None
+            ),
+            "rollout_fidelity_epoch_best": float(epoch_best_seen_F),
+            "raw_fidelity_epoch_best": float(epoch_best_raw_F),
             "depth_best": int(best_depth),
             "depth_epoch_best": int(epoch_best_depth),
             "total_gates_best": int(best_total),
@@ -907,8 +897,6 @@ class Trainer:
             self.token_qubit0, self.token_qubit1, self.token_is_noop,
         )
 
-
-# ── Convenience entrypoint ───────────────────────────────────────────────────
 
 def gqe(cfg: GQEConfig, u_target: np.ndarray, pool, logger=None) -> TrainResult:
     trainer = Trainer(cfg, u_target, pool, logger=logger)
