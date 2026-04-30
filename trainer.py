@@ -310,7 +310,6 @@ class Trainer:
                 use_linear_trace_loss=cfg.refinement.use_linear_trace_loss,
                 early_stop_patience=cfg.refinement.early_stop_patience,
                 early_stop_rel_tol=cfg.refinement.early_stop_rel_tol,
-                adaptive_restarts=False,
                 sweep_passes=0,
             )
         else:
@@ -703,12 +702,9 @@ class Trainer:
                 self.evaluator,
                 steps=cfg.refinement.steps,
                 lr=cfg.refinement.lr,
-                num_restarts=cfg.refinement.num_restarts,
                 use_linear_trace_loss=cfg.refinement.use_linear_trace_loss,
                 early_stop_patience=cfg.refinement.early_stop_patience,
                 early_stop_rel_tol=cfg.refinement.early_stop_rel_tol,
-                adaptive_restarts=cfg.refinement.adaptive_restarts,
-                restart_fidelity_threshold=cfg.refinement.restart_fidelity_threshold,
                 sweep_passes=cfg.refinement.sweep_passes,
             )
 

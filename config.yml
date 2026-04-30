@@ -14,7 +14,7 @@ model:
   # max_gates_count: 105
 
 training:
-  max_epochs: 200
+  max_epochs: 100
   num_samples: 1024 # circuits sampled per epoch
   batch_size: 256 # gradient-step batch size
   lr: 1.0e-4
@@ -27,7 +27,7 @@ policy:
   entropy_disc: 0.005 # categorical-entropy regularisation weight
   entropy_cont: 0.005 # Gaussian-entropy regularisation weight
   # Optional Adam refinement applied before scoring each rollout sample.
-  inner_refine_steps: 12
+  inner_refine_steps: 8
   inner_refine_lr: 0.1
 
 temperature:
@@ -47,15 +47,12 @@ logging:
 
 refinement:
   enabled: true
-  steps: 1000
+  steps: 500
   lr: 0.1
-  num_restarts: 4
   apply_simplify: true # simplify each archive circuit before re-optim
   use_linear_trace_loss: true
   early_stop_patience: 50
   early_stop_rel_tol: 1.0e-6
-  adaptive_restarts: true
-  restart_fidelity_threshold: 0.999
   sweep_passes: 2
   simplify_max_passes: 3
 

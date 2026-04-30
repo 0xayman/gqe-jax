@@ -16,7 +16,7 @@ from simplify import build_token_axis, simplify_token_sequence
 
 
 class AngleRefiner:
-    """Batched Adam refinement with optional restarts and sweep polish."""
+    """Batched Adam refinement with optional sweep polish."""
 
     def __init__(
         self,
@@ -24,50 +24,38 @@ class AngleRefiner:
         *,
         steps: int = 50,
         lr: float = 0.1,
-        num_restarts: int = 1,
         use_linear_trace_loss: bool = True,
         early_stop_patience: int = 30,
         early_stop_rel_tol: float = 1.0e-5,
-        adaptive_restarts: bool = True,
-        restart_fidelity_threshold: float = 0.999,
         sweep_passes: int = 0,
     ):
-        if num_restarts < 1:
-            raise ValueError("num_restarts must be >= 1")
         if steps <= 0:
             raise ValueError("steps must be positive")
         if early_stop_patience <= 0:
             raise ValueError("early_stop_patience must be positive")
         if early_stop_rel_tol < 0:
             raise ValueError("early_stop_rel_tol must be >= 0")
-        if not (0.0 < restart_fidelity_threshold <= 1.0):
-            raise ValueError(
-                "restart_fidelity_threshold must be in (0, 1]"
-            )
         if sweep_passes < 0:
             raise ValueError("sweep_passes must be >= 0")
         self.evaluator = evaluator
         self.steps = int(steps)
         self.lr = float(lr)
-        self.num_restarts = int(num_restarts)
         self.use_linear_trace_loss = bool(use_linear_trace_loss)
         self.early_stop_patience = int(early_stop_patience)
         self.early_stop_rel_tol = float(early_stop_rel_tol)
-        self.adaptive_restarts = bool(adaptive_restarts)
-        self.restart_fidelity_threshold = float(restart_fidelity_threshold)
         self.sweep_passes = int(sweep_passes)
         self._adam = optax.adam(learning_rate=lr)
 
         if self.use_linear_trace_loss:
             value_and_grad_one = jax.value_and_grad(
-                lambda angles, token_ids: evaluator._linear_loss_one(
-                    angles, token_ids
+                lambda angles, token_ids, u_target: evaluator._linear_loss_one(
+                    angles, token_ids, u_target,
                 )
             )
         else:
             value_and_grad_one = jax.value_and_grad(
-                lambda angles, token_ids: 1.0 - evaluator._fidelity_one(
-                    token_ids, angles,
+                lambda angles, token_ids, u_target: 1.0 - evaluator._fidelity_one(
+                    token_ids, angles, u_target,
                 )
             )
 
@@ -76,10 +64,10 @@ class AngleRefiner:
         real_dtype = evaluator._real_dtype
         rel_tol = jnp.asarray(self.early_stop_rel_tol, dtype=real_dtype)
 
-        def adam_refine_one(angles, token_ids):
+        def adam_refine_one(angles, token_ids, u_target):
             angles = angles.astype(real_dtype)
             opt_state = self._adam.init(angles)
-            init_loss, _ = value_and_grad_one(angles, token_ids)
+            init_loss, _ = value_and_grad_one(angles, token_ids, u_target)
             init_carry = (
                 angles,
                 opt_state,
@@ -95,7 +83,7 @@ class AngleRefiner:
 
             def body(c):
                 a, st, step, best, ba, ss = c
-                v, g = value_and_grad_one(a, token_ids)
+                v, g = value_and_grad_one(a, token_ids, u_target)
                 u, st_new = self._adam.update(g, st, a)
                 a_next = optax.apply_updates(a, u)
                 active = jnp.logical_and(step < max_steps, ss < patience)
@@ -119,8 +107,9 @@ class AngleRefiner:
             final_carry = jax.lax.while_loop(cond, body, init_carry)
             return final_carry[4]
 
-        self._refine_batch = jax.jit(jax.vmap(adam_refine_one, in_axes=(0, 0)))
-        self._rng_seed = 0
+        self._refine_batch = jax.jit(
+            jax.vmap(adam_refine_one, in_axes=(0, 0, None))
+        )
 
     def _run_adam(
         self,
@@ -133,6 +122,7 @@ class AngleRefiner:
             self._refine_batch(
                 jnp.asarray(init_angles_batch, dtype=real_dtype),
                 token_jax,
+                self.evaluator.u_target,
             ),
             dtype=np.float32,
             copy=True,
@@ -155,40 +145,10 @@ class AngleRefiner:
                 np.zeros((0,), dtype=np.float32),
                 np.zeros((0, self.evaluator.max_gates), dtype=np.float32),
             )
-        B, T = init_angles_batch.shape
 
         best_fids, best_angles = self._run_adam(
             token_ids_batch, init_angles_batch.astype(np.float32)
         )
-
-        rng = np.random.default_rng(self._rng_seed)
-        self._rng_seed += 1
-        for _ in range(self.num_restarts - 1):
-            if self.adaptive_restarts:
-                needs = best_fids < self.restart_fidelity_threshold
-                if not bool(np.any(needs)):
-                    break
-                keep_idx = np.flatnonzero(needs)
-                sub_tokens = token_ids_batch[keep_idx]
-                sub_init = rng.uniform(
-                    -np.pi, np.pi, size=(keep_idx.size, T)
-                ).astype(np.float32)
-                fids_sub, refined_sub = self._run_adam(sub_tokens, sub_init)
-                cur_sub = best_fids[keep_idx]
-                improved_sub = fids_sub > cur_sub
-                upd_local = np.flatnonzero(improved_sub)
-                if upd_local.size:
-                    upd_global = keep_idx[upd_local]
-                    best_fids[upd_global] = fids_sub[upd_local]
-                    best_angles[upd_global] = refined_sub[upd_local]
-            else:
-                random_init = rng.uniform(
-                    -np.pi, np.pi, size=(B, T)
-                ).astype(np.float32)
-                fids, refined = self._run_adam(token_ids_batch, random_init)
-                improved = fids > best_fids
-                best_fids = np.where(improved, fids, best_fids)
-                best_angles = np.where(improved[:, None], refined, best_angles)
 
         if self.sweep_passes > 0:
             from polish import sweep_refine_batch

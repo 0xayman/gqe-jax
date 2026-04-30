@@ -27,8 +27,12 @@ echo "Setting up VM environment..."
 gcloud compute ssh --zone "$ZONE" "$INSTANCE" --project "$PROJECT_ID" -- '
 set -e
 
-sudo apt update
-sudo apt install -y python3 python3-pip python3-venv git rsync build-essential
+echo "Waiting for apt locks to be released..."
+while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+  sleep 5
+done
+
+sudo apt-get install -y python3 python3-pip python3-venv git rsync build-essential
 
 cd ~/work/gqe-torch
 mkdir -p ~/tmp

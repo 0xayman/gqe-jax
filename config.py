@@ -95,13 +95,10 @@ class RefinementConfig:
     enabled: bool = True
     steps: int = 50
     lr: float = 0.1
-    num_restarts: int = 1
     apply_simplify: bool = True
     use_linear_trace_loss: bool = True
     early_stop_patience: int = 30
     early_stop_rel_tol: float = 1.0e-5
-    adaptive_restarts: bool = True
-    restart_fidelity_threshold: float = 0.999
     sweep_passes: int = 0
     simplify_max_passes: int = 3
 
@@ -258,8 +255,6 @@ def validate_config(raw: dict) -> None:
             raise ValueError("refinement.steps must be positive")
         if r.get("lr", 1.0) <= 0:
             raise ValueError("refinement.lr must be positive")
-        if r.get("num_restarts", 1) < 1:
-            raise ValueError("refinement.num_restarts must be >= 1")
         _require_bool("refinement.apply_simplify", r.get("apply_simplify", True))
         if "use_linear_trace_loss" in r:
             _require_bool(
@@ -269,12 +264,6 @@ def validate_config(raw: dict) -> None:
             raise ValueError("refinement.early_stop_patience must be positive")
         if r.get("early_stop_rel_tol", 1.0) < 0:
             raise ValueError("refinement.early_stop_rel_tol must be >= 0")
-        if "adaptive_restarts" in r:
-            _require_bool("refinement.adaptive_restarts", r["adaptive_restarts"])
-        if not (0.0 < r.get("restart_fidelity_threshold", 0.999) <= 1.0):
-            raise ValueError(
-                "refinement.restart_fidelity_threshold must be in (0, 1]"
-            )
         if r.get("sweep_passes", 0) < 0:
             raise ValueError("refinement.sweep_passes must be >= 0")
         if r.get("simplify_max_passes", 1) <= 0:

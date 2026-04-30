@@ -249,15 +249,10 @@ def _config_snapshot(cfg: GQEConfig) -> dict:
             "enabled": bool(cfg.refinement.enabled),
             "steps": int(cfg.refinement.steps),
             "lr": float(cfg.refinement.lr),
-            "num_restarts": int(cfg.refinement.num_restarts),
             "apply_simplify": bool(cfg.refinement.apply_simplify),
             "use_linear_trace_loss": bool(cfg.refinement.use_linear_trace_loss),
             "early_stop_patience": int(cfg.refinement.early_stop_patience),
             "early_stop_rel_tol": float(cfg.refinement.early_stop_rel_tol),
-            "adaptive_restarts": bool(cfg.refinement.adaptive_restarts),
-            "restart_fidelity_threshold": float(
-                cfg.refinement.restart_fidelity_threshold
-            ),
             "sweep_passes": int(cfg.refinement.sweep_passes),
             "simplify_max_passes": int(cfg.refinement.simplify_max_passes),
         },

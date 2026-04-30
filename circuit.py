@@ -284,35 +284,39 @@ class CircuitEvaluator:
         )
         return U_final
 
-    def _process_fidelity(self, U: jax.Array) -> jax.Array:
+    def _process_fidelity(self, U: jax.Array, u_target: jax.Array) -> jax.Array:
         d = U.shape[0]
-        overlap = jnp.sum(jnp.conjugate(self.u_target) * U)
+        overlap = jnp.sum(jnp.conjugate(u_target) * U)
         return jnp.clip((jnp.abs(overlap) ** 2) / (d ** 2), 0.0, 1.0)
 
-    def _linear_trace_cost(self, U: jax.Array) -> jax.Array:
+    def _linear_trace_cost(self, U: jax.Array, u_target: jax.Array) -> jax.Array:
         d = U.shape[0]
-        overlap = jnp.sum(jnp.conjugate(self.u_target) * U)
+        overlap = jnp.sum(jnp.conjugate(u_target) * U)
         return 1.0 - jnp.abs(overlap) / d
 
     def _build_jit_fns(self) -> None:
-        def fidelity_one(token_ids, angles):
-            return self._process_fidelity(self._build_unitary(token_ids, angles))
+        def fidelity_one(token_ids, angles, u_target):
+            return self._process_fidelity(
+                self._build_unitary(token_ids, angles), u_target,
+            )
 
-        def loss_one(angles, token_ids):
-            return 1.0 - fidelity_one(token_ids, angles)
+        def loss_one(angles, token_ids, u_target):
+            return 1.0 - fidelity_one(token_ids, angles, u_target)
 
-        def linear_loss_one(angles, token_ids):
-            return self._linear_trace_cost(self._build_unitary(token_ids, angles))
+        def linear_loss_one(angles, token_ids, u_target):
+            return self._linear_trace_cost(
+                self._build_unitary(token_ids, angles), u_target,
+            )
 
         self._fidelity_one = jax.jit(fidelity_one)
         self._loss_one = jax.jit(loss_one)
         self._linear_loss_one = jax.jit(linear_loss_one)
-        self._fidelity_batch = jax.jit(jax.vmap(fidelity_one, in_axes=(0, 0)))
+        self._fidelity_batch = jax.jit(jax.vmap(fidelity_one, in_axes=(0, 0, None)))
         self._loss_value_and_grad_batch = jax.jit(
-            jax.vmap(jax.value_and_grad(loss_one), in_axes=(0, 0))
+            jax.vmap(jax.value_and_grad(loss_one), in_axes=(0, 0, None))
         )
         self._linear_loss_value_and_grad_batch = jax.jit(
-            jax.vmap(jax.value_and_grad(linear_loss_one), in_axes=(0, 0))
+            jax.vmap(jax.value_and_grad(linear_loss_one), in_axes=(0, 0, None))
         )
 
     def fidelity_batch(
@@ -325,7 +329,7 @@ class CircuitEvaluator:
             return np.zeros((0,), dtype=np.float32)
         token_jax = jnp.asarray(token_ids_batch, dtype=jnp.int32)
         angle_jax = jnp.asarray(angles_batch, dtype=self._real_dtype)
-        f = self._fidelity_batch(token_jax, angle_jax)
+        f = self._fidelity_batch(token_jax, angle_jax, self.u_target)
         return np.asarray(f, dtype=np.float32)
 
     def loss_value_and_grad_batch(
@@ -334,7 +338,9 @@ class CircuitEvaluator:
         angles_batch: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         """Per-sample (loss, d_loss/d_angles) for a batch."""
-        return self._loss_value_and_grad_batch(angles_batch, token_ids_batch)
+        return self._loss_value_and_grad_batch(
+            angles_batch, token_ids_batch, self.u_target,
+        )
 
     def parametric_mask(self, token_ids: np.ndarray) -> np.ndarray:
         """Boolean mask: which positions hold a parametric (rotation) gate."""
