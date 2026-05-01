@@ -1,0 +1,528 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{Scalability and Code Review Notes for the Current GQE Methodology}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+
+This note reviews the current repository without changing implementation code.  The
+review focuses on the methodology currently implemented in
+\texttt{main.py}, \texttt{trainer.py}, \texttt{policy.py},
+\texttt{circuit.py}, \texttt{refine.py}, \texttt{pareto.py}, and
+\texttt{simplify.py}; it also checks benchmark/reporting paths that affect how
+results are interpreted.
+
+The existing test suite was run with \texttt{pytest -q}.  It passed:
+\[
+  30 \text{ passed.}
+\]
+The test run emitted JAX persistent-cache warnings because the configured cache
+directory under \texttt{\$HOME/.cache/jax-compilation-cache} was read-only in the
+current sandbox.  The warnings do not invalidate the tests, but they matter for
+long repeated runs.
+
+\section{Current Methodology}
+
+The current implementation is a target-conditioned, hybrid-action GQE search:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Gate vocabulary.}  \texttt{operator\_pool.py} builds one token
+  for each configured one-qubit rotation on each qubit, one \texttt{SX} token per
+  qubit, and every directed \texttt{CNOT} pair.  With \(n\) qubits and \(r\)
+  configured rotation axes, the gate pool has
+  \[
+    n(r+1) + n(n-1)
+  \]
+  gate tokens, plus \texttt{BOS}, \texttt{STOP}, and \texttt{PAD}.
+
+  \item \textbf{Target conditioning.}  The target unitary is flattened into
+  real and imaginary parts and projected into the transformer embedding space.
+  This vector has length \(2 \cdot 4^n\).  For 4 qubits this is still small
+  (\(512\) floats), but it grows exponentially.
+
+  \item \textbf{Hybrid policy.}  \texttt{HybridPolicy} is a causal transformer.
+  At every sequence position it emits discrete token logits and a Gaussian
+  angle head \((\mu,\log\sigma)\).  Rollout sampling uses a cached autoregressive
+  decoder in \texttt{build\_rollout\_fn}.  Discrete sampling is from
+  \(\mathrm{softmax}(-\beta \,\mathrm{logits})\), so the logits are being treated
+  like energies rather than conventional larger-is-better logits.
+
+  \item \textbf{Circuit evaluation.}  \texttt{CircuitEvaluator} composes the
+  full \(2^n \times 2^n\) unitary by applying each gate to the rows of the
+  running matrix.  Fidelity is process fidelity,
+  \[
+    F(U,V) = \frac{|\mathrm{Tr}(U^\dagger V)|^2}{d^2},
+    \qquad d = 2^n,
+  \]
+  which is invariant to global phase.
+
+  \item \textbf{Angle refinement.}  Rollouts may be scored after an inner Adam
+  refinement of all sampled angles.  A final archive refinement also runs after
+  training, optionally followed by host-side sweep polishing.
+
+  \item \textbf{Reward.}  The reward is lexicographic in spirit.  Fidelity is
+  optimized first using a log-infidelity reward.  CNOT and depth penalties only
+  activate when fidelity exceeds \texttt{lex\_structure\_fidelity\_threshold}.
+  A sequence discount and no-\texttt{STOP} penalty encourage shorter, terminated
+  rows.
+
+  \item \textbf{Policy update.}  The discrete token policy is updated with a
+  PPO/GRPO-style sequence-level objective.  The stored old log probabilities are
+  only the discrete-token log probabilities.  The continuous angle head is
+  trained by supervised regression toward the stored/refined angles, not by a
+  reward-weighted continuous-action policy-gradient term.
+
+  \item \textbf{Pareto archive.}  Candidate circuits above a fidelity floor are
+  archived under four objectives: maximize fidelity, minimize depth, minimize
+  total gates, and minimize CNOT count.  After final refinement, the archive is
+  simplified algebraically and rebuilt.
+
+  \item \textbf{Simplification.}  \texttt{simplify.py} applies local rewrite
+  rules: same-axis rotation merging, identical CNOT cancellation, zero-angle
+  removal, angle reduction, partial \texttt{SX} periodicity, and two CNOT
+  commutation look-through rules (\(R_Z\) on the CNOT control and \(R_X\) on the
+  CNOT target).
+\end{enumerate}
+
+\section{Interpretation of the 2-Qubit Improvement}
+
+The strong 2-qubit results after simplification are plausible because the policy
+often samples redundant circuits.  Post-hoc algebraic simplification can remove
+many redundant rotations and CNOT pairs without changing process fidelity.  The
+current benchmark logs show 2-qubit brickwork runs reaching \(F=1.0\) with
+competitive or better CNOT counts after simplification.
+
+The important caveat is that simplification is currently mostly a reporting and
+archive post-processing step.  The policy is trained and rewarded using the
+pre-simplification structure during rollouts.  Therefore, the improvement shows
+that the sampled circuits contain useful solutions hidden behind redundant
+syntax, but it does not yet mean the policy has learned to sample compact
+canonical circuits directly.  For 4+ qubits, this distinction becomes much more
+important because redundant syntax grows rapidly with sequence length.
+
+\section{Main Scalability Risks}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+Component & Current scaling & Practical issue for 4+ qubits \\
+\midrule
+Dense unitary evaluation & \(O(L4^n)\) per circuit & Expensive with long horizons and refinement \\
+Target feature vector & \(O(4^n)\) & Fine at 4q, increasingly large after that \\
+Transformer PPO forward & \(O(BT^2)\) & Very costly when \(T\) reaches hundreds \\
+Rollout decoder & roughly \(O(BT^2)\) & KV cache still attends over full length each step \\
+Inner refinement & \(O(BS_{\rm ref}L4^n)\) & Dominant cost if applied to every sample \\
+Pareto update batch & \(O((A+K)^2)\) & Manageable at current sizes, risky if \(K\) grows \\
+Qiskit dense reference & exponential & Can dominate or fail for 4+ dense targets \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The current default action horizon is especially important.  The function
+\texttt{rollout\_context\_tokens} estimates an action budget from a generic CNOT
+lower-bound-like expression:
+\[
+  \left\lceil \frac{4^n - 3n - 1}{4} \right\rceil.
+\]
+It then uses roughly \(7.5\) times that value, with a minimum of \(32\) and a
+maximum of \(1023\) actions.  This gives:
+\[
+  T_{\rm actions}(2q)=32,\quad
+  T_{\rm actions}(3q)\approx105,\quad
+  T_{\rm actions}(4q)\approx458,\quad
+  T_{\rm actions}(5q)=1023 \text{ (cap)}.
+\]
+For structured brickwork targets, these horizons can be far larger than needed.
+For dense Haar targets, they may still be insufficient or inefficient because the
+search space is enormous.
+
+\section{Recommendations for Scaling to 4+ Qubits}
+
+\subsection{Make Simplification Part of the Search Loop}
+
+The biggest methodological change should be to score and archive simplified
+circuits during rollout, not only after training.  A recommended pipeline is:
+
+\begin{enumerate}[leftmargin=*]
+  \item Decode sampled tokens and angles.
+  \item Simplify/canonicalize the circuit.
+  \item Recompute simplified depth, total gates, and CNOT count.
+  \item Use the simplified structural metrics in the reward.
+  \item Store the simplified sequence in the archive using a canonical hash.
+\end{enumerate}
+
+This gives the policy credit for circuits that simplify well and prevents the
+archive from filling with syntactically different versions of the same circuit.
+For 4+ qubits, this is likely more valuable than simply increasing model size.
+
+\subsection{Use Target-Aware Action Budgets}
+
+The action budget should be configurable and target-aware.  For 4-qubit
+brickwork targets, a horizon of \(458\) is probably too expensive and too
+permissive.  Start with shorter horizons such as \(64\), \(96\), or \(128\),
+then increase only if the Pareto front saturates below the desired fidelity.
+
+For dense 4-qubit Haar targets, use a separate configuration because the required
+gate count is much larger.  Do not use the same horizon and sampling budget for
+brickwork, random reachable, and full Haar targets.
+
+\subsection{Refine Only Promising Skeletons}
+
+The inner refiner is very expensive because it optimizes every sampled circuit.
+For 4+ qubits, use a two-stage scoring scheme:
+
+\begin{enumerate}[leftmargin=*]
+  \item Evaluate raw fidelities for all samples.
+  \item Select the top \(K\) candidates by raw fidelity, archive novelty, or
+  simplified compactness.
+  \item Run Adam refinement only on those \(K\) candidates.
+  \item Use exact refined scores for archive updates.
+\end{enumerate}
+
+The angle head can still learn from the refined candidates.  This keeps the
+benefit of refinement without multiplying the full rollout cost by the number of
+Adam steps for every sample.
+
+\subsection{Constrain the CNOT Topology When Appropriate}
+
+The current pool includes all directed CNOTs.  For \(n=4\), this is \(12\) CNOT
+tokens; for larger \(n\), it grows as \(n(n-1)\).  If the target is brickwork or
+hardware-local, restrict CNOTs to the relevant graph.  This reduces the token
+space, removes many bad skeletons, and makes Qiskit comparisons more meaningful.
+
+A good next experiment is a 4-qubit nearest-neighbor brickwork setup with only
+adjacent CNOT directions, then compare against an all-to-all run.
+
+\subsection{Use Hierarchical or Blockwise Synthesis}
+
+For 4+ qubits, especially dense targets, direct monolithic sequence search is
+not the most scalable route.  Better options are:
+
+\begin{itemize}[leftmargin=*]
+  \item decompose the target into two-qubit or nearest-neighbor blocks, then use
+  GQE to optimize each block or boundary;
+  \item use known decompositions such as KAK for two-qubit blocks and CSD/QSD for
+  larger unitaries, then let GQE reduce or rewrite the resulting circuit;
+  \item train the policy to synthesize and simplify local windows rather than
+  entire dense unitaries from scratch.
+\end{itemize}
+
+This also matches the observation that simplification gives large gains: a local
+rewrite/synthesis model can specialize in removing redundancies introduced by a
+baseline decomposition.
+
+\subsection{Use Approximate Screening Before Exact Unitary Fidelity}
+
+Dense exact fidelity is still feasible at 4 qubits, but the combination of long
+horizons, many samples, and refinement is expensive.  For larger systems, screen
+candidates with cheaper metrics first:
+
+\begin{itemize}[leftmargin=*]
+  \item random input-state probes;
+  \item selected Pauli-transfer or Hilbert-Schmidt sketches;
+  \item target-specific local observables for structured circuits.
+\end{itemize}
+
+Only top candidates should receive full \(2^n \times 2^n\) unitary evaluation and
+angle refinement.
+
+\subsection{Use Curriculum and Warm Starts}
+
+The current runs initialize a fresh policy for each target.  For 4+ qubits, use
+curriculum:
+
+\begin{itemize}[leftmargin=*]
+  \item train on reachable/random shallow targets before harder brickwork or
+  Haar-like targets;
+  \item increase qubit count, target depth, and horizon gradually;
+  \item pretrain on many target circuits so the target-conditioned policy learns
+  reusable structure;
+  \item warm-start 4-qubit runs from 3-qubit or smaller-depth checkpoints.
+\end{itemize}
+
+\section{Confirmed Bugs and Implementation Issues}
+
+\subsection{High Priority: Simplified Angle Alignment Breaks Reported Qiskit Circuits}
+
+Files involved: \texttt{simplify.py} and \texttt{reporting.py}.
+
+\texttt{simplify.py:\_encode} returns an angle vector with a leading BOS-aligned
+zero:
+\[
+  [0,\theta_1,\theta_2,\ldots].
+\]
+However \texttt{reporting.py:build\_qiskit\_circuit\_from\_actions} removes BOS
+from the token sequence and then reads \texttt{angles[pos]}.  That function
+expects action-aligned angles:
+\[
+  [\theta_1,\theta_2,\ldots].
+\]
+
+I confirmed this with a one-gate 2-qubit probe.  A simplified circuit containing
+\(R_Z(0.7)\) stored angles as
+\[
+  [0, 0.699999988, 0, 0].
+\]
+When passed to reporting, the Qiskit circuit used angle \(0\) for the first gate.
+The archive-reported fidelity was \(1.0\), while the Qiskit-recomputed fidelity
+was \(0.8824210975\).
+
+Impact: benchmark Pareto metrics can still be mathematically meaningful if the
+simplification itself is correct, but exported/reported Qiskit circuits after
+simplification can be wrong.  This can make \texttt{verified\_fidelity} and
+\texttt{qc\_fidelity} disagree.  Before using simplified circuits as final
+artifacts, the project needs one consistent angle convention.
+
+\subsection{High Priority: Documented SX Periodicity Is Not Fully Implemented}
+
+Files involved: \texttt{simplify.py} and \texttt{docs/simplification\_rules.tex}.
+
+The documentation says:
+\[
+  \mathrm{SX}^2 = R_X(\pi), \qquad \mathrm{SX}^4 = I.
+\]
+The implementation only rewrites \(\mathrm{SX}^2\) when an \texttt{RX} token
+exists in the configured pool.  With the current default-style pool
+\texttt{["rz", "ry"]}, four consecutive \texttt{SX} gates remain unchanged.
+
+With an \texttt{RX}-enabled pool, four \texttt{SX} gates simplify only to
+\(R_X(2\pi)\), not to identity.  This is because the code reduces modulo
+\(4\pi\) and only drops angles close to \(0\), while the documentation states
+that \(2\pi\) rotations may be dropped as global phase under the process-fidelity
+objective.
+
+Impact: the simplifier leaves avoidable gates in exactly the kind of redundant
+circuits that become common in long 4+ qubit rollouts.
+
+\subsection{High Priority: Simplification Is Not Used in the Rollout Reward}
+
+Files involved: \texttt{trainer.py} and \texttt{simplify.py}.
+
+During rollout, CNOT count, depth, total gates, reward, and archive admission are
+computed from the raw sampled sequence.  Simplification is applied only after
+training to the final archive.  This means compact-after-rewrite circuits do not
+receive structural reward credit during learning.
+
+Impact: for 4+ qubits, the policy may learn to rely on post-processing instead
+of learning compact canonical skeletons.  The larger the horizon, the worse this
+credit-assignment mismatch becomes.
+
+\subsection{High Priority: One-Qubit Evaluation Is Broken Although Config Allows It}
+
+Files involved: \texttt{config.py} and \texttt{circuit.py}.
+
+\texttt{validate\_config} allows \texttt{num\_qubits=1}.  But
+\texttt{CircuitEvaluator.\_build\_unitary} always computes both the one-qubit and
+two-qubit branches before selecting with \texttt{jnp.where}.  For \(n=1\),
+\(\texttt{d // 4}=0\), so the two-qubit branch has incompatible row-block shapes.
+A direct 1-qubit fidelity call fails with:
+\[
+  \texttt{TypeError: add got incompatible shapes for broadcasting: (0, 2), (2, 2).}
+\]
+
+Impact: not directly a 4-qubit blocker, but it is a correctness gap and a sign
+that branch evaluation in the JAX circuit evaluator should be tested more
+thoroughly.
+
+\subsection{Medium Priority: Continuous Angle Log Probabilities Are Not Used by PPO}
+
+Files involved: \texttt{trainer.py}, \texttt{policy.py}, and \texttt{loss.py}.
+
+The rollout path samples continuous angles and there is code for wrapped-normal
+log probabilities, but the PPO update stores and uses only discrete-token
+\texttt{log\_p\_disc}.  \texttt{log\_p\_cont} is computed in one helper but is not
+part of the sequence PPO ratio.  The angle head is trained with a supervised
+\(1-\cos(\Delta\theta)\) loss toward stored refined angles.
+
+This may be intentional, and it can work when angle refinement supplies good
+targets.  The limitation is that reward does not directly reinforce angle
+sampling.  As qubit count and angle dimension grow, this may make the policy
+depend more heavily on expensive classical refinement.
+
+\subsection{Medium Priority: No Fidelity Reverification After Simplification}
+
+Files involved: \texttt{simplify.py}.
+
+\texttt{simplify\_point} copies the old fidelity into the new \texttt{ParetoPoint}
+without reevaluating the simplified sequence.  The rewrite rules are intended to
+be exact, but the confirmed angle-alignment issue shows why a verification pass
+is important.
+
+Recommendation: after simplification, recompute fidelity for at least debug mode
+or archive-finalization mode and assert that the process fidelity did not drop
+beyond a small tolerance.
+
+\subsection{Medium Priority: Archive Can Store Duplicate Objective Points}
+
+Files involved: \texttt{pareto.py}.
+
+Dominance requires strict improvement in at least one objective.  Two different
+circuits with identical \((F,\mathrm{depth},\mathrm{gates},\mathrm{CNOTs})\) do
+not dominate each other, so duplicates can remain until crowding pruning removes
+something.  For 4+ qubits, this wastes archive capacity.
+
+Recommendation: store a canonical simplified circuit hash and reject exact
+duplicates, or keep only the shorter/canonical representative for each objective
+tuple.
+
+\subsection{Medium Priority: Action Horizon Is Hard-Coded Rather Than Configurable}
+
+Files involved: \texttt{trainer.py}.
+
+\texttt{rollout\_context\_tokens} is not exposed in \texttt{config.yml}.  Because
+it grows quickly with \(n\), 4-qubit runs can silently move to hundreds of
+actions.  This affects transformer memory, rollout time, refinement time, and
+archive complexity.
+
+Recommendation: make the action horizon a config field with sensible
+target-type defaults.
+
+\subsection{Medium Priority: Benchmark Outputs Are Not Crash-Resilient}
+
+Files involved: \texttt{benchmark.py}.
+
+\texttt{benchmark.py} contains helper functions for JSONL loading, completed
+seed detection, summary writing, and metadata writing, but the main function does
+not currently write per-seed JSONL rows or the summary/metadata files.  It keeps
+rows in memory and writes final CSV/plot/log outputs at the end.
+
+Impact: long 4-qubit or 5-qubit benchmarks can lose most results if interrupted.
+This is a scalability and reproducibility problem.
+
+\subsection{Medium Priority: Run Artifacts Do Not Store Reconstructable Circuits}
+
+Files involved: \texttt{reporting.py}.
+
+\texttt{save\_run\_artifact} stores target matrices, config, logs, and Pareto
+metrics, but not the token sequences or optimized angle arrays for Pareto
+entries.  This makes it hard to verify, rerender, or post-process the exact
+circuits later.
+
+Recommendation: store token sequences, angle arrays, and the angle convention
+explicitly.
+
+\subsection{Lower Priority: Hypervolume Is Not Comparable Across Runs}
+
+Files involved: \texttt{pareto.py}.
+
+\texttt{hypervolume\_2d} uses a reference CNOT count derived from the current
+archive maximum.  This makes the value convenient as a rough within-run summary,
+but it should not be compared across runs unless the reference point is fixed.
+
+\subsection{Lower Priority: Dead or Partially Integrated Code Paths}
+
+Examples:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{trainer.py} defines \texttt{model\_forward} inside
+  \texttt{\_compile\_jit\_fns} but does not use it.
+  \item \texttt{loss.py:joint\_sequence\_log\_prob} supports joint discrete and
+  continuous sequence log probabilities, but the training loop does not use it.
+  \item \texttt{benchmark.py} contains unused JSONL/summary/metadata helpers.
+\end{itemize}
+
+These are not correctness failures by themselves, but they make it harder to see
+the intended training objective and benchmark workflow.
+
+\section{Bottlenecks to Address Before 4-Qubit Sweeps}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Inner refinement on every sample.}  With
+  \texttt{num\_samples=2048}, \texttt{inner\_refine\_steps=16}, and a 4-qubit
+  horizon near \(458\), refinement is likely the dominant cost.
+
+  \item \textbf{Transformer sequence length.}  PPO training uses full-sequence
+  causal attention.  The jump from \(T=105\) at 3 qubits to \(T=459\) at 4
+  qubits is large.
+
+  \item \textbf{Dense exact evaluation.}  Dense \(16 \times 16\) matrices are
+  still manageable for 4 qubits, but not when multiplied by long sequences, large
+  batches, and many refinement steps.
+
+  \item \textbf{Host/device transfer and Python loops.}  Each epoch converts
+  rollout outputs to NumPy, pushes buffer entries in a Python loop, builds Python
+  Pareto objects, and may run host-side sweep polishing.  These costs grow with
+  sample count and archive size.
+
+  \item \textbf{Qiskit reference compilation.}  Compiling dense
+  \texttt{UnitaryGate} targets can become expensive for 4+ qubits and should be
+  optional in training-oriented runs.
+
+  \item \textbf{JAX compilation/cache setup.}  Current cache warnings indicate
+  the persistent compilation cache may not be usable in some environments.  This
+  is painful when changing qubit count, horizon, or batch size because JAX must
+  recompile large functions.
+\end{enumerate}
+
+\section{Suggested 4-Qubit Roadmap}
+
+\subsection{Phase 0: Correctness Before New Claims}
+
+Before trusting 4-qubit results, fix or guard:
+
+\begin{itemize}[leftmargin=*]
+  \item one consistent angle-array convention across refinement, simplification,
+  reporting, and artifacts;
+  \item fidelity verification after simplification;
+  \item tests for \(\mathrm{SX}^4\), \(R_P(2\pi)\) global-phase removal if that
+  remains part of the objective, and report-circuit fidelity after
+  simplification;
+  \item artifact storage of token sequences and angles.
+\end{itemize}
+
+\subsection{Phase 1: Structured 4-Qubit Brickwork}
+
+Start with brickwork targets, not full Haar targets.  Recommended experiment
+shape:
+
+\begin{itemize}[leftmargin=*]
+  \item nearest-neighbor CNOT pool first, then compare all-to-all;
+  \item horizon \(64\) to \(128\), increased only if needed;
+  \item inner refinement on top-\(K\) samples rather than all samples;
+  \item online simplification before reward and archive update;
+  \item per-seed JSONL writes so long runs are resumable.
+\end{itemize}
+
+\subsection{Phase 2: Broader 4-Qubit Targets}
+
+After structured targets are stable, try harder 4-qubit targets:
+
+\begin{itemize}[leftmargin=*]
+  \item random reachable targets with known generating circuits;
+  \item deeper brickwork targets;
+  \item dense Haar targets only with reduced sample counts and staged
+  refinement.
+\end{itemize}
+
+Use Qiskit as a reference, but decouple Qiskit compilation from the training loop
+so training runs do not fail or slow down because of reference synthesis.
+
+\subsection{Phase 3: 5+ Qubits}
+
+For 5+ qubits, direct dense-unitary sequence search should not be the main plan.
+Use hierarchical decomposition, local-window GQE, tensor-network or sketch-based
+screening, and exact dense verification only for final candidates where feasible.
+
+\section{Bottom Line}
+
+The current 2-qubit improvement is a useful signal: the policy is finding
+high-fidelity circuits with substantial removable redundancy.  To make the
+method scale, the simplifier should become part of the learning and archiving
+loop, not only a final reporting step.  The most urgent correctness issue is the
+angle-alignment mismatch after simplification, because it can make exported
+Qiskit circuits disagree with archive fidelities.  The most urgent scalability
+issue is the combination of long 4-qubit horizons and per-sample inner
+refinement.
+
+\end{document}

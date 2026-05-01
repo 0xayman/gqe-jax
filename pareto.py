@@ -19,6 +19,7 @@ class ParetoPoint:
     token_sequence: np.ndarray
     epoch: int
     opt_angles: Optional[np.ndarray] = None
+    canonical_hash: Optional[str] = None
 
 
 class ParetoArchive:
@@ -39,6 +40,7 @@ class ParetoArchive:
         self._depth = np.zeros((0,), dtype=np.int32)
         self._total = np.zeros((0,), dtype=np.int32)
         self._cnot = np.zeros((0,), dtype=np.int32)
+        self._hash_to_index: dict[str, int] = {}
 
     def _rebuild_arrays(self) -> None:
         if not self._archive:
@@ -46,6 +48,7 @@ class ParetoArchive:
             self._depth = np.zeros((0,), dtype=np.int32)
             self._total = np.zeros((0,), dtype=np.int32)
             self._cnot = np.zeros((0,), dtype=np.int32)
+            self._hash_to_index = {}
             return
         self._fid = np.fromiter(
             (p.fidelity for p in self._archive), dtype=np.float32, count=len(self._archive)
@@ -60,6 +63,36 @@ class ParetoArchive:
         )
         self._cnot = np.fromiter(
             (p.cnot_count for p in self._archive), dtype=np.int32, count=len(self._archive)
+        )
+        self._hash_to_index = {
+            p.canonical_hash: i
+            for i, p in enumerate(self._archive)
+            if p.canonical_hash is not None
+        }
+
+    @staticmethod
+    def _prefer_replacement(
+        candidate: ParetoPoint,
+        incumbent: ParetoPoint,
+        fidelity_tol: float,
+    ) -> bool:
+        """Return whether a same-hash candidate is the better representative."""
+        if candidate.fidelity > incumbent.fidelity + fidelity_tol:
+            return True
+        if incumbent.fidelity > candidate.fidelity + fidelity_tol:
+            return False
+        return (
+            candidate.cnot_count,
+            candidate.depth,
+            candidate.total_gates,
+            -candidate.fidelity,
+            candidate.epoch,
+        ) < (
+            incumbent.cnot_count,
+            incumbent.depth,
+            incumbent.total_gates,
+            -incumbent.fidelity,
+            incumbent.epoch,
         )
 
     @staticmethod
@@ -85,6 +118,17 @@ class ParetoArchive:
         """Insert one point and evict archive entries it dominates."""
         if point.fidelity < self.fidelity_floor:
             return False
+
+        if point.canonical_hash is not None:
+            existing_idx = self._hash_to_index.get(point.canonical_hash)
+            if existing_idx is not None:
+                existing = self._archive[existing_idx]
+                if not self._prefer_replacement(
+                    point, existing, self.fidelity_tol
+                ):
+                    return False
+                self._archive.pop(existing_idx)
+                self._rebuild_arrays()
 
         if self._fid.size > 0:
             pf = np.float32(point.fidelity)
@@ -132,6 +176,8 @@ class ParetoArchive:
         self._depth = np.append(self._depth, np.int32(point.depth))
         self._total = np.append(self._total, np.int32(point.total_gates))
         self._cnot = np.append(self._cnot, np.int32(point.cnot_count))
+        if point.canonical_hash is not None:
+            self._hash_to_index[point.canonical_hash] = len(self._archive) - 1
 
         if self.max_size > 0 and len(self._archive) > self.max_size:
             self._prune_by_crowding()
@@ -147,7 +193,22 @@ class ParetoArchive:
         if not candidates:
             return
 
-        combined = list(self._archive) + candidates
+        combined: list[ParetoPoint] = []
+        hash_to_idx: dict[str, int] = {}
+        for p in [*self._archive, *candidates]:
+            h = p.canonical_hash
+            if h is None:
+                combined.append(p)
+                continue
+            existing_idx = hash_to_idx.get(h)
+            if existing_idx is None:
+                hash_to_idx[h] = len(combined)
+                combined.append(p)
+                continue
+            existing = combined[existing_idx]
+            if self._prefer_replacement(p, existing, self.fidelity_tol):
+                combined[existing_idx] = p
+
         n = len(combined)
         fids = np.fromiter((p.fidelity for p in combined), dtype=np.float32, count=n)
         depths = np.fromiter((p.depth for p in combined), dtype=np.int32, count=n)
@@ -174,6 +235,11 @@ class ParetoArchive:
         self._depth = depths[keep_idx]
         self._total = totals[keep_idx]
         self._cnot = cnots[keep_idx]
+        self._hash_to_index = {
+            p.canonical_hash: i
+            for i, p in enumerate(self._archive)
+            if p.canonical_hash is not None
+        }
 
         while self.max_size > 0 and len(self._archive) > self.max_size:
             self._prune_by_crowding()
@@ -205,6 +271,11 @@ class ParetoArchive:
         self._depth = np.delete(self._depth, remove_idx)
         self._total = np.delete(self._total, remove_idx)
         self._cnot = np.delete(self._cnot, remove_idx)
+        self._hash_to_index = {
+            p.canonical_hash: i
+            for i, p in enumerate(self._archive)
+            if p.canonical_hash is not None
+        }
 
     def set_fidelity_floor(self, floor: float) -> None:
         """Raise the fidelity floor and evict any entries below it."""

@@ -42,6 +42,7 @@ from policy import (
 from refine import AngleRefiner, refine_pareto_archive
 from reporting import select_report_token_sequence
 from scheduler import FixedScheduler, LinearScheduler
+from simplify import simplify_token_sequence
 from target import build_target
 from trainer import Trainer, _row_structure_metrics, gqe, rollout_context_tokens
 
@@ -396,6 +397,24 @@ def test_pareto_dominance_includes_total_gates():
     assert points[0].total_gates == 2
 
 
+def test_archive_deduplicates_canonical_hashes():
+    archive = ParetoArchive(max_size=8, fidelity_floor=0.0)
+    bloated = np.asarray([0, 3, 4, 1], dtype=np.int32)
+    compact = np.asarray([0, 3, 1, 2], dtype=np.int32)
+    assert archive.update(ParetoPoint(
+        fidelity=0.98, depth=3, total_gates=3, cnot_count=1,
+        token_sequence=bloated, epoch=0, canonical_hash="same",
+    ))
+    assert archive.update(ParetoPoint(
+        fidelity=0.99, depth=2, total_gates=2, cnot_count=1,
+        token_sequence=compact, epoch=1, canonical_hash="same",
+    ))
+    points = archive.to_sorted_list()
+    assert len(points) == 1
+    assert points[0].fidelity == 0.99
+    np.testing.assert_array_equal(points[0].token_sequence, compact)
+
+
 def test_best_fidelity_tie_breaks_by_compactness():
     high_cnot = np.asarray([0, 3, 4, 5], dtype=np.int32)
     low_cnot = np.asarray([0, 3, 4, 6], dtype=np.int32)
@@ -524,6 +543,79 @@ def test_row_structure_metrics_skips_noop_tokens():
     assert depth == 3
     assert total == 4
     assert cnots == 1
+
+
+def test_simplify_token_sequence_returns_canonical_metrics_and_hash():
+    pool = build_operator_pool(2, ("rz",))
+    names = ["<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]]
+    name_to_id = {name: i for i, name in enumerate(names)}
+    tokens = np.asarray([
+        name_to_id["<BOS>"],
+        name_to_id["RZ_q0"],
+        name_to_id["RZ_q0"],
+        name_to_id["CNOT_q0_q1"],
+        name_to_id["CNOT_q0_q1"],
+        name_to_id["<STOP>"],
+        name_to_id["<PAD>"],
+    ], dtype=np.int32)
+    angles = np.asarray([0.2, 0.3, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    simplified, simplified_angles, depth, total, cnots, h1 = (
+        simplify_token_sequence(tokens, angles, pool, num_qubits=2)
+    )
+    direct = np.asarray([
+        name_to_id["<BOS>"],
+        name_to_id["RZ_q0"],
+        name_to_id["<STOP>"],
+        name_to_id["<PAD>"],
+        name_to_id["<PAD>"],
+        name_to_id["<PAD>"],
+        name_to_id["<PAD>"],
+    ], dtype=np.int32)
+    direct_angles = np.asarray([0.5, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    _, _, _, _, _, h2 = simplify_token_sequence(
+        direct, direct_angles, pool, num_qubits=2,
+    )
+
+    np.testing.assert_array_equal(simplified, direct)
+    np.testing.assert_allclose(simplified_angles, direct_angles, atol=1e-6)
+    assert (depth, total, cnots) == (1, 1, 0)
+    assert h1 == h2
+
+
+def test_trainer_simplifies_rollout_metrics_before_reward_and_archive():
+    trainer, _ = _build_trainer(pareto_enabled=True)
+    name_to_id = {name: i for i, name in enumerate(trainer.pool_token_names)}
+    tokens = np.asarray([[
+        name_to_id["<BOS>"],
+        name_to_id["RZ_q0"],
+        name_to_id["RZ_q0"],
+        name_to_id["CNOT_q0_q1"],
+        name_to_id["CNOT_q0_q1"],
+        name_to_id["<STOP>"],
+    ]], dtype=np.int32)
+    angles = np.asarray([[0.4, -0.4, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+    simplified, simplified_angles, depths, totals, cnots, hashes = (
+        trainer._simplify_rollout_sequences(tokens, angles)
+    )
+
+    np.testing.assert_array_equal(
+        simplified[0],
+        np.asarray([
+            name_to_id["<BOS>"],
+            name_to_id["<STOP>"],
+            name_to_id["<PAD>"],
+            name_to_id["<PAD>"],
+            name_to_id["<PAD>"],
+            name_to_id["<PAD>"],
+        ], dtype=np.int32),
+    )
+    np.testing.assert_allclose(simplified_angles[0], np.zeros(5), atol=1e-6)
+    np.testing.assert_array_equal(depths, [0])
+    np.testing.assert_array_equal(totals, [0])
+    np.testing.assert_array_equal(cnots, [0])
+    assert len(hashes) == 1
 
 
 def test_inner_refinement_lifts_rollout_fidelity():

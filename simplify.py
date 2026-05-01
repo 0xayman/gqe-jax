@@ -13,6 +13,7 @@ Rules 1-2 are the user-specified ones; 3-7 are verified extensions:
 from __future__ import annotations
 
 import math
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,9 +21,13 @@ import numpy as np
 from pareto import ParetoArchive, ParetoPoint
 
 _GATE_OFFSET = 3        # tokens 0/1/2 are BOS/STOP/special
+_BOS_TOKEN = 0
+_STOP_TOKEN = 1
+_PAD_TOKEN = 2
 _FOUR_PI = 4.0 * math.pi
 _TWO_PI  = 2.0 * math.pi
 _ANGLE_TOL = 1e-9
+_HASH_ANGLE_SCALE = 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +72,25 @@ def _commutes_through(gt: str, qubits: tuple, blocker: _Op) -> bool:
 # Decode token sequence → list[_Op]
 # ---------------------------------------------------------------------------
 
+def _angles_to_bos_layout(tokens: np.ndarray, angles: np.ndarray | None) -> np.ndarray:
+    """Return an angle vector indexed like a full BOS-prefixed token row."""
+    out = np.zeros(len(tokens), dtype=np.float64)
+    if angles is None:
+        return out
+    raw = np.asarray(angles, dtype=np.float64)
+    if raw.size == len(tokens):
+        return raw
+    n = min(raw.size, max(len(tokens) - 1, 0))
+    out[1:1 + n] = raw[:n]
+    return out
+
+
 def _decode(tokens: np.ndarray, angles: np.ndarray, pool) -> list[_Op]:
     ops: list[_Op] = []
     for pos in range(1, len(tokens)):
         tok = int(tokens[pos])
+        if tok == _STOP_TOKEN:
+            break
         if tok < _GATE_OFFSET:
             continue
         name, _ = pool[tok - _GATE_OFFSET]
@@ -97,22 +117,30 @@ def _encode(
     pool_name_map: dict[str, int],
     orig_len: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    toks: list[int]   = [0]    # BOS
-    angs: list[float] = [0.0]
+    toks: list[int] = [_BOS_TOKEN]
+    action_angs: list[float] = []
+    action_len = max(orig_len - 1, 0)
     for op in ops:
+        if len(toks) >= orig_len:
+            break
         if op.gate_type in ('RX', 'RY', 'RZ', 'SX'):
             name = f"{op.gate_type}_q{op.qubits[0]}"
         else:
             name = f"CNOT_q{op.qubits[0]}_q{op.qubits[1]}"
         toks.append(pool_name_map[name] + _GATE_OFFSET)
-        angs.append(op.angle)
-    # Pad to original length with STOP (1); tokens[i] >= 3 filter ignores these
+        action_angs.append(op.angle)
+
+    if len(toks) < orig_len:
+        toks.append(_STOP_TOKEN)
+        action_angs.append(0.0)
     while len(toks) < orig_len:
-        toks.append(1)
-        angs.append(0.0)
+        toks.append(_PAD_TOKEN)
+        action_angs.append(0.0)
+    while len(action_angs) < action_len:
+        action_angs.append(0.0)
     return (
         np.array(toks[:orig_len], dtype=np.int32),
-        np.array(angs[:orig_len], dtype=np.float64),
+        np.array(action_angs[:action_len], dtype=np.float64),
     )
 
 
@@ -223,9 +251,50 @@ def _compute_metrics(ops: list[_Op], num_qubits: int) -> tuple[int, int, int]:
     return depth, total, cnot_count
 
 
+def _canonical_hash(ops: list[_Op]) -> str:
+    """Return a stable hash for the canonical simplified operation stream."""
+    h = hashlib.sha256()
+    h.update(b"gqe-simplified-v1")
+    for op in ops:
+        h.update(op.gate_type.encode("ascii"))
+        h.update(b":")
+        h.update(",".join(str(int(q)) for q in op.qubits).encode("ascii"))
+        if op.gate_type in ("RX", "RY", "RZ"):
+            angle_key = int(round(_reduce_angle(op.angle) * _HASH_ANGLE_SCALE))
+            h.update(f":{angle_key}".encode("ascii"))
+        h.update(b";")
+    return h.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def simplify_token_sequence(
+    token_sequence: np.ndarray,
+    angles: np.ndarray | None,
+    pool,
+    num_qubits: int,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, str]:
+    """Simplify one BOS-prefixed token sequence and return canonical metrics.
+
+    The returned angle vector follows the rollout/evaluator convention: it is
+    aligned to the action tokens and therefore excludes the BOS position.
+    """
+    tokens = np.asarray(token_sequence, dtype=np.int32)
+    aligned_angles = _angles_to_bos_layout(tokens, angles)
+
+    pool_name_map = {name: idx for idx, (name, _) in enumerate(pool)}
+    rx_qubits = {int(n.split('_')[1][1:]) for n, _ in pool if n.startswith('RX_')}
+
+    ops = _decode(tokens, aligned_angles, pool)
+    ops = _simplify_ops(ops, rx_qubits)
+
+    depth, total, cnot_count = _compute_metrics(ops, num_qubits)
+    canonical_hash = _canonical_hash(ops)
+    new_tokens, new_angles = _encode(ops, pool_name_map, orig_len=len(tokens))
+    return new_tokens, new_angles, depth, total, cnot_count, canonical_hash
+
 
 def simplify_point(point: ParetoPoint, pool, num_qubits: int) -> ParetoPoint:
     """Return a new ParetoPoint with its circuit algebraically simplified.
@@ -234,28 +303,9 @@ def simplify_point(point: ParetoPoint, pool, num_qubits: int) -> ParetoPoint:
     Metrics (depth, total_gates, cnot_count) are recomputed from the simplified
     gate sequence.
     """
-    tokens = np.asarray(point.token_sequence, dtype=np.int32)
-    if point.opt_angles is not None:
-        raw = np.asarray(point.opt_angles, dtype=np.float64)
-        if raw.size == len(tokens):
-            angles = raw                          # BOS-aligned (pre-refinement)
-        elif raw.size < len(tokens):
-            # No-BOS convention (post-refinement): shift into BOS-aligned layout
-            angles = np.zeros(len(tokens), dtype=np.float64)
-            angles[1:1 + raw.size] = raw
-        else:
-            angles = raw[:len(tokens)]
-    else:
-        angles = np.zeros(len(tokens), dtype=np.float64)
-
-    pool_name_map = {name: idx for idx, (name, _) in enumerate(pool)}
-    rx_qubits     = {int(n.split('_')[1][1:]) for n, _ in pool if n.startswith('RX_')}
-
-    ops = _decode(tokens, angles, pool)
-    ops = _simplify_ops(ops, rx_qubits)
-
-    depth, total, cnot_count = _compute_metrics(ops, num_qubits)
-    new_tokens, new_angles   = _encode(ops, pool_name_map, orig_len=len(tokens))
+    new_tokens, new_angles, depth, total, cnot_count, canonical_hash = (
+        simplify_token_sequence(point.token_sequence, point.opt_angles, pool, num_qubits)
+    )
 
     return ParetoPoint(
         fidelity=point.fidelity,
@@ -265,6 +315,7 @@ def simplify_point(point: ParetoPoint, pool, num_qubits: int) -> ParetoPoint:
         token_sequence=new_tokens,
         epoch=point.epoch,
         opt_angles=new_angles,
+        canonical_hash=canonical_hash,
     )
 
 

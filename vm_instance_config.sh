@@ -4,7 +4,7 @@
 # instance-4-qubits
 : "${PROJECT_ID:=aymantarig-project}"
 : "${ZONE:=us-central1-f}"
-: "${INSTANCE:=instance-20260430-122147}"
+: "${INSTANCE:=instance-20260501-004701}"
 : "${VM_USER:=aymantarig_aims_ac_za}"
 : "${REMOTE_DIR:=~/work/gqe-torch}"
 : "${LOCAL_PROJECT_DIR:=$HOME/Downloads/Quantum/project/gqe-torch}"

@@ -35,6 +35,7 @@ from policy import (
 )
 from refine import AngleRefiner, refine_pareto_archive
 from scheduler import CosineScheduler, FixedScheduler, LinearScheduler
+from simplify import simplify_pareto_archive, simplify_token_sequence
 
 
 class _WandbLogger:
@@ -467,6 +468,40 @@ class Trainer:
             token_is_noop=self.token_is_noop,
         )
 
+    def _simplify_rollout_sequences(
+        self,
+        tokens: np.ndarray,
+        angles: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
+        """Simplify rollout rows and return canonical tokens, angles, and metrics."""
+        n = int(tokens.shape[0])
+        simplified_tokens = np.empty_like(tokens)
+        simplified_angles = np.zeros_like(angles)
+        depths = np.zeros((n,), dtype=np.int32)
+        totals = np.zeros((n,), dtype=np.int32)
+        cnot_counts = np.zeros((n,), dtype=np.int32)
+        canonical_hashes: list[str] = []
+
+        for i in range(n):
+            st, sa, depth, total, cnot, h = simplify_token_sequence(
+                tokens[i], angles[i], self.pool, self.cfg.target.num_qubits,
+            )
+            simplified_tokens[i] = st
+            simplified_angles[i] = sa.astype(angles.dtype, copy=False)
+            depths[i] = int(depth)
+            totals[i] = int(total)
+            cnot_counts[i] = int(cnot)
+            canonical_hashes.append(h)
+
+        return (
+            simplified_tokens,
+            simplified_angles,
+            depths,
+            totals,
+            cnot_counts,
+            canonical_hashes,
+        )
+
     def collect_rollout(self) -> dict:
         beta = jnp.asarray(self.scheduler.get_inverse_temperature(), dtype=jnp.float32)
         self.rng_key, sub = jax.random.split(self.rng_key)
@@ -495,16 +530,19 @@ class Trainer:
             pareto_angles = init_angles
             refined_fidelities = raw_fidelities
 
-        cnot_counts = np.count_nonzero(
-            self.two_qubit_token_mask[action_tokens], axis=1,
-        ).astype(np.int32)
-        depths_j, totals_j = self._structure_jit(
-            jnp.asarray(action_tokens, dtype=jnp.int32),
-        )
-        depths = np.asarray(depths_j, dtype=np.int32)
-        totals = np.asarray(totals_j, dtype=np.int32)
+        (
+            simplified_tokens,
+            simplified_angles,
+            depths,
+            totals,
+            cnot_counts,
+            canonical_hashes,
+        ) = self._simplify_rollout_sequences(tokens, pareto_angles)
+        simplified_action_tokens = simplified_tokens[:, 1:]
         lengths = np.asarray(
-            compute_lengths_from_tokens(jnp.asarray(action_tokens), self.stop_token_id),
+            compute_lengths_from_tokens(
+                jnp.asarray(simplified_action_tokens), self.stop_token_id,
+            ),
             dtype=np.int32,
         )
         no_stop = ~np.any(action_tokens == self.stop_token_id, axis=1)
@@ -537,7 +575,7 @@ class Trainer:
                 survivors: list[int] = []
                 for i in keep.tolist():
                     rep = _cnot_pair_max_repetition(
-                        action_tokens[i], self.token_qubit0,
+                        simplified_action_tokens[i], self.token_qubit0,
                         self.token_qubit1, window,
                     )
                     if rep <= max_rep:
@@ -550,9 +588,10 @@ class Trainer:
                         depth=int(depths[i]),
                         total_gates=int(totals[i]),
                         cnot_count=int(cnot_counts[i]),
-                        token_sequence=tokens[i].copy(),
+                        token_sequence=simplified_tokens[i].copy(),
                         epoch=self._current_epoch,
-                        opt_angles=pareto_angles[i].copy(),
+                        opt_angles=simplified_angles[i].copy(),
+                        canonical_hash=canonical_hashes[i],
                     )
                     for i in keep.tolist()
                 ]
@@ -561,6 +600,8 @@ class Trainer:
         return {
             "tokens": tokens,
             "angles": pareto_angles,
+            "simplified_tokens": simplified_tokens,
+            "simplified_angles": simplified_angles,
             "init_angles": init_angles,
             "fidelities": fidelities,
             "raw_fidelities": raw_fidelities,
@@ -661,8 +702,12 @@ class Trainer:
             best_idx = int(np.argmin(costs))
             if costs[best_idx] < best_cost:
                 best_cost = float(costs[best_idx])
-                best_tokens = roll["tokens"][best_idx].copy()
-                best_angles = roll["angles"][best_idx].copy()
+                if cfg.reward.enabled:
+                    best_tokens = roll["simplified_tokens"][best_idx].copy()
+                    best_angles = roll["simplified_angles"][best_idx].copy()
+                else:
+                    best_tokens = roll["tokens"][best_idx].copy()
+                    best_angles = roll["angles"][best_idx].copy()
                 best_fidelity = float(fids[best_idx])
 
             best_seen_fidelity = max(best_seen_fidelity, float(np.max(fids)))
@@ -739,6 +784,9 @@ class Trainer:
                     bos_token_id=self.bos_token_id,
                     pad_token_id=self.pad_token_id,
                     verbose=cfg.logging.verbose,
+                )
+                self.pareto_archive = simplify_pareto_archive(
+                    self.pareto_archive, self.pool, cfg.target.num_qubits,
                 )
             elif cfg.logging.verbose:
                 print(
