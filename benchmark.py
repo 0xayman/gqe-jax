@@ -602,10 +602,13 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
             result.pareto_archive, pool, args.num_qubits,
         )
 
+    report_floor = float(base_cfg.reward.pareto_report_fidelity_floor)
     pareto_rows: list[dict] = []
     arc = result.pareto_archive
     if arc is not None:
         for pt in arc.to_sorted_list():
+            if float(pt.fidelity) < report_floor:
+                continue
             pareto_rows.append({
                 "seed": seed,
                 "num_qubits": args.num_qubits,
@@ -615,6 +618,7 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
                 "cnot_count": int(pt.cnot_count),
                 "depth": int(pt.depth),
                 "total_gates": int(pt.total_gates),
+                "circuit": _decode_circuit(pt.token_sequence, pt.opt_angles, pool),
             })
 
     gqe_b = _gqe_summary(result, thresholds)
@@ -656,112 +660,178 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
     return row, pareto_rows
 
 
-def _plot_main(rows: list[dict], png_path: Path) -> None:
-    """4-panel figure: fidelity / CNOT / depth / total-gates, sorted by GQE best fidelity.
+def _plot_main(all_pareto_rows: list[dict], all_rows: list[dict], png_path: Path) -> None:
+    """4-panel bar/dot figure: all Pareto-front circuits, grouped by seed.
 
-    All four panels are built from the same sorted list of per-circuit records so that
-    column i in every panel always refers to the identical circuit.
+    One column per Pareto-front circuit.  Seeds are sorted by best GQE
+    fidelity (ascending) and delimited by alternating background shading.
+    Within each seed group circuits are ordered by fidelity (descending).
+    Qiskit reference values are drawn as coloured horizontal lines spanning
+    each seed's group so the comparison is immediate.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from collections import defaultdict
 
-    rows = [r for r in rows if r.get("gqe_F") is not None]
-    if not rows:
+    all_rows = [r for r in all_rows if r.get("gqe_F") is not None]
+    if not all_rows:
         print("No rows to plot.")
         return
 
-    n_qubits = int(rows[0]["num_qubits"])
-    target_type = rows[0]["target_type"]
+    n_qubits = int(all_rows[0]["num_qubits"])
+    target_type = all_rows[0]["target_type"]
 
-    def _v(row: dict, key: str) -> float:
-        val = row.get(key)
-        return float(val) if val is not None else np.nan
+    # Sort seeds by best GQE fidelity ascending — same convention as before
+    seed_to_best_f = {r["seed"]: float(r["gqe_F"]) for r in all_rows}
+    sorted_seeds = sorted(seed_to_best_f, key=lambda s: seed_to_best_f[s])
 
-    # Sort all per-circuit data together as a single unit — this is the guarantee
-    # that column i in every panel below shows the same circuit.
-    records = sorted(
-        [
-            {
-                "seed":     row.get("seed"),
-                "f":        _v(row, "gqe_F"),
-                "gqe_cnot": _v(row, "gqe_best_cnot"),
-                "gqe_dep":  _v(row, "gqe_best_depth"),
-                "gqe_tot":  _v(row, "gqe_best_total_gates"),
-                "qk_cnot":  _v(row, "qiskit_cnot"),
-                "qk_dep":   _v(row, "qiskit_depth"),
-                "qk_tot":   _v(row, "qiskit_total_gates"),
-            }
-            for row in rows
-        ],
-        key=lambda d: d["f"],
-    )
+    # Group Pareto rows by seed; within each group sort best-fidelity first
+    seed_to_pareto: dict = defaultdict(list)
+    for pr in all_pareto_rows:
+        seed_to_pareto[pr["seed"]].append(pr)
+    for seed in sorted_seeds:
+        seed_to_pareto[seed].sort(key=lambda p: -p["fidelity"])
 
-    n         = len(records)
-    seeds     = [d["seed"] for d in records]
-    f         = np.array([d["f"]        for d in records])
-    gqe_cnot  = np.array([d["gqe_cnot"] for d in records])
-    gqe_dep   = np.array([d["gqe_dep"]  for d in records])
-    gqe_tot   = np.array([d["gqe_tot"]  for d in records])
-    qk_cnot   = np.array([d["qk_cnot"]  for d in records])
-    qk_dep    = np.array([d["qk_dep"]   for d in records])
-    qk_tot    = np.array([d["qk_tot"]   for d in records])
+    seed_to_row = {r["seed"]: r for r in all_rows}
 
-    xs = np.arange(n)
-    width = 0.4
+    # Build a flat ordered list (one entry per Pareto circuit) and track
+    # which x-indices belong to each seed.
+    flat_pts: list[dict] = []
+    seed_to_xrange: dict = {}          # seed -> (x_left, x_right) inclusive
+    for seed in sorted_seeds:
+        pts = seed_to_pareto.get(seed, [])
+        if not pts:
+            continue
+        x0 = len(flat_pts)
+        flat_pts.extend(pts)
+        seed_to_xrange[seed] = (x0, len(flat_pts) - 1)
 
+    n_pts = len(flat_pts)
+    if n_pts == 0:
+        print("No Pareto points to plot.")
+        return
+
+    xs = np.arange(n_pts)
+    fids   = np.array([p["fidelity"]    for p in flat_pts])
+    cnots  = np.array([float(p["cnot_count"])  for p in flat_pts])
+    depths = np.array([float(p["depth"])       for p in flat_pts])
+    totals = np.array([float(p["total_gates"]) for p in flat_pts])
+
+    n_seeds = len(seed_to_xrange)
     fig, axes = plt.subplots(
         4, 1, sharex=True,
-        figsize=(max(10, n * 0.32 + 2), 12),
+        figsize=(max(10, n_pts * 0.3 + 2), 12),
         gridspec_kw={"height_ratios": [1.5, 1, 1, 1]},
     )
 
-    # Panel 1 — fidelity (each dot = same circuit as bars directly below it)
+    legend_handles = [
+        Line2D([0], [0], color="C0", linewidth=5, label="GQE Pareto"),
+        Line2D([0], [0], color="C1", linewidth=2, label="Qiskit"),
+    ]
+
+    # Draw alternating seed bands and Qiskit reference lines on every panel
+    qiskit_col_map = [
+        "qiskit_F", "qiskit_cnot", "qiskit_depth", "qiskit_total_gates"
+    ]
+    for i, seed in enumerate(sorted_seeds):
+        if seed not in seed_to_xrange:
+            continue
+        x0, x1 = seed_to_xrange[seed]
+        row = seed_to_row[seed]
+        bg = "0.92" if i % 2 == 0 else "white"
+        for ax in axes:
+            ax.axvspan(x0 - 0.5, x1 + 0.5, color=bg, zorder=0, lw=0)
+        for ax, col in zip(axes, qiskit_col_map):
+            val = row.get(col)
+            if val is not None:
+                ax.hlines(
+                    float(val), x0 - 0.4, x1 + 0.4,
+                    colors="C1", linewidths=2.0, zorder=5,
+                )
+
+    # Panel 1 — fidelity dots
     ax = axes[0]
-    ax.scatter(xs, f, color="C0", s=30, zorder=3, label="GQE best fidelity")
-    ax.axhline(float(np.nanmedian(f)), color="C0", linestyle="--", linewidth=1.0,
-               alpha=0.6, label=f"GQE median {np.nanmedian(f):.4f}")
+    ax.scatter(xs, fids, color="C0", s=22, zorder=3)
+    med_f = float(np.nanmedian(fids))
+    ax.axhline(med_f, color="C0", linestyle="--", linewidth=1.0, alpha=0.6)
     ax.set_ylabel("Process fidelity")
-    ax.set_ylim(max(0.0, float(np.nanmin(f)) - 0.02), 1.005)
-    ax.legend(loc="lower right", fontsize=8)
-    ax.set_title(
-        f"GQE best-fidelity circuits vs Qiskit — {n} {target_type} {n_qubits}q targets",
-        fontsize=12,
-    )
+    ax.set_ylim(max(0.0, float(np.nanmin(fids)) - 0.02), 1.005)
     stats_txt = (
-        f"N={n}  mean={np.nanmean(f):.5f}  median={np.nanmedian(f):.5f}  "
-        f"min={np.nanmin(f):.5f}"
+        f"N={n_seeds} seeds  {n_pts} Pareto pts  "
+        f"mean={np.nanmean(fids):.5f}  median={med_f:.5f}  "
+        f"min={np.nanmin(fids):.5f}"
     )
     ax.text(
         0.02, 0.05, stats_txt, transform=ax.transAxes, fontsize=8,
         verticalalignment="bottom",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.88, edgecolor="0.7"),
     )
+    ax.set_title(
+        f"GQE Pareto-front circuits vs Qiskit — {n_seeds} {target_type} {n_qubits}q targets",
+        fontsize=12,
+    )
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=8)
 
-    # Panels 2-4 — metrics of the SAME circuit whose fidelity dot sits above
-    panels = [
-        (axes[1], gqe_cnot, qk_cnot, "CNOT count"),
-        (axes[2], gqe_dep,  qk_dep,  "Circuit depth"),
-        (axes[3], gqe_tot,  qk_tot,  "Total gates"),
-    ]
-    for ax, gqe_v, qk_v, ylabel in panels:
-        ax.bar(xs - width / 2, gqe_v, width, color="C0", label="GQE")
-        ax.bar(xs + width / 2, qk_v,  width, color="C1", label="Qiskit")
+    # Panels 2-4 — bar charts for CNOT / depth / total gates
+    for ax, vals, ylabel in [
+        (axes[1], cnots,  "CNOT count"),
+        (axes[2], depths, "Circuit depth"),
+        (axes[3], totals, "Total gates"),
+    ]:
+        ax.bar(xs, vals, color="C0", width=0.7, zorder=3)
         ax.set_ylabel(ylabel)
-        ax.legend(loc="upper right", fontsize=8)
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
 
-    # x-axis: seed labels so each column is traceable to the JSONL / Pareto CSV
-    step = max(1, n // 20)
-    tick_xs    = xs[::step]
-    tick_seeds = seeds[::step]
-    axes[-1].set_xticks(tick_xs)
-    axes[-1].set_xticklabels([str(s) for s in tick_seeds], rotation=45, ha="right", fontsize=7)
+    # X-axis: one tick per seed, at the centre of its group
+    tick_positions = []
+    tick_labels = []
+    for seed in sorted_seeds:
+        if seed not in seed_to_xrange:
+            continue
+        x0, x1 = seed_to_xrange[seed]
+        tick_positions.append((x0 + x1) / 2.0)
+        tick_labels.append(str(seed))
+    step = max(1, len(tick_positions) // 20)
+    axes[-1].set_xticks(tick_positions[::step])
+    axes[-1].set_xticklabels(tick_labels[::step], rotation=45, ha="right", fontsize=7)
     axes[-1].set_xlabel("Seed (sorted by GQE best fidelity, ascending)")
 
     fig.tight_layout()
     fig.savefig(png_path, dpi=140)
     plt.close(fig)
     print(f"Saved plot → {png_path}")
+
+
+def _decode_circuit(token_sequence: np.ndarray, opt_angles, pool) -> str:
+    """Decode a BOS-prefixed token sequence to a human-readable gate string.
+
+    Rotation gates include their optimised angle.  Stops at the first STOP
+    token; BOS and PAD tokens are skipped silently.
+    """
+    _STOP = 1
+    _GATE_OFFSET = 3
+    parts = []
+    for pos in range(1, len(token_sequence)):
+        tok = int(token_sequence[pos])
+        if tok == _STOP:
+            break
+        if tok < _GATE_OFFSET:
+            continue
+        pool_idx = tok - _GATE_OFFSET
+        if pool_idx >= len(pool):
+            parts.append(f"<tok{tok}>")
+            continue
+        name = pool[pool_idx][0]
+        gt = name.split("_")[0]
+        action_idx = pos - 1  # opt_angles is action-aligned (excludes BOS)
+        if gt in ("RX", "RY", "RZ") and opt_angles is not None and action_idx < len(opt_angles):
+            angle = float(opt_angles[action_idx])
+            parts.append(f"{name}({angle:.3f})")
+        else:
+            parts.append(name)
+    return " → ".join(parts) if parts else "(empty)"
 
 
 def _write_pareto_csv(pareto_rows: list[dict], csv_path: Path) -> None:
@@ -771,7 +841,7 @@ def _write_pareto_csv(pareto_rows: list[dict], csv_path: Path) -> None:
         print("No Pareto points recorded — skipping CSV.")
         return
     fields = ["seed", "num_qubits", "target_type", "target_desc",
-              "fidelity", "cnot_count", "depth", "total_gates"]
+              "fidelity", "cnot_count", "depth", "total_gates", "circuit"]
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -948,6 +1018,14 @@ def main():
             f"D={row['qiskit_depth']}  |  "
             f"ETA {eta_h:d}h{eta_m:02d}m"
         )
+        if pareto_rows:
+            logger.log(f"  Pareto front ({len(pareto_rows)} pts):")
+            for pr in sorted(pareto_rows, key=lambda r: (-r["fidelity"], r["cnot_count"])):
+                logger.log(
+                    f"    F={pr['fidelity']:.4f} CX={pr['cnot_count']:2d} "
+                    f"D={pr['depth']:2d} T={pr['total_gates']:2d}  "
+                    f"{pr['circuit']}"
+                )
 
     logger.log("")
     logger.log(f"Benchmark complete. {len(all_rows)} circuits run.")
@@ -956,7 +1034,7 @@ def main():
     _write_pareto_csv(all_pareto_rows, csv_path)
 
     if not args.no_plot:
-        _plot_main(all_rows, png_path)
+        _plot_main(all_pareto_rows, all_rows, png_path)
 
     logger.log("")
     logger.log("Outputs written:")

@@ -938,6 +938,11 @@ class Trainer:
         )
 
 
-def gqe(cfg: GQEConfig, u_target: np.ndarray, pool, logger=None) -> TrainResult:
+def gqe(
+    cfg: GQEConfig,
+    u_target: np.ndarray,
+    pool,
+    logger=None,
+) -> TrainResult:
     trainer = Trainer(cfg, u_target, pool, logger=logger)
     return trainer.run()

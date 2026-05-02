@@ -109,6 +109,7 @@ class RewardConfig:
     fidelity_threshold: float = 0.99
     pair_repeat_window: int = 0
     pair_repeat_max: int = 1
+    pareto_report_fidelity_floor: float = 0.99
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,8 @@ def validate_config(raw: dict) -> None:
             raise ValueError("reward.pair_repeat_window must be >= 0")
         if rw.get("pair_repeat_max", 1) < 1:
             raise ValueError("reward.pair_repeat_max must be >= 1")
+        if not (0.0 <= rw.get("pareto_report_fidelity_floor", 0.99) <= 1.0):
+            raise ValueError("reward.pareto_report_fidelity_floor must be in [0, 1]")
 
 
 def load_config(path: str) -> GQEConfig:

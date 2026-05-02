@@ -68,3 +68,6 @@ reward:
   fidelity_threshold: 0.99
   pair_repeat_window: 0
   pair_repeat_max: 1
+  # Minimum fidelity for a Pareto circuit to appear in logs, CSV, and plots.
+  # Does not affect the search — only post-run reporting.
+  pareto_report_fidelity_floor: 0.99

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import numpy as np
 import jax
 from dotenv import load_dotenv
@@ -18,6 +19,18 @@ from reporting import (
 from simplify import simplify_pareto_archive
 from target import build_target
 from trainer import build_logger, gqe
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Run one GQE synthesis experiment.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--config", default="config.yml",
+        help="GQE config YAML.",
+    )
+    return p.parse_args()
 
 
 def _basis_gates(rotation_gates) -> list[str]:
@@ -107,10 +120,11 @@ def _print_pareto_summary(
 
 
 def main():
+    args = _parse_args()
     load_dotenv()
 
-    cfg = load_config("config.yml")
-    print("\nLoaded config: config.yml")
+    cfg = load_config(args.config)
+    print(f"\nLoaded config: {args.config}")
     print(f"  Target type:          {cfg.target.type}")
     print(f"  Qubits:               {cfg.target.num_qubits}")
     print(f"  Scheduler:            {cfg.temperature.scheduler}")

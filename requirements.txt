@@ -12,3 +12,4 @@ pyyaml
 pytest
 pyzx
 numba
+h5py
