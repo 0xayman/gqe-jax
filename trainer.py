@@ -87,10 +87,18 @@ def _build_scheduler(cfg: GQEConfig):
     raise ValueError(f"Unknown scheduler {t.scheduler!r}")
 
 
+def universal_cnot_lower_bound(num_qubits: int) -> int:
+    """Shende-Markov-Bullock CNOT lower bound: ceil((4^n - 3n - 1) / 4)."""
+    n = int(num_qubits)
+    if n <= 1:
+        return 0
+    numer = 4 ** n - 3 * n - 1
+    return max(0, -(-numer // 4))
+
+
 def rollout_context_tokens(num_qubits: int) -> int:
     """Return the transformer token window used for rollouts."""
-    numer = 4 ** int(num_qubits) - 3 * int(num_qubits) - 1
-    cnot_lb = max(0, -(-numer // 4))
+    cnot_lb = universal_cnot_lower_bound(num_qubits)
     action_budget = max(
         32,
         min(DEFAULT_CONTEXT_TOKENS - 1, int(round(7.5 * cnot_lb))),
@@ -208,10 +216,11 @@ class TrainResult:
     best_angles: np.ndarray | None
     pareto_archive: ParetoArchive | None
     best_raw_fidelity: float = float("nan")
-    best_raw_tokens: list[int] | None = None
-    best_raw_angles: np.ndarray | None = None
-    refined_raw_fidelity: float | None = None
-    refined_raw_angles: np.ndarray | None = None
+    best_inner_fidelity: float = float("nan")
+    best_inner_tokens: list[int] | None = None
+    best_inner_angles: np.ndarray | None = None
+    refined_inner_fidelity: float | None = None
+    refined_inner_angles: np.ndarray | None = None
     epoch_logs: list[dict] = None  # type: ignore[assignment]
 
 
@@ -224,11 +233,13 @@ class Trainer:
         u_target: np.ndarray,
         pool: list,
         logger=None,
+        angle_init_fn=None,
     ):
         self.cfg = cfg
         self.u_target = u_target
         self.pool = pool
         self.logger = logger
+        self.angle_init_fn = angle_init_fn
 
         self.bos_token_id = 0
         self.stop_token_id = 1
@@ -313,6 +324,17 @@ class Trainer:
         else:
             self.pareto_archive = None
         self._current_epoch = 0
+
+        r = cfg.reward
+        self._F_thr = float(r.fidelity_threshold)
+        self._struct_F_thr = float(r.lex_structure_fidelity_threshold)
+        self._lambda = float(r.lex_constraint_lambda_init)
+        self._lambda_lr = float(r.lex_constraint_lambda_lr)
+        self._lambda_max = float(r.lex_constraint_lambda_max)
+        anchor = r.lex_cnot_anchor
+        if anchor is None:
+            anchor = universal_cnot_lower_bound(cfg.target.num_qubits)
+        self._cnot_anchor = int(anchor)
 
         if cfg.policy.inner_refine_steps > 0:
             self.inner_refiner: AngleRefiner | None = AngleRefiner(
@@ -514,6 +536,15 @@ class Trainer:
         log_p_d = np.asarray(out["log_p_d"], dtype=np.float32)
 
         action_tokens = tokens[:, 1:]
+
+        if self.angle_init_fn is not None:
+            try:
+                warm_angles = self.angle_init_fn(action_tokens)
+                if warm_angles is not None and warm_angles.shape == init_angles.shape:
+                    init_angles = warm_angles.astype(np.float32)
+            except Exception:
+                pass
+
         raw_fidelities = self.evaluator.fidelity_batch(action_tokens, init_angles)
 
         if self.inner_refiner is not None:
@@ -597,6 +628,19 @@ class Trainer:
                 ]
                 self.pareto_archive.update_batch(new_points)
 
+        mean_F = float(np.mean(fidelities)) if fidelities.size else float("nan")
+        violation_rate = (
+            float(np.mean(fidelities < self._F_thr)) if fidelities.size else 0.0
+        )
+        lambda_before = self._lambda
+        if fidelities.size and self.cfg.reward.enabled:
+            violation = self._F_thr - mean_F
+            self._lambda = float(np.clip(
+                self._lambda + self._lambda_lr * violation,
+                0.0,
+                self._lambda_max,
+            ))
+
         return {
             "tokens": tokens,
             "angles": pareto_angles,
@@ -613,6 +657,10 @@ class Trainer:
             "costs": costs,
             "advantages": advantages,
             "beta": float(np.asarray(beta, dtype=np.float32)),
+            "mean_fidelity": mean_F,
+            "constraint_violation_rate": violation_rate,
+            "constraint_lambda_before": float(lambda_before),
+            "constraint_lambda_after": float(self._lambda),
         }
 
     def _sequence_discounts(self, lengths: np.ndarray | None) -> np.ndarray | np.float32:
@@ -637,17 +685,27 @@ class Trainer:
         D = depths.astype(np.float32)
         discounts = self._sequence_discounts(lengths)
 
+        F_thr = np.float32(self._F_thr)
+        lam = np.float32(self._lambda)
         eps = np.float32(r.lex_infidelity_eps)
-        infidelity = np.clip(1.0 - F + eps, eps, 1.0).astype(np.float32)
-        reward = -np.float32(r.lex_fidelity_weight) * np.log(infidelity)
-        active = (F >= np.float32(r.lex_structure_fidelity_threshold)).astype(
-            np.float32
+        infid_capped = np.maximum(
+            np.float32(1.0) - F, np.float32(1.0) - F_thr + eps,
+        )
+        F_reward = -np.log(infid_capped)
+        fid_term = lam * discounts * F_reward
+
+        active = (F >= np.float32(self._struct_F_thr)).astype(np.float32)
+        anchor = np.float32(self._cnot_anchor)
+        over = np.maximum(np.float32(0.0), C - anchor)
+        cnot_cost = (
+            np.float32(r.lex_cnot_weight) * C
+            + np.float32(r.lex_cnot_quadratic_weight) * over * over
         )
         structure_cost = active * (
-            np.float32(r.lex_cnot_weight) * C
-            + np.float32(r.lex_depth_weight) * D
+            cnot_cost + np.float32(r.lex_depth_weight) * D
         )
-        cost = -(discounts * reward) + structure_cost
+
+        cost = -fid_term + structure_cost
         if no_stop is not None:
             cost = cost + np.asarray(no_stop, dtype=np.float32) * np.float32(
                 r.lex_no_stop_penalty
@@ -685,8 +743,9 @@ class Trainer:
         best_angles = None
         best_fidelity = float("nan")
         best_raw_fidelity = -1.0
-        best_raw_tokens = None
-        best_raw_angles = None
+        best_inner_fidelity = -1.0
+        best_inner_tokens = None
+        best_inner_angles = None
         best_seen_fidelity = -1.0
         run_start = time.perf_counter()
 
@@ -715,8 +774,12 @@ class Trainer:
             raw_idx = int(np.argmax(raw_fids))
             if float(raw_fids[raw_idx]) > best_raw_fidelity:
                 best_raw_fidelity = float(raw_fids[raw_idx])
-                best_raw_tokens = roll["tokens"][raw_idx].copy()
-                best_raw_angles = roll["init_angles"][raw_idx].copy()
+
+            inner_idx = int(np.argmax(fids))
+            if float(fids[inner_idx]) > best_inner_fidelity:
+                best_inner_fidelity = float(fids[inner_idx])
+                best_inner_tokens = roll["tokens"][inner_idx].copy()
+                best_inner_angles = roll["angles"][inner_idx].copy()
 
             losses = self.train_epoch(beta_val)
             avg_loss = float(np.mean(losses)) if losses else float("nan")
@@ -739,8 +802,8 @@ class Trainer:
                     print(f"Early stop: fidelity 1.0 reached at epoch {epoch + 1:03d}")
                 break
 
-        refined_raw_fidelity: float | None = None
-        refined_raw_angles: np.ndarray | None = None
+        refined_inner_fidelity: float | None = None
+        refined_inner_angles: np.ndarray | None = None
         if cfg.refinement.enabled:
             refiner = AngleRefiner(
                 self.evaluator,
@@ -752,21 +815,26 @@ class Trainer:
                 sweep_passes=cfg.refinement.sweep_passes,
             )
 
-            if best_raw_tokens is not None:
+            if best_inner_tokens is not None:
                 if cfg.logging.verbose:
                     print(
-                        f"\nRefining best raw rollout (F={best_raw_fidelity:.4f}) "
-                        f"with {cfg.refinement.steps} adam steps..."
+                        f"\nRefining policy's best inner-refined sample "
+                        f"(F={best_inner_fidelity:.4f}, post "
+                        f"{cfg.policy.inner_refine_steps}-step inner Adam) "
+                        f"with {cfg.refinement.steps} more Adam steps as a "
+                        f"fallback in case the Pareto archive is empty..."
                     )
-                tok_no_bos = np.asarray(best_raw_tokens, dtype=np.int32)[1:][None, :]
-                ang = np.asarray(best_raw_angles, dtype=np.float32)[None, :]
+                tok_no_bos = np.asarray(best_inner_tokens, dtype=np.int32)[1:][None, :]
+                ang = np.asarray(best_inner_angles, dtype=np.float32)[None, :]
                 rfids, rangles = refiner.refine_batch(tok_no_bos, ang)
-                refined_raw_fidelity = float(rfids[0])
-                refined_raw_angles = rangles[0]
+                refined_inner_fidelity = float(rfids[0])
+                refined_inner_angles = rangles[0]
                 if cfg.logging.verbose:
                     print(
-                        f"  Best raw: F {best_raw_fidelity:.4f} → "
-                        f"{refined_raw_fidelity:.4f}"
+                        f"  Best inner-refined: F {best_inner_fidelity:.4f} → "
+                        f"{refined_inner_fidelity:.4f} (continued from inner-Adam "
+                        f"angles; the Pareto archive refinement below is the "
+                        f"headline)."
                     )
 
             if self.pareto_archive is not None and len(self.pareto_archive) > 0:
@@ -804,10 +872,13 @@ class Trainer:
             best_angles=best_angles,
             pareto_archive=self.pareto_archive,
             best_raw_fidelity=best_raw_fidelity,
-            best_raw_tokens=best_raw_tokens.tolist() if best_raw_tokens is not None else None,
-            best_raw_angles=best_raw_angles,
-            refined_raw_fidelity=refined_raw_fidelity,
-            refined_raw_angles=refined_raw_angles,
+            best_inner_fidelity=best_inner_fidelity,
+            best_inner_tokens=(
+                best_inner_tokens.tolist() if best_inner_tokens is not None else None
+            ),
+            best_inner_angles=best_inner_angles,
+            refined_inner_fidelity=refined_inner_fidelity,
+            refined_inner_angles=refined_inner_angles,
             epoch_logs=list(self.epoch_logs),
         )
 
@@ -860,6 +931,11 @@ class Trainer:
             best_g = arc.best_by_total_gates(min_fidelity=thresh)
             pareto_min_gates = best_g.total_gates if best_g is not None else -1
 
+        mean_F_rollout = float(roll.get("mean_fidelity", float("nan")))
+        violation_rate = float(roll.get("constraint_violation_rate", 0.0))
+        lambda_before = float(roll.get("constraint_lambda_before", self._lambda))
+        lambda_after = float(roll.get("constraint_lambda_after", self._lambda))
+
         if cfg.logging.verbose:
             pstr = (
                 f" | pareto={pareto_size}"
@@ -878,6 +954,9 @@ class Trainer:
                 f" | beta={beta_val:.3f}"
                 f" | F_epoch_best={epoch_best_F:.4f}"
                 f" | F_seen={best_seen_fidelity:.4f}"
+                f" | F_mean={mean_F_rollout:.4f}"
+                f" | viol={violation_rate:.2f}"
+                f" | lambda={lambda_after:.3f}"
                 f" | cnot_epoch={epoch_best_cnot}"
                 f" | depth_epoch={epoch_best_depth}"
                 f" | mean_len={mean_len:.1f}"
@@ -914,6 +993,14 @@ class Trainer:
             "epoch_time_sec": float(epoch_time),
             "elapsed_time_sec": float(elapsed),
             "inner_refine_lift_mean": float(mean_inner_lift),
+            "rollout_fidelity_mean": (
+                float(mean_F_rollout) if np.isfinite(mean_F_rollout) else None
+            ),
+            "constraint_violation_rate": float(violation_rate),
+            "constraint_lambda_before": float(lambda_before),
+            "constraint_lambda": float(lambda_after),
+            "constraint_threshold": float(self._F_thr),
+            "constraint_cnot_anchor": int(self._cnot_anchor),
         }
         if self.pareto_archive is not None:
             metrics.update({
@@ -943,6 +1030,7 @@ def gqe(
     u_target: np.ndarray,
     pool,
     logger=None,
+    angle_init_fn=None,
 ) -> TrainResult:
-    trainer = Trainer(cfg, u_target, pool, logger=logger)
+    trainer = Trainer(cfg, u_target, pool, logger=logger, angle_init_fn=angle_init_fn)
     return trainer.run()

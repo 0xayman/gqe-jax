@@ -91,9 +91,12 @@ class RefinementConfig:
 class RewardConfig:
     """Reward and Pareto-archive settings.
 
-    Uses a lexicographic reward: fidelity is optimised first; structural
-    penalties (CNOT count, depth) activate only after the configured
-    fidelity threshold is reached.
+    Constrained-RL (Lagrangian) reward: structure cost (CNOT, depth) is the
+    primary objective; fidelity is enforced as a soft constraint
+    F >= fidelity_threshold via an adaptive Lagrange multiplier ``lambda``
+    that follows F-violations. Below threshold, ``lambda * (F_thr - F)``
+    drives the policy upward; above threshold, fidelity penalty is zero
+    and structure cost dominates.
     """
 
     enabled: bool = True
@@ -110,6 +113,12 @@ class RewardConfig:
     pair_repeat_window: int = 0
     pair_repeat_max: int = 1
     pareto_report_fidelity_floor: float = 0.99
+
+    lex_constraint_lambda_init: float = 1.0
+    lex_constraint_lambda_lr: float = 0.05
+    lex_constraint_lambda_max: float = 50.0
+    lex_cnot_quadratic_weight: float = 0.0
+    lex_cnot_anchor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -285,6 +294,19 @@ def validate_config(raw: dict) -> None:
             raise ValueError("reward.pair_repeat_max must be >= 1")
         if not (0.0 <= rw.get("pareto_report_fidelity_floor", 0.99) <= 1.0):
             raise ValueError("reward.pareto_report_fidelity_floor must be in [0, 1]")
+        if rw.get("lex_constraint_lambda_init", 1.0) < 0.0:
+            raise ValueError("reward.lex_constraint_lambda_init must be >= 0")
+        if rw.get("lex_constraint_lambda_lr", 0.05) < 0.0:
+            raise ValueError("reward.lex_constraint_lambda_lr must be >= 0")
+        if rw.get("lex_constraint_lambda_max", 50.0) <= 0.0:
+            raise ValueError("reward.lex_constraint_lambda_max must be positive")
+        if rw.get("lex_cnot_quadratic_weight", 0.0) < 0.0:
+            raise ValueError("reward.lex_cnot_quadratic_weight must be >= 0")
+        anchor = rw.get("lex_cnot_anchor", None)
+        if anchor is not None and (not isinstance(anchor, int) or anchor < 0):
+            raise ValueError(
+                "reward.lex_cnot_anchor must be a non-negative integer or null"
+            )
 
 
 def load_config(path: str) -> GQEConfig:

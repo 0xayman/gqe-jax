@@ -1,0 +1,75 @@
+# Default configuration for the representation-learning module.
+
+dataset:
+  num_qubits_list: [2, 3]          # train on both 2- and 3-qubit unitaries
+  max_qubits: 4                    # fixed canonical vocab size
+  num_samples: 2048                # samples per qubit count (A100 40 GB)
+  brickwork_depth_min: 1
+  brickwork_depth_max: 6
+  fidelity_threshold: 0.999
+  rotation_gates: ["rz", "ry"]    # must match the GQE pool layout
+  qiskit_optimization_levels: [0, 1, 2, 3]
+  seed: 0
+  out_path: "data/brickwork_agnostic.npz"
+  # basis = rotation_gates + [sx, cx]; no rx
+
+encoder:
+  hidden_dim: 512
+  latent_dim: 256
+  num_layers: 4
+  dropout: 0.1
+
+local_encoder:
+  site_feat_dim: 32   # must match features.SITE_FEAT_DIM
+  hidden_dim: 256
+  latent_dim: 128
+  num_layers: 3
+  num_heads: 8
+  dropout: 0.1
+
+budget:
+  # Inclusive range of CNOT budgets the classifier scores.
+  k_min: 0
+  k_max: 24
+  hidden_dim: 256
+
+angle_init:
+  hidden_dim: 256
+  num_layers: 3
+  num_heads: 8
+  dropout: 0.1
+  max_skeleton_len: 64
+
+training:
+  local_budget:
+    epochs: 100
+    batch_size: 512
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    val_split: 0.1
+    seed: 0
+    out_dir: "checkpoints/local_budget"
+  local_angle:
+    epochs: 80
+    batch_size: 512
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    val_split: 0.1
+    seed: 0
+    out_dir: "checkpoints/local_angle"
+  budget:
+    epochs: 100
+    batch_size: 512
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    val_split: 0.1
+    seed: 0
+    out_dir: "checkpoints/budget"
+  angle:
+    epochs: 80
+    batch_size: 512
+    lr: 3.0e-4
+    weight_decay: 1.0e-4
+    val_split: 0.1
+    seed: 0
+    out_dir: "checkpoints/angle"

@@ -1,0 +1,28 @@
+How to run on the A100
+
+  cd representation-learning
+
+  # 1. Generate dataset (~2048×2 = 4096 unitaries, both 2- and 3-qubit)
+  python dataset.py --config config.yml
+
+  # 2. Train budget classifier (flat + local, ~100 epochs each)
+  python train_budget.py --config config.yml
+
+  # 3. Train angle initialiser (flat + local, ~80 epochs each)
+  python train_angle.py --config config.yml
+
+  Checkpoints land in:
+  - representation-learning/checkpoints/local_budget/local_budget_model.pkl
+  - representation-learning/checkpoints/local_angle/local_angle_init.pkl
+
+  ---
+  How to run the benchmark with repr-learning warm-start
+
+  cd ..   # back to gqe-torch/
+
+  python benchmark.py \
+    --config config.yml \
+    --num-qubits 3 \
+    --num-circuits 50 \
+    --repr-dir representation-learning/checkpoints \
+    --output-dir results/benchmarks

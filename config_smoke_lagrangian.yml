@@ -1,0 +1,76 @@
+# Short smoke test for the Lagrangian-constrained reward.
+# Verifies: lambda updates, mean_F is logged, no crashes, anchor=universal LB.
+
+target:
+  num_qubits: 3
+  type: "brickwork"
+  path: "targets/haar_random_q3.npy"
+
+pool:
+  rotation_gates: ["rz", "ry"]
+
+model:
+  size: "tiny"
+
+training:
+  max_epochs: 8
+  num_samples: 512
+  batch_size: 256
+  lr: 1.0e-4
+  grad_norm_clip: 1.0
+  seed: 42
+  grpo_clip_ratio: 0.2
+  early_stop: false
+
+policy:
+  entropy_disc: 0.003
+  entropy_cont: 0.003
+  angle_supervision_weight: 1.0
+  inner_refine_steps: 16
+  inner_refine_lr: 0.08
+
+temperature:
+  scheduler: "fixed"
+  initial_value: 0.9
+  delta: 0.02
+  min_value: 0.3
+  max_value: 1.5
+
+buffer:
+  max_size: 1024
+  steps_per_epoch: 2
+
+logging:
+  verbose: true
+  wandb: false
+
+refinement:
+  enabled: false
+  steps: 50
+  lr: 0.08
+  use_linear_trace_loss: true
+  early_stop_patience: 30
+  early_stop_rel_tol: 1.0e-5
+  sweep_passes: 0
+
+reward:
+  enabled: true
+  lex_fidelity_weight: 1.0
+  lex_infidelity_eps: 1.0e-8
+  lex_cnot_weight: 0.02
+  lex_depth_weight: 0.003
+  lex_structure_fidelity_threshold: 0.99
+  lex_no_stop_penalty: 1.0
+  sequence_discount: 0.995
+  fidelity_floor: 0.5
+  max_archive_size: 200
+  fidelity_threshold: 0.99
+  pair_repeat_window: 0
+  pair_repeat_max: 1
+  pareto_report_fidelity_floor: 0.99
+  # Lagrangian Tier-B knobs
+  lex_constraint_lambda_init: 1.0
+  lex_constraint_lambda_lr: 0.05
+  lex_constraint_lambda_max: 50.0
+  lex_cnot_quadratic_weight: 0.01
+  lex_cnot_anchor: null

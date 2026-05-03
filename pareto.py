@@ -29,7 +29,7 @@ class ParetoArchive:
         self,
         max_size: int = 500,
         fidelity_floor: float = 0.5,
-        fidelity_tol: float = 1e-4,
+        fidelity_tol: float = 0.0,
     ):
         """Build an archive with a fidelity admission floor and tie tolerance."""
         self.max_size = max_size
@@ -51,7 +51,9 @@ class ParetoArchive:
             self._hash_to_index = {}
             return
         self._fid = np.fromiter(
-            (p.fidelity for p in self._archive), dtype=np.float32, count=len(self._archive)
+            (p.fidelity for p in self._archive),
+            dtype=np.float32,
+            count=len(self._archive),
         )
         self._depth = np.fromiter(
             (p.depth for p in self._archive), dtype=np.int32, count=len(self._archive)
@@ -62,7 +64,9 @@ class ParetoArchive:
             count=len(self._archive),
         )
         self._cnot = np.fromiter(
-            (p.cnot_count for p in self._archive), dtype=np.int32, count=len(self._archive)
+            (p.cnot_count for p in self._archive),
+            dtype=np.int32,
+            count=len(self._archive),
         )
         self._hash_to_index = {
             p.canonical_hash: i
@@ -96,9 +100,7 @@ class ParetoArchive:
         )
 
     @staticmethod
-    def dominates(
-        a: ParetoPoint, b: ParetoPoint, fidelity_tol: float = 0.0
-    ) -> bool:
+    def dominates(a: ParetoPoint, b: ParetoPoint, fidelity_tol: float = 0.0) -> bool:
         """Return whether ``a`` is no worse on all objectives and better on one."""
         better_or_equal = (
             a.fidelity + fidelity_tol >= b.fidelity
@@ -123,9 +125,7 @@ class ParetoArchive:
             existing_idx = self._hash_to_index.get(point.canonical_hash)
             if existing_idx is not None:
                 existing = self._archive[existing_idx]
-                if not self._prefer_replacement(
-                    point, existing, self.fidelity_tol
-                ):
+                if not self._prefer_replacement(point, existing, self.fidelity_tol):
                     return False
                 self._archive.pop(existing_idx)
                 self._rebuild_arrays()
@@ -322,7 +322,8 @@ class ParetoArchive:
             return None
         best_f = max(p.fidelity for p in self._archive)
         candidates = [
-            p for p in self._archive
+            p
+            for p in self._archive
             if np.isclose(p.fidelity, best_f, rtol=0.0, atol=1.0e-7)
         ]
         return min(
@@ -334,24 +335,36 @@ class ParetoArchive:
         """Return the lowest-CNOT entry among circuits with fidelity >= min_fidelity."""
         candidates = [p for p in self._archive if p.fidelity >= min_fidelity]
         return (
-            min(candidates, key=lambda p: (p.cnot_count, p.depth, p.total_gates, -p.fidelity))
-            if candidates else None
+            min(
+                candidates,
+                key=lambda p: (p.cnot_count, p.depth, p.total_gates, -p.fidelity),
+            )
+            if candidates
+            else None
         )
 
     def best_by_depth(self, min_fidelity: float = 0.0) -> Optional[ParetoPoint]:
         """Return the shallowest entry among circuits with fidelity >= min_fidelity."""
         candidates = [p for p in self._archive if p.fidelity >= min_fidelity]
         return (
-            min(candidates, key=lambda p: (p.depth, p.cnot_count, p.total_gates, -p.fidelity))
-            if candidates else None
+            min(
+                candidates,
+                key=lambda p: (p.depth, p.cnot_count, p.total_gates, -p.fidelity),
+            )
+            if candidates
+            else None
         )
 
     def best_by_total_gates(self, min_fidelity: float = 0.0) -> Optional[ParetoPoint]:
         """Return the entry with fewest total gates among circuits with fidelity >= min_fidelity."""
         candidates = [p for p in self._archive if p.fidelity >= min_fidelity]
         return (
-            min(candidates, key=lambda p: (p.total_gates, p.cnot_count, p.depth, -p.fidelity))
-            if candidates else None
+            min(
+                candidates,
+                key=lambda p: (p.total_gates, p.cnot_count, p.depth, -p.fidelity),
+            )
+            if candidates
+            else None
         )
 
     def __len__(self) -> int:

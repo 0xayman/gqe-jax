@@ -12,7 +12,7 @@ model:
   size: "tiny" # tiny | small | medium | large
 
 training:
-  max_epochs: 150
+  max_epochs: 100
   num_samples: 2048 # circuits sampled per epoch
   batch_size: 512 # gradient-step batch size
   lr: 1.0e-4
@@ -26,7 +26,7 @@ policy:
   entropy_cont: 0.003 # Gaussian-entropy regularisation weight
   angle_supervision_weight: 1.0 # regression weight toward refined rotation angles
   # Optional Adam refinement used to score each sampled gate skeleton.
-  inner_refine_steps: 16
+  inner_refine_steps: 700
   inner_refine_lr: 0.08
 
 temperature:
@@ -42,10 +42,10 @@ buffer:
 
 logging:
   verbose: true
-  wandb: true
+  wandb: false
 
 refinement:
-  enabled: true
+  enabled: false
   steps: 700
   lr: 0.08
   use_linear_trace_loss: true
@@ -57,9 +57,9 @@ reward:
   enabled: true
   lex_fidelity_weight: 1.0
   lex_infidelity_eps: 1.0e-8
-  lex_cnot_weight: 0.02
-  lex_depth_weight: 0.003
-  lex_structure_fidelity_threshold: 0.98
+  lex_cnot_weight: 0.05
+  lex_depth_weight: 0.001
+  lex_structure_fidelity_threshold: 0.80
   lex_no_stop_penalty: 1.0
   sequence_discount: 0.995
   # Archive admission floor; lower values keep more exploratory circuits.
@@ -70,4 +70,15 @@ reward:
   pair_repeat_max: 1
   # Minimum fidelity for a Pareto circuit to appear in logs, CSV, and plots.
   # Does not affect the search — only post-run reporting.
-  pareto_report_fidelity_floor: 0.99
+  pareto_report_fidelity_floor: 0.995
+  # Lagrangian dual variable on the constraint F >= fidelity_threshold.
+  lex_constraint_lambda_init: 1.0
+  lex_constraint_lambda_lr: 0.05
+  lex_constraint_lambda_max: 50.0
+  # Convex over-budget CNOT cost: weight * max(0, C - anchor)^2.
+  # Anchored at universal LB (Shende-Markov-Bullock) when null:
+  #   n=2 -> 3, n=3 -> 14, n=4 -> 61.
+  # Active only when F >= fidelity_threshold (Stage 2). Heavily punishes
+  # circuits that exceed the universal lower bound at high F.
+  lex_cnot_quadratic_weight: 0.03
+  lex_cnot_anchor: null

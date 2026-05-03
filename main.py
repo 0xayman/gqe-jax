@@ -168,32 +168,33 @@ def main():
     print(f"\n{'=' * 55}")
     print("Training complete!")
     print(f"  Best cost (during training):       {result.best_cost:.6f}")
-    print(f"  Best raw fidelity (during train):  {result.best_raw_fidelity:.6f}")
-    if result.refined_raw_fidelity is not None:
+    print(f"  Best raw fidelity (pre-Adam):      {result.best_raw_fidelity:.6f}")
+    print(f"  Best inner-refined fidelity:       {result.best_inner_fidelity:.6f}")
+    if result.refined_inner_fidelity is not None:
         print(
-            f"  Best raw fidelity (post-refine):   "
-            f"{result.refined_raw_fidelity:.6f}"
+            f"  Best inner-refined (post-700-Adam): "
+            f"{result.refined_inner_fidelity:.6f}"
         )
 
     pareto_empty = (
         result.pareto_archive is None or len(result.pareto_archive) == 0
     )
-    if pareto_empty and result.best_raw_tokens is not None:
-        rep_idx = np.asarray(result.best_raw_tokens, dtype=np.int32)
+    if pareto_empty and result.best_inner_tokens is not None:
+        rep_idx = np.asarray(result.best_inner_tokens, dtype=np.int32)
         rep_angles = (
-            result.refined_raw_angles
-            if result.refined_raw_angles is not None
-            else result.best_raw_angles
+            result.refined_inner_angles
+            if result.refined_inner_angles is not None
+            else result.best_inner_angles
         )
         rep_F = (
-            result.refined_raw_fidelity
-            if result.refined_raw_fidelity is not None
-            else result.best_raw_fidelity
+            result.refined_inner_fidelity
+            if result.refined_inner_fidelity is not None
+            else result.best_inner_fidelity
         )
         rep_src = (
-            "Best raw rollout (refined)"
-            if result.refined_raw_fidelity is not None
-            else "Best raw rollout"
+            "Best inner-refined rollout (post-700-Adam)"
+            if result.refined_inner_fidelity is not None
+            else "Best inner-refined rollout"
         )
     else:
         rep_idx, rep_angles, rep_F, rep_src = select_report_token_sequence(
