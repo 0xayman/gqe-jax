@@ -112,17 +112,6 @@ def _parse_args() -> argparse.Namespace:
         default="0.99,0.999,0.9999",
         help="Comma-separated fidelity thresholds for constrained metrics.",
     )
-    p.add_argument(
-        "--repr-dir",
-        default=None,
-        help=(
-            "Root of the representation-learning checkpoints directory. "
-            "Expected layout: <repr-dir>/local_budget/local_budget_model.pkl and "
-            "<repr-dir>/local_angle/local_angle_init.pkl. "
-            "When set, the budget predictor is logged and the angle initialiser "
-            "warm-starts Adam in each GQE run."
-        ),
-    )
     return p.parse_args()
 
 
@@ -701,68 +690,6 @@ def _write_summary(
     print(f"Wrote benchmark summary → {summary_path}")
 
 
-def _load_repr_models(repr_dir: str):
-    """Load local budget and angle-init models from a repr-learning checkpoint root.
-
-    repr_dir is the checkpoints root produced by the representation-learning pipeline
-    (e.g. ``representation-learning/checkpoints``).  Expected layout:
-        repr_dir/local_budget/local_budget_model.pkl
-        repr_dir/local_angle/local_angle_init.pkl
-
-    Returns (loaded_budget, loaded_angle, canonical_vocab) or raises on missing files.
-    """
-    import sys
-    # Add the representation-learning source directory to the path.
-    rl_src = str(Path(__file__).parent / "representation-learning")
-    if rl_src not in sys.path:
-        sys.path.insert(0, rl_src)
-
-    from infer import load_local_budget, load_local_angle_init  # type: ignore
-    from vocab import build_vocab  # type: ignore
-
-    root = Path(repr_dir)
-    budget_ckpt = str(root / "local_budget" / "local_budget_model.pkl")
-    angle_ckpt = str(root / "local_angle" / "local_angle_init.pkl")
-    loaded_b = load_local_budget(budget_ckpt)
-    loaded_a = load_local_angle_init(angle_ckpt)
-    max_qubits = loaded_a.max_qubits if loaded_a.max_qubits > 0 else 4
-    rotation_gates = getattr(loaded_a, "rotation_gates", ("rz", "ry"))
-    canon_vocab = build_vocab(max_qubits, rotation_gates)
-    return loaded_b, loaded_a, canon_vocab
-
-
-def _make_angle_init_fn(loaded_a, u_target, gqe_pool_names: list[str], canon_vocab):
-    """Return a callable(action_tokens) -> angles for warm-starting GQE Adam.
-
-    GQE tokens are 0-indexed into gqe_pool_names = [BOS, STOP, PAD, gate0, ...].
-    The repr model uses a canonical vocab keyed by token names. We remap by name.
-    """
-    from infer import suggest_angles_local  # type: ignore  (already on sys.path)
-    from vocab import remap_tokens  # type: ignore
-
-    # Build a minimal Vocab-like object for the GQE token space so remap_tokens works.
-    class _MinVocab:
-        def __init__(self, names):
-            self.token_names = tuple(names)
-            self.name_to_id = {n: i for i, n in enumerate(names)}
-
-    gqe_vocab = _MinVocab(gqe_pool_names)
-
-    def angle_init_fn(action_tokens: np.ndarray) -> np.ndarray | None:
-        B, L = action_tokens.shape
-        result = np.zeros_like(action_tokens, dtype=np.float32)
-        for b in range(B):
-            row = action_tokens[b]
-            try:
-                remapped = remap_tokens(row, gqe_vocab, canon_vocab)
-                angles = suggest_angles_local(loaded_a, u_target, remapped, canon_vocab)
-                result[b] = angles
-            except Exception:
-                pass
-        return result
-
-    return angle_init_fn
-
 
 def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
     thresholds = _parse_thresholds(args.fidelity_thresholds)
@@ -794,24 +721,8 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
         key=lambda r: (r["cnot"], r["depth"], r["total_gates"], -r["fidelity"]),
     )
 
-    gqe_token_names = ["<BOS>", "<STOP>", "<PAD>", *[name for name, _ in pool]]
-
-    repr_budget_k = None
-    angle_init_fn = None
-    if getattr(args, "repr_dir", None):
-        try:
-            loaded_b, loaded_a, canon_vocab = _load_repr_models(args.repr_dir)
-            from infer import suggest_budget_local  # type: ignore  # noqa: F401
-            sug = suggest_budget_local(loaded_b, u_target, confidence=0.5)
-            repr_budget_k = sug.suggested_k
-            angle_init_fn = _make_angle_init_fn(
-                loaded_a, u_target, gqe_token_names, canon_vocab,
-            )
-        except Exception as _e:
-            print(f"  [repr] WARNING: could not load repr models: {_e!r}")
-
     t0 = time.time()
-    result = gqe(cfg, u_target, pool, logger=None, angle_init_fn=angle_init_fn)
+    result = gqe(cfg, u_target, pool, logger=None)
     dt = time.time() - t0
 
     if result.pareto_archive is not None and len(result.pareto_archive) > 0:
@@ -866,7 +777,6 @@ def _run_one(args, base_cfg: GQEConfig, seed: int) -> dict:
         "qiskit_elapsed_sec": float(sum(r["elapsed_sec"] for r in qiskit_runs)),
         "qiskit_seed_transpiler": int(q_best["seed_transpiler"]),
         "qiskit_seed_sweep": qiskit_runs,
-        "repr_predicted_budget": repr_budget_k,
     }
     row.update(
         {
@@ -1355,8 +1265,6 @@ def main():
         eta_sec = int(mean_dt * remaining)
         eta_h, rem = divmod(eta_sec, 3600)
         eta_m = rem // 60
-        repr_k = row.get("repr_predicted_budget")
-        repr_str = f"  |  repr_k={repr_k}" if repr_k is not None else ""
         logger.log(
             f"  done in {row['elapsed_sec']:.1f}s  |  "
             f"GQE F={row['gqe_selected_F']:.4f} CX={row['gqe_cnot']} "
@@ -1364,7 +1272,7 @@ def main():
             f"BF F={row['gqe_F']:.4f} CX={row['gqe_best_cnot']} "
             f"D={row['gqe_best_depth']}  |  "
             f"Qiskit F={row['qiskit_F']:.4f} CX={row['qiskit_cnot']} "
-            f"D={row['qiskit_depth']}{repr_str}  |  "
+            f"D={row['qiskit_depth']}  |  "
             f"ETA {eta_h:d}h{eta_m:02d}m"
         )
         if pareto_rows:
